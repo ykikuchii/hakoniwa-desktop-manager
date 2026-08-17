@@ -92,9 +92,12 @@ pub fn start_asset(state: State<'_, AppState>, asset_id: String) -> Result<crate
 
 #[tauri::command]
 pub fn stop_asset(state: State<'_, AppState>, asset_id: String) -> Result<Vec<crate::types::ProcessSnapshot>, String> {
-    let snapshots = state.processes.stop_owner(&asset_id);
-    if snapshots.is_empty() { return Err("停止できる実行中プロセスがありません。".to_owned()); }
-    Ok(snapshots)
+    let report = state.processes.stop_owner(&asset_id);
+    if report.is_empty() { return Err("停止できる実行中プロセスがありません。".to_owned()); }
+    if !report.failures.is_empty() {
+        return Err(format!("停止できなかったプロセスがあります: {}", report.failures.join(" / ")));
+    }
+    Ok(report.stopped)
 }
 
 #[tauri::command]
@@ -108,9 +111,12 @@ pub fn start_core_controller(state: State<'_, AppState>) -> Result<crate::types:
 pub fn stop_core_controller(state: State<'_, AppState>) -> Result<Vec<crate::types::ProcessSnapshot>, String> {
     let controller = state.workspace.lock().map_err(|_| "ワークスペースをロックできません。".to_owned())?.core_controller.clone()
         .ok_or_else(|| "Coreコントローラーを設定してください。".to_owned())?;
-    let snapshots = state.processes.stop_owner(&controller.id);
-    if snapshots.is_empty() { return Err("停止できるCoreプロセスがありません。".to_owned()); }
-    Ok(snapshots)
+    let report = state.processes.stop_owner(&controller.id);
+    if report.is_empty() { return Err("停止できるCoreプロセスがありません。".to_owned()); }
+    if !report.failures.is_empty() {
+        return Err(format!("停止できなかったCoreプロセスがあります: {}", report.failures.join(" / ")));
+    }
+    Ok(report.stopped)
 }
 
 #[tauri::command]
@@ -149,8 +155,20 @@ pub fn stop_all(state: State<'_, AppState>) -> Result<Vec<crate::types::ProcessS
     let workspace = state.workspace.lock().map_err(|_| "ワークスペースをロックできません。".to_owned())?.clone();
     let _ = if workspace.core_release.is_some() { run_lifecycle_command(state.clone(), "stop".to_owned()) } else { Ok(LifecycleCommandResult { command: "stop".to_owned(), status: ProcessStatus::Unknown, stdout: String::new(), stderr: String::new() }) };
     let mut stopped = Vec::new();
-    for asset in workspace.assets.iter().rev() { stopped.extend(state.processes.stop_owner(&asset.id)); }
-    if let Some(controller) = workspace.core_controller { stopped.extend(state.processes.stop_owner(&controller.id)); }
+    let mut failures = Vec::new();
+    for asset in workspace.assets.iter().rev() {
+        let report = state.processes.stop_owner(&asset.id);
+        stopped.extend(report.stopped);
+        failures.extend(report.failures);
+    }
+    if let Some(controller) = workspace.core_controller {
+        let report = state.processes.stop_owner(&controller.id);
+        stopped.extend(report.stopped);
+        failures.extend(report.failures);
+    }
+    if !failures.is_empty() {
+        return Err(format!("停止できなかったプロセスがあります: {}", failures.join(" / ")));
+    }
     Ok(stopped)
 }
 
