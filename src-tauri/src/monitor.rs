@@ -139,7 +139,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     fn connection() -> ConnectionDefinition {
-        ConnectionDefinition { id: "c1".to_owned(), source: "a".to_owned(), destination: "b".to_owned(), label: "a to b".to_owned(), transport: TransportKind::Tcp, pdu_names: vec![], endpoint_config: None, details: BTreeMap::new() }
+        ConnectionDefinition { id: "c1".to_owned(), source: "a".to_owned(), destination: "b".to_owned(), label: "a to b".to_owned(), transport: TransportKind::Tcp, pdu_names: vec![], endpoint_config: None, details: BTreeMap::new(), source_asset_id: None, destination_asset_id: None, owner_asset_id: None }
     }
 
     #[test]

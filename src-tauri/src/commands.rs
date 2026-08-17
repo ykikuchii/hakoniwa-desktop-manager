@@ -17,7 +17,10 @@ use uuid::Uuid;
 
 #[tauri::command]
 pub fn get_snapshot(state: State<'_, AppState>) -> Result<WorkspaceSnapshot, String> {
-    let workspace = state.workspace.lock().map_err(|_| "ワークスペースをロックできません。".to_owned())?.clone();
+    let mut workspace = state.workspace.lock().map_err(|_| "ワークスペースをロックできません。".to_owned())?.clone();
+    // 保存済みの解決結果はキャッシュに過ぎない。アセットの追加・改名・削除に追従させるため、
+    // 表示に渡すコピーの上で毎回引き直す（永続値はここでは書き換えない）。
+    let _ = crate::linking::resolve_links(&workspace.assets, &mut workspace.imported_connections);
     let processes = state.processes.snapshots();
     harvest_monitor_logs(&state, &workspace, &processes);
     Ok(WorkspaceSnapshot {
@@ -241,11 +244,7 @@ fn harvest_monitor_logs(state: &AppState, workspace: &Workspace, processes: &[cr
         if !matches!(asset.role, crate::types::AssetRole::Bridge | crate::types::AssetRole::Monitor) {
             continue;
         }
-        let matched_connections: Vec<&crate::types::ConnectionDefinition> = workspace.imported_connections.iter().filter(|connection| {
-            connection.details.get("bridge").map(|bridge| bridge == &asset.name).unwrap_or(false)
-                || connection.endpoint_config.as_ref().map(|config| asset.config_files.iter().any(|asset_config| asset_config == config)).unwrap_or(false)
-        }).collect();
-        for connection in matched_connections {
+        for connection in monitor_targets(asset, &workspace.imported_connections) {
             for (index, line) in process.stdout_tail.iter().enumerate() {
                 state.monitor.record_bridge_process_line(&connection.id, &process.id, "stdout", index, line);
             }
@@ -254,6 +253,26 @@ fn harvest_monitor_logs(state: &AppState, workspace: &Workspace, processes: &[cr
             }
         }
     }
+}
+
+/// このアセットのログを、どの接続の観測情報として扱うか。
+///
+/// 帰属先は`linking`が解決した`owner_asset_id`を正とする。旧実装が併用していた
+/// 「`endpoint_config`が`config_files`に含まれるか」は、importerが`config_files`へ
+/// Launcher JSONのパスしか入れず`endpoint_config`にはendpoint/bridge JSONのパスしか
+/// 入れないため恒常的に成立しなかったので落とした。Bridge名の一致は、解決結果を
+/// 持たない古いworkspace.jsonのための後方互換として残す。
+fn monitor_targets<'a>(
+    asset: &AssetDefinition,
+    connections: &'a [crate::types::ConnectionDefinition],
+) -> Vec<&'a crate::types::ConnectionDefinition> {
+    connections
+        .iter()
+        .filter(|connection| {
+            connection.owner_asset_id.as_deref() == Some(asset.id.as_str())
+                || connection.details.get("bridge").map(|bridge| bridge == &asset.name).unwrap_or(false)
+        })
+        .collect()
 }
 
 fn topological_order(assets: &[AssetDefinition]) -> Result<Vec<AssetDefinition>, String> {
@@ -283,5 +302,57 @@ mod tests {
     fn starts_dependencies_first() {
         let order = topological_order(&[asset("b", vec!["a"]), asset("a", vec![])]).unwrap();
         assert_eq!(order[0].id, "a");
+    }
+
+    fn connection(id: &str) -> crate::types::ConnectionDefinition {
+        crate::types::ConnectionDefinition {
+            id: id.to_owned(),
+            source: "endpoint".to_owned(),
+            destination: "external endpoint".to_owned(),
+            label: format!("Endpoint: {id}"),
+            transport: crate::types::TransportKind::Unknown,
+            pdu_names: vec![],
+            endpoint_config: None,
+            details: BTreeMap::new(),
+            source_asset_id: None,
+            destination_asset_id: None,
+            owner_asset_id: None,
+        }
+    }
+
+    /// ログの帰属は解決済みのowner_asset_idで決まること。
+    #[test]
+    fn monitor_targets_follow_resolved_owner() {
+        let owner = asset("bridge-asset", vec![]);
+        let mut mine = connection("mine");
+        mine.owner_asset_id = Some(owner.id.clone());
+        let connections = [mine, connection("others")];
+        let matched = monitor_targets(&owner, &connections);
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].id, "mine");
+    }
+
+    /// 旧実装の第2条件（endpoint_configがconfig_filesに含まれるか）は復活させない。
+    /// importerの実際の入れ方では成立せず、成立するように見せかけると誤結合を招く。
+    #[test]
+    fn monitor_targets_ignore_config_file_overlap() {
+        let mut owner = asset("path-asset", vec![]);
+        owner.config_files = vec!["/recipe/endpoint_a.json".to_owned()];
+        let mut candidate = connection("by-path");
+        candidate.endpoint_config = Some("/recipe/endpoint_a.json".to_owned());
+        let connections = [candidate];
+        assert!(
+            monitor_targets(&owner, &connections).is_empty(),
+            "解決を経ずに設定ファイルの一致だけで帰属させています。"
+        );
+    }
+
+    /// 解決結果を持たない古いworkspace.jsonでも、Bridge名の一致では拾えること。
+    #[test]
+    fn monitor_targets_keep_bridge_name_fallback() {
+        let owner = asset("pdu-bridge", vec![]);
+        let mut legacy = connection("legacy");
+        legacy.details.insert("bridge".to_owned(), "pdu-bridge".to_owned());
+        assert_eq!(monitor_targets(&owner, &[legacy]).len(), 1);
     }
 }

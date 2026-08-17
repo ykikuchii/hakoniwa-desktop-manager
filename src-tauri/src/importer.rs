@@ -46,6 +46,7 @@ pub fn inspect_directory(directory: &Path) -> Result<ImportPreview, String> {
     }
     deduplicate_assets(&mut assets);
     deduplicate_connections(&mut connections);
+    warnings.extend(crate::linking::resolve_links(&assets, &mut connections));
     if assets.is_empty() {
         warnings.push("Launcher形式のassets[]を検出できませんでした。アセットは画面から個別に追加できます。".to_owned());
     }
@@ -137,6 +138,9 @@ fn parse_endpoint(
         pdu_names,
         endpoint_config: Some(path.display().to_string()),
         details,
+        source_asset_id: None,
+        destination_asset_id: None,
+        owner_asset_id: None,
     })
 }
 
@@ -153,7 +157,7 @@ fn parse_bridge(path: &Path, root: &Value, warnings: &mut Vec<String>) -> Vec<Co
             details.insert("bridge".to_owned(), bridge_name.to_owned());
             if let Some(policy) = rule.get("policy").or_else(|| rule.get("transfer_policy")).and_then(Value::as_str) { details.insert("transfer_policy".to_owned(), policy.to_owned()); }
             let pdu_names = rule.get("pdus").or_else(|| rule.get("pdu_names")).and_then(Value::as_array).map(|items| items.iter().filter_map(Value::as_str).map(str::to_owned).collect()).unwrap_or_default();
-            result.push(ConnectionDefinition { id: stable_id(&format!("bridge:{}:{index}", path.display())), source: source.to_owned(), destination: destination.to_owned(), label: format!("Bridge: {bridge_name}"), transport: TransportKind::Unknown, pdu_names, endpoint_config: Some(path.display().to_string()), details });
+            result.push(ConnectionDefinition { id: stable_id(&format!("bridge:{}:{index}", path.display())), source: source.to_owned(), destination: destination.to_owned(), label: format!("Bridge: {bridge_name}"), transport: TransportKind::Unknown, pdu_names, endpoint_config: Some(path.display().to_string()), details, source_asset_id: None, destination_asset_id: None, owner_asset_id: None });
         }
     } else {
         warnings.push(format!("{}: Bridgeらしい設定を検出しましたが、routes/bridges/mappingsの配列を認識できませんでした。", path.display()));
@@ -221,5 +225,16 @@ mod tests {
         let assets = parse_launcher(Path::new("launch.json"), &root, &mut Vec::new());
         assert_eq!(assets.len(), 1);
         assert_eq!(assets[0].activation_timing, ActivationTiming::AfterStart);
+    }
+
+    /// 突き合わせはlinking側の責務であり、parse層は解決結果を埋めない。
+    #[test]
+    fn parse_endpoint_leaves_links_unset() {
+        let root: Value = serde_json::json!({"name":"endpoint_a","cache":{},"comm":{}});
+        let connection = parse_endpoint(Path::new("endpoint_a.json"), &root, Path::new("."), &[], &mut Vec::new())
+            .expect("endpointを解析できませんでした。");
+        assert!(connection.source_asset_id.is_none());
+        assert!(connection.destination_asset_id.is_none());
+        assert!(connection.owner_asset_id.is_none());
     }
 }

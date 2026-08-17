@@ -345,6 +345,20 @@ pub struct ConnectionDefinition {
     pub endpoint_config: Option<String>,
     #[serde(default)]
     pub details: BTreeMap<String, String>,
+    /// `source`が指す相手を登録アセットに解決した結果。相手が外部ホストや
+    /// キャッシュのようにアセットでない場合、および解決できなかった場合はNone。
+    ///
+    /// 解決は`linking::resolve_links`が行う。永続化された値はあくまでキャッシュで、
+    /// 真実は毎回の再計算側にある（アセットを改名しても表示が追従するため）。
+    #[serde(default)]
+    pub source_asset_id: Option<String>,
+    /// `destination`側の解決結果。意味は`source_asset_id`と同じ。
+    #[serde(default)]
+    pub destination_asset_id: Option<String>,
+    /// この接続を所有・観測するアセット。Bridge由来の接続では端点ではなく
+    /// Bridgeアセット自身を指す。ログ取り込みの帰属先はこちらを使う。
+    #[serde(default)]
+    pub owner_asset_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

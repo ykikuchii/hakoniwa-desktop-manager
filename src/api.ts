@@ -56,5 +56,8 @@ export function newConnection(): ConnectionDefinition {
     pdu_names: [],
     endpoint_config: null,
     details: {},
+    source_asset_id: null,
+    destination_asset_id: null,
+    owner_asset_id: null,
   };
 }

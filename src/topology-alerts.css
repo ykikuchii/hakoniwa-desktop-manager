@@ -1,0 +1,212 @@
+/* Hakoniwa topology — abnormal state alert treatment */
+
+.topology-alert-live {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* The stage remains calm in normal operation and changes only when an issue exists. */
+.topology-stage:has(.topology-asset-node.status-error)::after,
+.topology-stage:has(.topology-core-node.status-error)::after {
+  border-color: rgba(255, 107, 104, 0.48);
+  box-shadow: inset 0 0 44px rgba(205, 56, 53, 0.12);
+  animation: topologyStageAlert 2.1s ease-in-out infinite;
+}
+
+.topology-stage:has(.topology-asset-node.status-disconnected)::after {
+  border-color: rgba(255, 183, 86, 0.32);
+  box-shadow: inset 0 0 33px rgba(204, 132, 36, 0.08);
+}
+
+/* Error nodes receive a clear concentric warning ring and a short, restrained shake. */
+.topology-asset-node.status-error,
+.topology-core-node.status-error {
+  animation: topologyErrorPulse 1.35s cubic-bezier(.4, 0, .2, 1) infinite;
+  border-color: #ff8986;
+  box-shadow:
+    0 0 0 3px rgba(255, 90, 86, 0.22),
+    0 0 0 9px rgba(255, 74, 70, 0.10),
+    0 0 28px rgba(255, 73, 69, 0.50),
+    inset 0 1px 10px rgba(255, 207, 205, 0.18);
+}
+
+.topology-asset-node.status-error::after,
+.topology-core-node.status-error::after {
+  content: "!";
+  position: absolute;
+  z-index: 8;
+  right: -8px;
+  top: -8px;
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  border: 2px solid #2b1120;
+  border-radius: 50%;
+  background: #ff6865;
+  color: #fff8f7;
+  box-shadow: 0 3px 11px rgba(76, 5, 8, 0.50);
+  font-size: 12px;
+  font-weight: 900;
+  line-height: 1;
+}
+
+/* A disconnected asset remains readable but receives an amber beacon instead of an error alarm. */
+.topology-asset-node.status-disconnected {
+  animation: topologyDisconnectPulse 2.2s ease-in-out infinite;
+  border-color: rgba(255, 185, 86, 0.90);
+  box-shadow:
+    0 0 0 3px rgba(255, 178, 70, 0.10),
+    0 0 20px rgba(244, 157, 48, 0.20),
+    inset 0 1px 0 rgba(255, 243, 217, 0.07);
+}
+
+.topology-asset-node.status-disconnected::after {
+  content: "×";
+  position: absolute;
+  z-index: 8;
+  right: -7px;
+  top: -7px;
+  display: grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  border: 2px solid #2b1b0e;
+  border-radius: 50%;
+  background: #f7b44d;
+  color: #211507;
+  box-shadow: 0 3px 10px rgba(66, 38, 2, 0.45);
+  font-size: 12px;
+  font-weight: 900;
+  line-height: 1;
+}
+
+/* Fixed rail avoids changing the graph's geometry when a new alert arrives. */
+.topology-alert-rail {
+  position: fixed;
+  z-index: 100;
+  right: 24px;
+  bottom: 22px;
+  display: grid;
+  gap: 10px;
+  width: min(370px, calc(100vw - 32px));
+  pointer-events: none;
+}
+
+.topology-alert-card {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr) 24px;
+  gap: 10px;
+  align-items: start;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-left-width: 4px;
+  border-radius: 12px;
+  background: rgba(8, 16, 31, 0.96);
+  box-shadow: 0 15px 37px rgba(0, 0, 0, 0.38);
+  color: #eaf2fc;
+  padding: 12px 10px 12px 11px;
+  pointer-events: auto;
+  animation: topologyAlertEnter 320ms cubic-bezier(.2, .85, .2, 1) both;
+  backdrop-filter: blur(14px);
+}
+
+.topology-alert-card.alert-error { border-left-color: #ff706d; }
+.topology-alert-card.alert-disconnected { border-left-color: #ffc05a; }
+.topology-alert-card.alert-recovered { border-left-color: #5fdcaf; }
+
+.topology-alert-icon {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 10px;
+  background: rgba(160, 181, 212, 0.14);
+  color: #ecf6ff;
+  font-size: 17px;
+  font-weight: 850;
+}
+.alert-error .topology-alert-icon { background: rgba(255, 97, 92, 0.18); color: #ffaaa6; }
+.alert-disconnected .topology-alert-icon { background: rgba(255, 187, 73, 0.17); color: #ffcb78; }
+.alert-recovered .topology-alert-icon { background: rgba(74, 215, 159, 0.17); color: #8aebc2; }
+
+.topology-alert-content { min-width: 0; }
+.topology-alert-severity {
+  display: block;
+  color: #98abc7;
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: .11em;
+  text-transform: uppercase;
+}
+.topology-alert-card strong { display: block; overflow: hidden; margin-top: 2px; color: #f5f8fd; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.topology-alert-card p { display: -webkit-box; overflow: hidden; margin: 5px 0 0; color: #afbed3; font-size: 10px; line-height: 1.45; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+.topology-alert-action {
+  margin-top: 8px;
+  border: 0;
+  border-bottom: 1px solid currentColor;
+  background: transparent;
+  color: #9bd6ff;
+  font: inherit;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 0 0 1px;
+}
+.topology-alert-action:hover,
+.topology-alert-action:focus-visible { color: #e0f4ff; outline: none; }
+.topology-alert-dismiss {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: #7f92ae;
+  font-size: 18px;
+  line-height: 1;
+}
+.topology-alert-dismiss:hover,
+.topology-alert-dismiss:focus-visible { background: rgba(154, 178, 214, 0.14); color: #eff7ff; outline: none; }
+
+@keyframes topologyErrorPulse {
+  0%, 100% { filter: brightness(1); transform: translate(-50%, -50%) scale(1); }
+  45% { filter: brightness(1.22); transform: translate(-50%, -50%) scale(1.042); }
+  57% { transform: translate(calc(-50% - 1px), -50%) scale(1.042); }
+  69% { transform: translate(calc(-50% + 1px), -50%) scale(1.025); }
+}
+
+@keyframes topologyDisconnectPulse {
+  0%, 100% { filter: brightness(.92); }
+  50% { filter: brightness(1.22); }
+}
+
+@keyframes topologyStageAlert {
+  0%, 100% { opacity: .58; }
+  50% { opacity: 1; }
+}
+
+@keyframes topologyAlertEnter {
+  from { opacity: 0; transform: translateX(24px) scale(.96); }
+  to { opacity: 1; transform: translateX(0) scale(1); }
+}
+
+@media (max-width: 680px) {
+  .topology-alert-rail { right: 12px; bottom: 12px; width: calc(100vw - 24px); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .topology-asset-node.status-error,
+  .topology-core-node.status-error,
+  .topology-asset-node.status-disconnected,
+  .topology-stage:has(.topology-asset-node.status-error)::after,
+  .topology-stage:has(.topology-core-node.status-error)::after,
+  .topology-alert-card {
+    animation: none;
+  }
+}

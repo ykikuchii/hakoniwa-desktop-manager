@@ -1,6 +1,7 @@
 mod commands;
 mod core;
 mod importer;
+mod linking;
 mod monitor;
 mod process;
 mod state;

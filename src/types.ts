@@ -80,6 +80,11 @@ export interface ConnectionDefinition {
   pdu_names: string[];
   endpoint_config?: string | null;
   details: Record<string, string>;
+  /** Rust の linking がアセットへ解決した結果。相手がアセットでなければ null。 */
+  source_asset_id?: string | null;
+  destination_asset_id?: string | null;
+  /** この接続を観測するアセット。Bridge 由来では端点ではなく Bridge 自身。 */
+  owner_asset_id?: string | null;
 }
 
 export interface ConnectionSnapshot {
