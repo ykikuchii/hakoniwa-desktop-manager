@@ -1,0 +1,109 @@
+name: Publish approved Hakoniwa Core artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      core_tag:
+        description: hakoniwa-core-pro version tag to build
+        required: true
+        default: v1.3.0
+      source_revision:
+        description: Immutable hakoniwa-core-pro commit SHA recorded in the catalog
+        required: true
+        default: 841a8bad447e6b5d549b4f4d543346e1817e37e8
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform_id: linux-x64
+          - runner: macos-14
+            platform_id: macos-arm64
+          - runner: macos-13
+            platform_id: macos-x64
+          - runner: windows-2022
+            platform_id: windows-x64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout manager repository
+        uses: actions/checkout@v4
+      - name: Checkout exact Hakoniwa Core source
+        uses: actions/checkout@v4
+        with:
+          repository: hakoniwalab/hakoniwa-core-pro
+          ref: ${{ inputs.source_revision }}
+          path: core-source
+          submodules: recursive
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Configure Linux prerequisites
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y cmake build-essential libgtest-dev zip
+      - name: Build Core Pro on Linux or macOS
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          cd core-source
+          python3.12 tools/hako.py doctor
+          python3.12 tools/hako.py build
+          HAKO_INSTALL_PREFIX="$GITHUB_WORKSPACE/core-install" ./install.bash
+          cd "$GITHUB_WORKSPACE/core-install"
+          zip -r "$GITHUB_WORKSPACE/hakoniwa-core-pro-${{ inputs.core_tag }}-${{ matrix.platform_id }}.zip" .
+      - name: Build Core Pro on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Set-Location core-source
+          python tools/hako.py doctor
+          python tools/hako.py build
+          ./win-build-install.ps1 -InstallPrefix "$env:GITHUB_WORKSPACE/core-install"
+          Compress-Archive -Path "$env:GITHUB_WORKSPACE/core-install/*" -DestinationPath "$env:GITHUB_WORKSPACE/hakoniwa-core-pro-${{ inputs.core_tag }}-${{ matrix.platform_id }}.zip"
+      - name: Upload verified candidate archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-${{ matrix.platform_id }}
+          path: hakoniwa-core-pro-${{ inputs.core_tag }}-${{ matrix.platform_id }}.zip
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout manager repository
+        uses: actions/checkout@v4
+      - name: Download all platform archives
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: core-*
+          merge-multiple: true
+      - name: Generate catalog and checksums
+        shell: bash
+        run: |
+          python3 tools/create_core_catalog.py \
+            --version "${{ inputs.core_tag }}" \
+            --revision "${{ inputs.source_revision }}" \
+            --release-base-url "https://github.com/${{ github.repository }}/releases/download/${{ inputs.core_tag }}" \
+            --artifact "linux-x64=dist/hakoniwa-core-pro-${{ inputs.core_tag }}-linux-x64.zip" \
+            --artifact "macos-x64=dist/hakoniwa-core-pro-${{ inputs.core_tag }}-macos-x64.zip" \
+            --artifact "macos-arm64=dist/hakoniwa-core-pro-${{ inputs.core_tag }}-macos-arm64.zip" \
+            --artifact "windows-x64=dist/hakoniwa-core-pro-${{ inputs.core_tag }}-windows-x64.zip" \
+            --output dist/approved-core-catalog.json
+          (cd dist && sha256sum *.zip > SHA256SUMS)
+      - name: Publish immutable release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh release create "${{ inputs.core_tag }}" \
+            --title "Approved Hakoniwa Core ${{ inputs.core_tag }}" \
+            --notes "Built from hakoniwalab/hakoniwa-core-pro@${{ inputs.source_revision }}. SHA-256 checksums and the app catalog are attached." \
+            dist/*.zip dist/SHA256SUMS dist/approved-core-catalog.json

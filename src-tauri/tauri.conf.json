@@ -1,0 +1,49 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Hakoniwa Desktop Manager",
+  "version": "0.1.0",
+  "identifier": "net.hakoniwa.desktopmanager",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Hakoniwa Desktop Manager",
+        "width": 1440,
+        "height": 960,
+        "minWidth": 1120,
+        "minHeight": 720,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost; style-src 'self' 'unsafe-inline'; img-src 'self' asset: data:"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "icon": ["icons/icon.png"],
+    "targets": "all",
+    "category": "DeveloperTool",
+    "shortDescription": "Hakoniwa Core and asset lifecycle manager",
+    "longDescription": "A cross-platform desktop application for managing Hakoniwa Core, assets, and communication topology.",
+    "createUpdaterArtifacts": false,
+    "windows": {
+      "wix": {
+        "language": ["ja-JP"]
+      }
+    },
+    "macOS": {
+      "minimumSystemVersion": "10.15"
+    },
+    "linux": {
+      "deb": {
+        "depends": []
+      }
+    }
+  }
+}

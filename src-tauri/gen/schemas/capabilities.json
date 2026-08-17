@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"Capabilities required by the local Hakoniwa manager window.","local":true,"windows":["main"],"permissions":["core:default","dialog:default"]}}

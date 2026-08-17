@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "component": "hakoniwa-core-pro",
+  "publisher": "Hakoniwa Desktop Manager maintainers",
+  "releases": [
+    {
+      "version": "v1.3.0",
+      "source_revision": "841a8bad447e6b5d549b4f4d543346e1817e37e8",
+      "artifacts": [
+        {
+          "platform": "windows",
+          "architecture": "x64",
+          "url": "https://<trusted-release-host>/hakoniwa-core-pro-v1.3.0-windows-x64.zip",
+          "sha256": "REPLACE_WITH_64_HEX_SHA256_OF_RELEASE_ARTIFACT",
+          "archive_format": "zip",
+          "hako_cmd_relative_path": "bin/hako-cmd.exe",
+          "install_root": null,
+          "provenance": {
+            "repository": "https://github.com/hakoniwalab/hakoniwa-core-pro",
+            "release_tag": "v1.3.0",
+            "build_workflow": "publish-core-artifacts.yml"
+          }
+        }
+      ]
+    }
+  ]
+}
