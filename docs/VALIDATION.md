@@ -9,7 +9,7 @@
 | React/TypeScriptの型検査 | **Linuxで検証済み** | `pnpm run check`が成功。 |
 | フロントエンド本番ビルド | **Linuxで検証済み** | `pnpm run build`が成功。 |
 | Rustコンパイル | **Linuxで検証済み** | `cargo check --manifest-path src-tauri/Cargo.toml`が成功。 |
-| Rustユニットテスト | **Linuxで検証済み** | 7件が成功。 |
+| Rustユニットテスト | **Linuxで検証済み** | 26件が成功。内訳は下表。 |
 | Linuxネイティブバンドル | **Linuxで検証済み** | DEB、RPM、AppImageの3形式を生成。 |
 | Windows x64実行 | **CIで検証予定** | TauriのWindowsバンドルおよびCoreビルドCIを用意。実Windows環境で未実行。 |
 | macOS x64/ARM64実行 | **CIで検証予定** | TauriのmacOSバンドルおよびCoreビルドCIを用意。実macOS環境で未実行。 |
@@ -27,17 +27,42 @@ cargo test --manifest-path src-tauri/Cargo.toml
 pnpm tauri build
 ```
 
-Rustユニットテストで確認した対象は次のとおりです。
+Rustユニットテストで確認した対象は次のとおりです。v0.1.0時点の7件に、その後の不具合修正にともなう回帰テスト19件を加えた26件です。
 
 | テスト | 確認事項 |
 | --- | --- |
 | `core::rejects_non_https_artifact` | HTTPのCore配布URLを拒否する。 |
 | `core::rejects_parent_directory` | ZIP展開時の`..`パスを危険として扱う。 |
 | `commands::starts_dependencies_first` | アセットの依存順序を解決する。 |
+| `commands::monitor_targets_follow_resolved_owner` | ログの帰属先を解決済みの`owner_asset_id`で決める。 |
+| `commands::monitor_targets_ignore_config_file_overlap` | 成立しなかった旧条件（`endpoint_config`と`config_files`の一致）を復活させない。 |
+| `commands::monitor_targets_keep_bridge_name_fallback` | 解決結果を持たない旧`workspace.json`でもBridge名で帰属できる。 |
 | `importer::classifies_transports` | WebSocketとSHMをtransportとして正規化する。 |
 | `importer::parses_launcher_asset` | Launcherの`assets[]`と`after_start`を読み取る。 |
-| `process::rejects_empty_program` | 空の実行プログラムを拒否する。 |
+| `importer::parse_endpoint_leaves_links_unset` | 解析層はアセットとの突き合わせを行わない。 |
+| `linking::links_endpoints_to_assets_by_name` | 接続の端点をアセット名で解決する。 |
+| `linking::links_endpoints_despite_whitespace_and_case` | 前後空白・区切り文字・大小の違いを吸収する。 |
+| `linking::links_owner_by_config_path_in_command_args` | 名前が一致しなくても、設定ファイルのパスで所有アセットへ紐づける。 |
+| `linking::links_endpoint_named_after_its_config_file` | 設定ファイル名から採られたエンドポイント名を解決する。 |
+| `linking::links_owner_by_bridge_name` | Bridge由来の接続を端点ではなくBridgeアセットへ帰属させる。 |
+| `linking::keeps_non_asset_endpoints_unlinked_and_silent` | 外部ホストや内部キャッシュを未解決のまま扱い、警告を出さない。 |
+| `linking::warns_for_each_unresolved_endpoint` | 紐づかない端点を、送信元／宛先を名指しで警告する。 |
+| `linking::refuses_ambiguous_config_path_match` | 候補が複数ある設定パスでは先勝ちせず未解決にする。 |
+| `linking::re_resolution_follows_asset_changes` | アセットの追加・削除に解決結果が追従する。 |
 | `monitor::records_message_as_connected` | PDU送受信のログをConnected状態へ変換する。 |
+| `process::rejects_empty_program` | 空の実行プログラムを拒否する。 |
+| `process::start_returns_without_deadlock` | `start`がロックを保持したまま`snapshot`を呼ばない。 |
+| `process::requested_stop_is_not_reported_as_failure` | 利用者操作による停止をシグナル終了でも異常終了として記録しない。 |
+| `process::stop_snapshot_keeps_earlier_output` | 停止後のスナップショットが既存のログ末尾を保持する。 |
+| `process::stopping_twice_is_idempotent` | 停止済みプロセスへの再停止で状態を壊さない。 |
+| `process::caps_line_length_without_newline` | 改行を出さない出力でも1行の保持量を上限で抑える。 |
+| `process::stop_owner_reports_nothing_for_unknown_owner` | 未知のownerに対する停止要求を空の結果として返す。 |
+
+回帰テストは、対応する修正を1つずつ元に戻した版でそれぞれが失敗することを確認したうえで採用しています。テストが緑であることと、欠陥を検出できることは別であるため、新しい回帰テストを追加する際は同じ確認を行ってください。
+
+### 測定環境の補足
+
+上表の26件は、Windowsホスト上のWSL Ubuntu 24.04（rustupで導入したstableツールチェーン、Tauriの依存はaptで導入）で`cargo test`を実行して確認しました。v0.1.0当初の7件はLinux x64のビルド環境で確認したものです。フロントエンドにはテストランナーを導入していないため、`src/selectors.ts`などのTypeScript側の純関数は型検査とビルドのみで、単体テストはありません。
 
 ## Linuxで生成した配布物
 
@@ -97,6 +122,7 @@ Linuxでインストール後、次の順に確認してください。
 2. `publish-core-artifacts.yml`を一度実行し、実ハッシュを持つカタログを生成・二者承認する。
 3. Business Packの代表Recipe一つを選び、Launcher、Endpoint、Bridgeの実ファイルを使った受入シナリオを実行する。
 4. Core Proのread-only PDU monitor adapterを追加し、共有メモリのみのPDU通信についてもイベント時刻・方向・件数を記録する。
+5. フロントエンドのテストランナーを導入するか判断する。現状`src/selectors.ts`のプロセス選択・接続の対応付けは純関数だが単体テストがなく、回帰は目視受入に依存している。
 
 ## 参照
 
