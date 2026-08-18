@@ -26,7 +26,13 @@
   },
   "bundle": {
     "active": true,
-    "icon": ["icons/icon.png"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
     "targets": "all",
     "category": "DeveloperTool",
     "shortDescription": "Hakoniwa Core and asset lifecycle manager",
@@ -34,7 +40,9 @@
     "createUpdaterArtifacts": false,
     "windows": {
       "wix": {
-        "language": ["ja-JP"]
+        "language": [
+          "ja-JP"
+        ]
       }
     },
     "macOS": {

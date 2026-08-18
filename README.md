@@ -32,6 +32,32 @@ Business Packでは、`hakoniwa-core-pro`、PDU Endpoint、PDU Bridge Core、PDU
 | Bridge monitor／Endpointログ | 構造化または行単位のイベント取込 | 接続状態、通信数、PDU、最終活動、エラー | 対応するmonitor／ログ出力が必要です。 |
 | 遠隔アセット | Endpoint／Bridge／RPC経路 | 接続とハートビート／データフロー | リモート側に観測用endpoint・bridge・テレメトリがなければ、到達性の範囲に限定されます。 |
 
+## Windowsでのダブルクリック起動
+
+`tools\launch-windows.cmd` をダブルクリックすると、Windowsネイティブの実行ファイルが起動します。ソースが実行ファイルより新しければ自動で再ビルドし、`start`で切り離して起動するのでコンソールは残りません。
+
+| 前提 | 内容 |
+| --- | --- |
+| Rust | rustupで導入したMSVCツールチェーン（`x86_64-pc-windows-msvc`）。 |
+| C++ビルドツール | Visual Studio 2022のC++ワークロード、またはBuild Tools。 |
+| Node.js | フロントエンドのビルドに使います。 |
+| WebView2ランタイム | Windows 11には既定で入っています。 |
+
+初回はビルドに数分かかります。Rustのコードを変更したときに強制的に作り直すには、環境変数`HDM_REBUILD=1`を付けて起動します。
+
+インストーラを使う場合は、`pnpm tauri build`が生成する次のどちらかを実行してください。スタートメニューとデスクトップにショートカットが作られます。
+
+```text
+src-tauri/target/release/bundle/nsis/Hakoniwa Desktop Manager_0.1.0_x64-setup.exe
+src-tauri/target/release/bundle/msi/Hakoniwa Desktop Manager_0.1.0_x64_ja-JP.msi
+```
+
+WSL上のWSLg経由でも起動できますが、環境によってはWSLgがGPU共有に失敗して`COPY MODE`へ落ち、ウィンドウが真っ黒のまま何も描画されないことがあります（`MESA: error: ZINK: failed to choose pdev`）。この症状が出る環境ではネイティブビルドを使ってください。
+
+### 既知の問題
+
+起動直後にウィンドウが最小化状態で現れることがあります。タスクバーのアイコンから復元してください。原因は未特定です。
+
 ## 開発環境での起動
 
 ### 前提条件
@@ -89,7 +115,7 @@ hakoniwa-desktop-manager/
 ├── src/                         # React + TypeScript UI
 ├── src-tauri/                   # Rustのローカル実行・監視層
 ├── config/                      # Coreカタログの雛形
-├── tools/                       # カタログ生成ツール
+├── tools/                       # 起動ランチャ、カタログ生成ツール
 ├── .github/workflows/           # OS別CoreアーティファクトCI
 └── docs/                        # アーキテクチャ、運用、検証資料
 ```
