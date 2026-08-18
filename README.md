@@ -98,6 +98,8 @@ Hakoniwaの通常のランタイムでは、アセットを登録して待機さ
 
 ## 承認済みCoreカタログ
 
+このアプリが導入対象とするCoreは [`hakoniwalab/hakoniwa-core-pro`](https://github.com/hakoniwalab/hakoniwa-core-pro) です。[1] アーティファクトは同リポジトリの指定コミットから[`publish-core-artifacts.yml`](.github/workflows/publish-core-artifacts.yml)でビルドし、SHA-256とともに承認カタログへ登録します。カタログの各エントリは`provenance`に元リポジトリ・リリースタグ・ビルドワークフローを記録します。
+
 アプリは、実行時に次の場所のローカルカタログだけを利用します。
 
 | OS | カタログ既定位置 |
