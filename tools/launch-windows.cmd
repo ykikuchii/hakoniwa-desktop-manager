@@ -3,6 +3,7 @@ setlocal
 rem Launch Hakoniwa Desktop Manager by double-click (native Windows build).
 rem Builds the app when the executable is missing or the sources changed, then
 rem starts it detached so this console does not stay attached to the app.
+rem Arguments are passed through, e.g. --start-all to start everything on launch.
 rem
 rem ASCII only on purpose: a UTF-8 batch file breaks parsing on a Japanese
 rem (cp932) console.
@@ -38,7 +39,7 @@ if defined NEEDS_BUILD (
 if not exist "%EXE%" (echo [ERROR] Executable not found: %EXE% & goto :fail)
 
 echo Starting Hakoniwa Desktop Manager...
-start "" "%EXE%"
+start "" "%EXE%" %*
 popd
 endlocal
 exit /b 0
