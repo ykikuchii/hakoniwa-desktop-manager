@@ -7,11 +7,17 @@ use crate::{
         ActivationTiming, AssetDefinition, CommunicationEvent, CommunicationEventType,
         CoreCatalog, CoreInstallResult, EventDirection,
         ImportPreview, LifecycleCommandResult, ObservationSource, ProcessKind, ProcessStatus,
-        ProgramSpec, Workspace, WorkspaceSnapshot,
+        ProgramSpec, ReadinessCheck, Workspace, WorkspaceSnapshot,
     },
 };
 use chrono::Utc;
-use std::{collections::{BTreeMap, BTreeSet}, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    net::TcpStream,
+    path::Path,
+    thread,
+    time::{Duration, Instant},
+};
 use tauri::State;
 use uuid::Uuid;
 
@@ -127,14 +133,109 @@ pub fn run_lifecycle_command(state: State<'_, AppState>, command: String) -> Res
     if !matches!(command.as_str(), "start" | "stop" | "reset") {
         return Err("許可されていないライフサイクル操作です。".to_owned());
     }
-    let selection = state.workspace.lock().map_err(|_| "ワークスペースをロックできません。".to_owned())?.core_release.clone()
-        .ok_or_else(|| "承認済みCoreを導入して選択してください。".to_owned())?;
-    let spec = ProgramSpec { program: selection.hako_cmd_path, args: vec![command.clone()], cwd: Some(selection.install_directory), env: BTreeMap::new(), target: crate::types::ExecutionTarget::Native };
+    let (selection, env) = {
+        let workspace = state.workspace.lock().map_err(|_| "ワークスペースをロックできません。".to_owned())?;
+        (workspace.core_release.clone(), workspace.core_env.clone())
+    };
+    let selection = selection.ok_or_else(|| "承認済みCoreを導入して選択してください。".to_owned())?;
+    let spec = ProgramSpec { program: selection.hako_cmd_path, args: vec![command.clone()], cwd: Some(selection.install_directory), env, target: crate::types::ExecutionTarget::Native };
     let (code, stdout, stderr) = run_oneshot(&spec).map_err(|error| error.to_string())?;
     Ok(LifecycleCommandResult { command, status: if code == 0 { ProcessStatus::Exited } else { ProcessStatus::Failed }, stdout, stderr })
 }
 
-#[tauri::command]
+/// 準備完了を待つ上限。これを超えたら、条件の指定か対象そのものが誤っていると
+/// みなして中断する。
+const READINESS_TIMEOUT: Duration = Duration::from_secs(30);
+const READINESS_POLL: Duration = Duration::from_millis(200);
+
+/// アセットが `readiness` の条件を満たすまで待つ。
+///
+/// `Manual`（既定）は待たない。従来の挙動と同じ。
+///
+/// 待つ意味があるのは、次の段階がこのアセットの準備完了を前提にしている場合。
+/// Hakoniwa Core は `hako-cmd start` 以降はアセットの登録を受け付けないため、
+/// 登録アセットが登録を終える前に Core を起動すると、後続のアセットは
+/// `Can not register asset` で落ちる。プロセスを起動しただけでは、その登録が
+/// 済んだことにはならない。
+///
+/// 対象プロセスが条件を満たす前に終了した場合は、タイムアウトまで待たずに
+/// 即座に失敗させる。死んだプロセスを待ち続けても状況は変わらないうえ、
+/// 本当の失敗理由がタイムアウトという別の症状に置き換わってしまう。
+fn wait_for_readiness(
+    state: &State<'_, AppState>,
+    process_id: &str,
+    owner_name: &str,
+    check: &ReadinessCheck,
+) -> Result<(), String> {
+    let deadline = Instant::now() + READINESS_TIMEOUT;
+    loop {
+        let snapshot = state.processes.snapshot(process_id).map_err(|error| error.to_string())?;
+
+        let ready = match check {
+            ReadinessCheck::Manual => true,
+            ReadinessCheck::LogContains { text } => snapshot
+                .stdout_tail
+                .iter()
+                .chain(snapshot.stderr_tail.iter())
+                .any(|line| line.contains(text.as_str())),
+            ReadinessCheck::TcpPort { host, port } => {
+                TcpStream::connect((host.as_str(), *port)).is_ok()
+            }
+        };
+        if ready {
+            return Ok(());
+        }
+
+        if matches!(snapshot.status, ProcessStatus::Exited | ProcessStatus::Failed) {
+            // 最後の行をそのまま出すと、無害な警告が出力の末尾に来ているだけで
+            // 本当の失敗理由が隠れる。エラーらしい行を後ろから探し、無ければ
+            // 末尾に落とす。
+            let looks_like_error = |line: &&String| {
+                let line = line.as_str();
+                ["ERROR", "Error", "error:", "Traceback", "FAILED", "Failed", "Exception"]
+                    .iter()
+                    .any(|needle| line.contains(needle))
+            };
+            let detail = snapshot
+                .stderr_tail
+                .iter()
+                .chain(snapshot.stdout_tail.iter())
+                .rev()
+                .find(looks_like_error)
+                .or_else(|| snapshot.stderr_tail.last())
+                .or_else(|| snapshot.stdout_tail.last())
+                .cloned()
+                .unwrap_or_default();
+            let code = snapshot
+                .exit_code
+                .map(|value| format!("終了コード {value}。"))
+                .unwrap_or_default();
+            return Err(format!(
+                "{owner_name} は準備完了を報告する前に終了しました。{code}{detail}"
+            ));
+        }
+
+        if Instant::now() >= deadline {
+            return Err(match check {
+                ReadinessCheck::LogContains { text } => format!(
+                    "{owner_name} が {} 秒以内に「{text}」を出力しませんでした。",
+                    READINESS_TIMEOUT.as_secs()
+                ),
+                ReadinessCheck::TcpPort { host, port } => format!(
+                    "{owner_name} が {} 秒以内に {host}:{port} を開きませんでした。",
+                    READINESS_TIMEOUT.as_secs()
+                ),
+                ReadinessCheck::Manual => unreachable!("Manual は常に準備完了として扱う"),
+            });
+        }
+
+        thread::sleep(READINESS_POLL);
+    }
+}
+
+// 準備完了の待ち合わせで数十秒ブロックしうる。同期コマンドはメインスレッドで
+// 走り UI を止めるため、async 指定でワーカースレッドに逃がす。
+#[tauri::command(async)]
 pub fn start_all(state: State<'_, AppState>) -> Result<Vec<crate::types::ProcessSnapshot>, String> {
     let workspace = state.workspace.lock().map_err(|_| "ワークスペースをロックできません。".to_owned())?.clone();
     let ordered = topological_order(&workspace.assets)?;
@@ -144,10 +245,23 @@ pub fn start_all(state: State<'_, AppState>) -> Result<Vec<crate::types::Process
     }
     for timing in [ActivationTiming::BeforeStart, ActivationTiming::Manual, ActivationTiming::AfterStart] {
         for asset in ordered.iter().filter(|asset| asset.enabled && asset.activation_timing == timing) {
-            started.push(state.processes.start(asset.id.clone(), asset.name.clone(), ProcessKind::Asset, asset.command.clone()).map_err(|error| error.to_string())?);
+            let snapshot = state.processes.start(asset.id.clone(), asset.name.clone(), ProcessKind::Asset, asset.command.clone()).map_err(|error| error.to_string())?;
+            // 依存順に起動しているので、次へ進む前にこのアセットの準備完了を待つ。
+            // これを怠ると、後続のアセットや Core が、まだ準備できていない相手を
+            // 前提に動き出す。
+            wait_for_readiness(&state, &snapshot.id, &asset.name, &asset.readiness)?;
+            started.push(snapshot);
         }
         if timing == ActivationTiming::BeforeStart && workspace.core_release.is_some() {
-            let _ = run_lifecycle_command(state.clone(), "start".to_owned());
+            // ここに到達した時点で、登録アセットはすべて準備完了を報告済み。
+            // Core の起動で登録が締め切られても取りこぼしが出ない。
+            // 失敗を握りつぶすと、PDU セグメントが無いまま after_start のアセットが
+            // 起動され、原因と離れた場所（attach 時のクラッシュ）で症状が出る。
+            let result = run_lifecycle_command(state.clone(), "start".to_owned())?;
+            if result.status == ProcessStatus::Failed {
+                let detail = result.stderr.lines().chain(result.stdout.lines()).rev().find(|line| !line.trim().is_empty()).unwrap_or_default().to_owned();
+                return Err(format!("hako-cmd start が失敗しました。{detail}"));
+            }
         }
     }
     Ok(started)
@@ -295,7 +409,7 @@ mod tests {
     use crate::types::{AssetRole, ExecutionTarget, ProgramSpec};
 
     fn asset(id: &str, depends_on: Vec<&str>) -> AssetDefinition {
-        AssetDefinition { id: id.to_owned(), name: id.to_owned(), role: AssetRole::Other, command: ProgramSpec { program: "echo".to_owned(), args: vec![], cwd: None, env: BTreeMap::new(), target: ExecutionTarget::Native }, depends_on: depends_on.into_iter().map(str::to_owned).collect(), activation_timing: ActivationTiming::Manual, config_files: vec![], enabled: true }
+        AssetDefinition { id: id.to_owned(), name: id.to_owned(), role: AssetRole::Other, command: ProgramSpec { program: "echo".to_owned(), args: vec![], cwd: None, env: BTreeMap::new(), target: ExecutionTarget::Native }, depends_on: depends_on.into_iter().map(str::to_owned).collect(), activation_timing: ActivationTiming::Manual, config_files: vec![], enabled: true, readiness: ReadinessCheck::default() }
     }
 
     #[test]

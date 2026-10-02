@@ -183,7 +183,7 @@ impl AssetIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ActivationTiming, AssetRole, ExecutionTarget, ProgramSpec, TransportKind};
+    use crate::types::{ActivationTiming, AssetRole, ExecutionTarget, ProgramSpec, ReadinessCheck, TransportKind};
 
     fn asset(name: &str, args: Vec<&str>) -> AssetDefinition {
         AssetDefinition {
@@ -201,6 +201,7 @@ mod tests {
             activation_timing: ActivationTiming::Manual,
             config_files: Vec::new(),
             enabled: true,
+            readiness: ReadinessCheck::default(),
         }
     }
 

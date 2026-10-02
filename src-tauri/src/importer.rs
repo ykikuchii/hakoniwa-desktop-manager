@@ -1,6 +1,6 @@
 use crate::types::{
     ActivationTiming, AssetDefinition, AssetRole, ConnectionDefinition,
-    ExecutionTarget, ImportPreview, ProgramSpec, TransportKind,
+    ExecutionTarget, ImportPreview, ProgramSpec, ReadinessCheck, TransportKind,
 };
 use serde_json::Value;
 use std::{collections::{BTreeMap, BTreeSet}, fs, path::{Path, PathBuf}};
@@ -82,6 +82,22 @@ fn parse_launcher(path: &Path, root: &Value, warnings: &mut Vec<String>) -> Vec<
             Some("after_start") => ActivationTiming::AfterStart,
             _ => ActivationTiming::Manual,
         };
+        // 取り込み元が readiness を宣言していれば尊重する。壊れた指定は既定の
+        // Manual に落とし、取り込み全体を失敗させない。宣言が無い場合も Manual
+        // なので、従来のランチャ定義の挙動は変わらない。
+        let readiness = match item.get("readiness") {
+            None => ReadinessCheck::default(),
+            Some(value) => match serde_json::from_value::<ReadinessCheck>(value.clone()) {
+                Ok(check) => check,
+                Err(error) => {
+                    warnings.push(format!(
+                        "{}: asset「{}」のreadinessを解釈できませんでした（{error}）。手動確認として扱います。",
+                        path.display(), name
+                    ));
+                    ReadinessCheck::default()
+                }
+            },
+        };
         Some(AssetDefinition {
             id: stable_id(&format!("{}:{name}", path.display())),
             name: name.to_owned(),
@@ -95,6 +111,7 @@ fn parse_launcher(path: &Path, root: &Value, warnings: &mut Vec<String>) -> Vec<
             activation_timing,
             config_files: vec![path.display().to_string()],
             enabled: true,
+            readiness,
         })
     }).collect()
 }

@@ -134,6 +134,17 @@ pub struct AssetDefinition {
     pub config_files: Vec<String>,
     #[serde(default)]
     pub enabled: bool,
+    /// いつこのアセットを「起動済み」とみなすか。
+    ///
+    /// 既定の `Manual` は従来どおり、プロセスを起動した時点で次へ進む。
+    /// `LogContains` などを指定すると、一括起動はその条件が満たされるまで次の
+    /// 段階へ進まない。
+    ///
+    /// Hakoniwa Core は `hako-cmd start` 以降はアセットの登録を受け付けない。
+    /// 登録アセットが登録を終える前に Core を起動すると、後続のアセットが
+    /// `Can not register asset` で落ちる。その待ち合わせのために使う。
+    #[serde(default)]
+    pub readiness: ReadinessCheck,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -180,6 +191,13 @@ pub struct Workspace {
     pub core_release: Option<InstalledCoreSelection>,
     #[serde(default)]
     pub core_controller: Option<CoreController>,
+    /// `hako-cmd` のライフサイクル操作に渡す環境変数。
+    ///
+    /// `hako-cmd` は `HAKO_CONFIG_PATH` が指す設定の mmap 置き場で PDU セグメントを
+    /// 作る。アセット側と同じ設定を渡さないと、セグメントは別の場所に作られ、
+    /// 外部プロセスの attach が失敗する。
+    #[serde(default)]
+    pub core_env: BTreeMap<String, String>,
     #[serde(default)]
     pub assets: Vec<AssetDefinition>,
     #[serde(default)]
@@ -197,6 +215,7 @@ impl Workspace {
             source_directory: None,
             core_release: None,
             core_controller: None,
+            core_env: BTreeMap::new(),
             assets: Vec::new(),
             imported_connections: Vec::new(),
             last_opened_at: Some(Utc::now()),

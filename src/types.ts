@@ -50,6 +50,7 @@ export interface Workspace {
   source_directory?: string | null;
   core_release?: InstalledCoreSelection | null;
   core_controller?: CoreController | null;
+  core_env?: Record<string, string>;
   assets: AssetDefinition[];
   imported_connections: ConnectionDefinition[];
   last_opened_at?: string | null;
