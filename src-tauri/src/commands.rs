@@ -140,9 +140,15 @@ pub fn run_lifecycle_command(state: State<'_, AppState>, command: String) -> Res
     };
     let selection = selection.ok_or_else(|| "承認済みCoreを導入して選択してください。".to_owned())?;
     let spec = ProgramSpec { program: selection.hako_cmd_path, args: vec![command.clone()], cwd: Some(selection.install_directory), env, target: crate::types::ExecutionTarget::Native };
-    let (code, stdout, stderr) = run_oneshot(&spec).map_err(|error| error.to_string())?;
+    let (code, stdout, stderr) = run_oneshot(&spec, LIFECYCLE_TIMEOUT).map_err(|error| format!("hako-cmd {command}: {error}"))?;
     Ok(LifecycleCommandResult { command, status: if code == 0 { ProcessStatus::Exited } else { ProcessStatus::Failed }, stdout, stderr })
 }
+
+/// `hako-cmd` の 1 回の操作の上限。正常なら 1 秒もかからない。
+const LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// `hako-cmd reset` のあと、登録アセットが自分で終了するのを待つ上限。
+const STOP_GRACE: Duration = Duration::from_secs(3);
 
 /// 準備完了を待つ上限。これを超えたら、条件の指定か対象そのものが誤っていると
 /// みなして中断する。
@@ -341,9 +347,25 @@ pub fn start_all(state: State<'_, AppState>) -> Result<Vec<crate::types::Process
 #[tauri::command(async)]
 pub fn stop_all(state: State<'_, AppState>) -> Result<Vec<crate::types::ProcessSnapshot>, String> {
     let workspace = state.workspace.lock().map_err(|_| "ワークスペースをロックできません。".to_owned())?.clone();
-    let _ = if workspace.core_release.is_some() { run_lifecycle_command(state.clone(), "stop".to_owned()) } else { Ok(LifecycleCommandResult { command: "stop".to_owned(), status: ProcessStatus::Unknown, stdout: String::new(), stderr: String::new() }) };
-    let mut stopped = Vec::new();
     let mut failures = Vec::new();
+    if workspace.core_release.is_some() {
+        // stop だけで登録アセットを kill すると、conductor を持つアセットが Core の
+        // 状態遷移の途中で落ち、以後の hako-cmd が応答しなくなる（実測）。
+        // stop → reset で登録アセットを hakopy.start() から戻し、自分で終了させてから
+        // 残ったものだけを kill する。
+        for command in ["stop", "reset"] {
+            // Core が動いていなければ hako-cmd は失敗を返すが、停止としては正常。
+            // 報告するのは応答しなかった場合だけにする。
+            if let Err(error) = run_lifecycle_command(state.clone(), command.to_owned()) {
+                failures.push(error);
+            }
+        }
+        let deadline = Instant::now() + STOP_GRACE;
+        while !running_owner_names(&state, &workspace).is_empty() && Instant::now() < deadline {
+            thread::sleep(READINESS_POLL);
+        }
+    }
+    let mut stopped = Vec::new();
     for asset in workspace.assets.iter().rev() {
         let report = state.processes.stop_owner(&asset.id);
         stopped.extend(report.stopped);

@@ -30,6 +30,8 @@ pub enum ProcessError {
     NotFound(String),
     #[error("プロセスを停止できませんでした: {0}")]
     Stop(String),
+    #[error("{0} 秒以内に終了しなかったため中断しました。")]
+    Timeout(u64),
 }
 
 /// `stop_owner`の結果。停止できたプロセスと、停止に失敗したプロセスを取りこぼさず両方返す。
@@ -235,14 +237,55 @@ impl ProcessManager {
     }
 }
 
-pub fn run_oneshot(spec: &ProgramSpec) -> Result<(i32, String, String), ProcessError> {
+/// 終了まで待って終了コードと出力を返す。`timeout`を過ぎたら強制終了してエラーにする。
+///
+/// `hako-cmd`は Core の状態によっては応答せずに止まることがあり、上限が無いと
+/// 呼び出し元の一括停止まで道連れにして返らなくなる。
+pub fn run_oneshot(spec: &ProgramSpec, timeout: Duration) -> Result<(i32, String, String), ProcessError> {
     spec.validate().map_err(ProcessError::Validation)?;
-    let output = command_from_spec(spec)?.output()?;
-    Ok((
-        output.status.code().unwrap_or(-1),
-        String::from_utf8_lossy(&output.stdout).to_string(),
-        String::from_utf8_lossy(&output.stderr).to_string(),
-    ))
+    let mut command = command_from_spec(spec)?;
+    command.stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null());
+    let mut child = command.spawn()?;
+    // パイプが詰まって子が止まらないよう、待っている間も別スレッドで読み続ける。
+    let collect = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+        pipe.map(|mut pipe| thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = pipe.read_to_end(&mut bytes);
+            bytes
+        }))
+    };
+    let stdout = collect(child.stdout.take().map(|pipe| Box::new(pipe) as Box<dyn std::io::Read + Send>));
+    let stderr = collect(child.stderr.take().map(|pipe| Box::new(pipe) as Box<dyn std::io::Read + Send>));
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    // 孫プロセスがパイプを握っていると読み取りが終わらないため、待つのは
+    // `READER_DRAIN_BUDGET`まで。間に合わなければ読み取りスレッドは手放す。
+    let drain_deadline = Instant::now() + READER_DRAIN_BUDGET;
+    let text = |handle: Option<JoinHandle<Vec<u8>>>| {
+        let handle = handle?;
+        while !handle.is_finished() && Instant::now() < drain_deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        if !handle.is_finished() {
+            return None;
+        }
+        handle.join().ok().map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+    };
+    let (stdout, stderr) = (text(stdout).unwrap_or_default(), text(stderr).unwrap_or_default());
+    match status {
+        Some(status) => Ok((status.code().unwrap_or(-1), stdout, stderr)),
+        None => Err(ProcessError::Timeout(timeout.as_secs())),
+    }
 }
 
 fn command_from_spec(spec: &ProgramSpec) -> Result<Command, ProcessError> {
@@ -438,7 +481,7 @@ mod tests {
     #[test]
     fn rejects_empty_program() {
         let spec = ProgramSpec { program: " ".into(), args: vec![], cwd: None, env: BTreeMap::new(), target: ExecutionTarget::Native };
-        assert!(run_oneshot(&spec).is_err());
+        assert!(run_oneshot(&spec, Duration::from_secs(5)).is_err());
     }
 
     /// `start`が`processes`ロックを保持したまま`snapshot`を呼ぶと、
@@ -546,6 +589,14 @@ mod tests {
     #[cfg(not(windows))]
     fn marker_then_flood_spec() -> ProgramSpec {
         ProgramSpec { program: "/bin/sh".into(), args: vec!["-c".into(), "echo READY-MARK; i=1; while [ $i -le 600 ]; do echo line $i; i=$((i+1)); done".into()], cwd: None, env: BTreeMap::new(), target: ExecutionTarget::Native }
+    }
+
+    #[test]
+    fn oneshot_times_out_instead_of_hanging() {
+        let started = Instant::now();
+        let result = run_oneshot(&sleeper_spec(), Duration::from_secs(1));
+        assert!(matches!(result, Err(ProcessError::Timeout(1))), "{result:?}");
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 
     #[test]
