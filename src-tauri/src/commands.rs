@@ -255,6 +255,27 @@ fn tcp_reachable(host: &str, port: u16, deadline: Instant) -> bool {
     false
 }
 
+/// 一括起動の対象（有効なアセットと Core コントローラー）のうち、プロセスが
+/// 終了していないものの名前。
+fn running_owner_names(state: &State<'_, AppState>, workspace: &Workspace) -> Vec<String> {
+    let owners: BTreeSet<&str> = workspace
+        .assets
+        .iter()
+        .filter(|asset| asset.enabled)
+        .map(|asset| asset.id.as_str())
+        .chain(workspace.core_controller.iter().map(|controller| controller.id.as_str()))
+        .collect();
+    let names: BTreeSet<String> = state
+        .processes
+        .snapshots()
+        .into_iter()
+        .filter(|snapshot| owners.contains(snapshot.owner_id.as_str()))
+        .filter(|snapshot| matches!(snapshot.status, ProcessStatus::Starting | ProcessStatus::Running | ProcessStatus::Stopping))
+        .map(|snapshot| snapshot.owner_name)
+        .collect();
+    names.into_iter().collect()
+}
+
 /// 一括起動の実行中フラグを、関数を抜けるとき（失敗時も）に必ず下ろす。
 struct StartAllGuard<'a>(&'a AtomicBool);
 
@@ -273,6 +294,15 @@ pub fn start_all(state: State<'_, AppState>) -> Result<Vec<crate::types::Process
     }
     let _guard = StartAllGuard(&state.start_all_running);
     let workspace = state.workspace.lock().map_err(|_| "ワークスペースをロックできません。".to_owned())?.clone();
+    // 稼働中のアセットがあるまま一括起動すると、同じアセットが二重に起動する。
+    // 登録アセットは Core に二重登録できず、外部アセットは同じポートを取り合う。
+    let alive = running_owner_names(&state, &workspace);
+    if !alive.is_empty() {
+        return Err(format!(
+            "稼働中のプロセスがあるため一括起動できません（{}）。先にすべて停止してください。",
+            alive.join("、")
+        ));
+    }
     let ordered = topological_order(&workspace.assets)?;
     let mut started = Vec::new();
     if workspace.core_controller.is_some() {
@@ -306,7 +336,9 @@ pub fn start_all(state: State<'_, AppState>) -> Result<Vec<crate::types::Process
     Ok(started)
 }
 
-#[tauri::command]
+// hako-cmd stop と各プロセスの停止待ちで数秒かかる。同期コマンドはメインスレッドで
+// 走り、その間 UI が固まるため async 指定でワーカースレッドに逃がす。
+#[tauri::command(async)]
 pub fn stop_all(state: State<'_, AppState>) -> Result<Vec<crate::types::ProcessSnapshot>, String> {
     let workspace = state.workspace.lock().map_err(|_| "ワークスペースをロックできません。".to_owned())?.clone();
     let _ = if workspace.core_release.is_some() { run_lifecycle_command(state.clone(), "stop".to_owned()) } else { Ok(LifecycleCommandResult { command: "stop".to_owned(), status: ProcessStatus::Unknown, stdout: String::new(), stderr: String::new() }) };
