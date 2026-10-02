@@ -13,7 +13,8 @@ use crate::{
 use chrono::Utc;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    net::TcpStream,
+    net::{TcpStream, ToSocketAddrs},
+    sync::atomic::{AtomicBool, Ordering},
     path::Path,
     thread,
     time::{Duration, Instant},
@@ -158,35 +159,35 @@ const READINESS_POLL: Duration = Duration::from_millis(200);
 /// `Can not register asset` で落ちる。プロセスを起動しただけでは、その登録が
 /// 済んだことにはならない。
 ///
-/// 対象プロセスが条件を満たす前に終了した場合は、タイムアウトまで待たずに
-/// 即座に失敗させる。死んだプロセスを待ち続けても状況は変わらないうえ、
-/// 本当の失敗理由がタイムアウトという別の症状に置き換わってしまう。
+/// 対象プロセスが終了していれば、条件を満たしていても準備完了とはみなさない。
+/// 別のプロセスが同じポートを開いている場合など、条件だけが偶然満たされる
+/// ことがあるため。また、終了したプロセスはタイムアウトまで待たずに即座に
+/// 失敗させる。本当の失敗理由がタイムアウトという別の症状に置き換わるため。
 fn wait_for_readiness(
     state: &State<'_, AppState>,
     process_id: &str,
     owner_name: &str,
     check: &ReadinessCheck,
 ) -> Result<(), String> {
+    if matches!(check, ReadinessCheck::Manual) {
+        return Ok(());
+    }
     let deadline = Instant::now() + READINESS_TIMEOUT;
     loop {
-        let snapshot = state.processes.snapshot(process_id).map_err(|error| error.to_string())?;
-
         let ready = match check {
             ReadinessCheck::Manual => true,
-            ReadinessCheck::LogContains { text } => snapshot
-                .stdout_tail
-                .iter()
-                .chain(snapshot.stderr_tail.iter())
-                .any(|line| line.contains(text.as_str())),
-            ReadinessCheck::TcpPort { host, port } => {
-                TcpStream::connect((host.as_str(), *port)).is_ok()
-            }
+            // ログ末尾は保持行数で押し出されるため、読み取り時点で記録した結果を見る。
+            ReadinessCheck::LogContains { .. } => state.processes.marker_seen(process_id).map_err(|error| error.to_string())?,
+            ReadinessCheck::TcpPort { host, port } => tcp_reachable(host, *port, deadline),
         };
-        if ready {
+        // probe の後に状態を取り直す。probe の最中に終了したプロセスを見逃さない。
+        let snapshot = state.processes.snapshot(process_id).map_err(|error| error.to_string())?;
+        let terminated = matches!(snapshot.status, ProcessStatus::Exited | ProcessStatus::Failed);
+        if ready && !terminated {
             return Ok(());
         }
 
-        if matches!(snapshot.status, ProcessStatus::Exited | ProcessStatus::Failed) {
+        if terminated {
             // 最後の行をそのまま出すと、無害な警告が出力の末尾に来ているだけで
             // 本当の失敗理由が隠れる。エラーらしい行を後ろから探し、無ければ
             // 末尾に落とす。
@@ -225,7 +226,7 @@ fn wait_for_readiness(
                     "{owner_name} が {} 秒以内に {host}:{port} を開きませんでした。",
                     READINESS_TIMEOUT.as_secs()
                 ),
-                ReadinessCheck::Manual => unreachable!("Manual は常に準備完了として扱う"),
+                ReadinessCheck::Manual => unreachable!("Manual は待たずに返している"),
             });
         }
 
@@ -233,10 +234,44 @@ fn wait_for_readiness(
     }
 }
 
+/// 1 回の接続試行の上限。応答しないアドレスで待ち続けず、プロセスの終了確認へ戻る。
+const TCP_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// `host:port` に接続できるか。各試行は `deadline` までの残り時間と
+/// `TCP_ATTEMPT_TIMEOUT` の短いほうで打ち切る。
+///
+/// 名前解決自体は OS の呼び出しで、ここでは上限を掛けられない。
+fn tcp_reachable(host: &str, port: u16, deadline: Instant) -> bool {
+    let Ok(addresses) = (host, port).to_socket_addrs() else { return false };
+    for address in addresses {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        if TcpStream::connect_timeout(&address, remaining.min(TCP_ATTEMPT_TIMEOUT)).is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
+/// 一括起動の実行中フラグを、関数を抜けるとき（失敗時も）に必ず下ろす。
+struct StartAllGuard<'a>(&'a AtomicBool);
+
+impl Drop for StartAllGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 // 準備完了の待ち合わせで数十秒ブロックしうる。同期コマンドはメインスレッドで
 // 走り UI を止めるため、async 指定でワーカースレッドに逃がす。
 #[tauri::command(async)]
 pub fn start_all(state: State<'_, AppState>) -> Result<Vec<crate::types::ProcessSnapshot>, String> {
+    if state.start_all_running.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        return Err("一括起動は既に実行中です。".to_owned());
+    }
+    let _guard = StartAllGuard(&state.start_all_running);
     let workspace = state.workspace.lock().map_err(|_| "ワークスペースをロックできません。".to_owned())?.clone();
     let ordered = topological_order(&workspace.assets)?;
     let mut started = Vec::new();
@@ -245,7 +280,11 @@ pub fn start_all(state: State<'_, AppState>) -> Result<Vec<crate::types::Process
     }
     for timing in [ActivationTiming::BeforeStart, ActivationTiming::Manual, ActivationTiming::AfterStart] {
         for asset in ordered.iter().filter(|asset| asset.enabled && asset.activation_timing == timing) {
-            let snapshot = state.processes.start(asset.id.clone(), asset.name.clone(), ProcessKind::Asset, asset.command.clone()).map_err(|error| error.to_string())?;
+            let marker = match &asset.readiness {
+                ReadinessCheck::LogContains { text } => Some(text.clone()),
+                _ => None,
+            };
+            let snapshot = state.processes.start_watching(asset.id.clone(), asset.name.clone(), ProcessKind::Asset, asset.command.clone(), marker).map_err(|error| error.to_string())?;
             // 依存順に起動しているので、次へ進む前にこのアセットの準備完了を待つ。
             // これを怠ると、後続のアセットや Core が、まだ準備できていない相手を
             // 前提に動き出す。

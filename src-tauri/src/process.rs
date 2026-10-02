@@ -5,7 +5,7 @@ use std::{
     io::BufRead,
     io::BufReader,
     process::{Child, Command, Stdio},
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex, MutexGuard},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -51,6 +51,9 @@ struct ManagedProcess {
     stdout_tail: Arc<Mutex<Vec<String>>>,
     stderr_tail: Arc<Mutex<Vec<String>>>,
     readers: Vec<JoinHandle<()>>,
+    /// 起動時に指定した文字列を含む行が一度でも出力されたか。
+    /// 表示用のログ末尾は`LOG_TAIL_LIMIT`行で押し出されるため、準備完了の判定はこちらで行う。
+    marker_seen: Arc<AtomicBool>,
     /// 利用者の停止操作で終了させたかどうか。シグナル終了を異常終了と誤表示しないために使う。
     stop_requested: bool,
     /// スナップショットのログ末尾は毎回上書きされるため、管理側の警告は別に保持して後から足す。
@@ -86,18 +89,33 @@ impl ProcessManager {
         kind: ProcessKind,
         spec: ProgramSpec,
     ) -> Result<ProcessSnapshot, ProcessError> {
+        self.start_watching(owner_id, owner_name, kind, spec, None)
+    }
+
+    /// `marker`を含む行の出力を、読み取った時点で記録しながら起動する。
+    /// 記録はログ末尾の保持行数に左右されない。結果は`marker_seen`で確認する。
+    pub fn start_watching(
+        &self,
+        owner_id: String,
+        owner_name: String,
+        kind: ProcessKind,
+        spec: ProgramSpec,
+        marker: Option<String>,
+    ) -> Result<ProcessSnapshot, ProcessError> {
         spec.validate().map_err(ProcessError::Validation)?;
         let mut command = command_from_spec(&spec)?;
         command.stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null());
         let mut child = command.spawn()?;
         let stdout_tail = Arc::new(Mutex::new(Vec::new()));
         let stderr_tail = Arc::new(Mutex::new(Vec::new()));
+        let marker_seen = Arc::new(AtomicBool::new(false));
+        let watch = marker.map(|text| (Arc::new(text), Arc::clone(&marker_seen)));
         let mut readers = Vec::new();
         if let Some(stdout) = child.stdout.take() {
-            readers.push(spawn_log_reader(stdout, Arc::clone(&stdout_tail)));
+            readers.push(spawn_log_reader(stdout, Arc::clone(&stdout_tail), watch.clone()));
         }
         if let Some(stderr) = child.stderr.take() {
-            readers.push(spawn_log_reader(stderr, Arc::clone(&stderr_tail)));
+            readers.push(spawn_log_reader(stderr, Arc::clone(&stderr_tail), watch));
         }
         let id = Uuid::new_v4().to_string();
         let snapshot = ProcessSnapshot {
@@ -121,6 +139,7 @@ impl ProcessManager {
             stdout_tail,
             stderr_tail,
             readers,
+            marker_seen,
             stop_requested: false,
             diagnostics: Vec::new(),
         };
@@ -138,6 +157,15 @@ impl ProcessManager {
             .ok_or_else(|| ProcessError::NotFound(process_id.to_owned()))?;
         refresh(managed);
         Ok(managed.snapshot.clone())
+    }
+
+    /// `start_watching`で指定した文字列が出力済みか。
+    pub fn marker_seen(&self, process_id: &str) -> Result<bool, ProcessError> {
+        let processes = self.lock_processes();
+        let managed = processes
+            .get(process_id)
+            .ok_or_else(|| ProcessError::NotFound(process_id.to_owned()))?;
+        Ok(managed.marker_seen.load(Ordering::Acquire))
     }
 
     pub fn snapshots(&self) -> Vec<ProcessSnapshot> {
@@ -277,12 +305,19 @@ fn lock_tail(tail: &Mutex<Vec<String>>) -> MutexGuard<'_, Vec<String>> {
     tail.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn spawn_log_reader<R: std::io::Read + Send + 'static>(reader: R, output: Arc<Mutex<Vec<String>>>) -> JoinHandle<()> {
+type MarkerWatch = Option<(Arc<String>, Arc<AtomicBool>)>;
+
+fn spawn_log_reader<R: std::io::Read + Send + 'static>(reader: R, output: Arc<Mutex<Vec<String>>>, watch: MarkerWatch) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut reader = BufReader::new(reader);
         loop {
             match read_capped_line(&mut reader) {
                 Some(line) => {
+                    if let Some((marker, seen)) = &watch {
+                        if line.contains(marker.as_str()) {
+                            seen.store(true, Ordering::Release);
+                        }
+                    }
                     let mut tail = lock_tail(&output);
                     tail.push(line);
                     if tail.len() > LOG_TAIL_LIMIT {
@@ -501,5 +536,35 @@ mod tests {
         let manager = ProcessManager::new();
         let report = manager.stop_owner("missing-owner");
         assert!(report.is_empty());
+    }
+
+    #[cfg(windows)]
+    fn marker_then_flood_spec() -> ProgramSpec {
+        ProgramSpec { program: "cmd".into(), args: vec!["/C".into(), "echo READY-MARK& for /L %i in (1,1,600) do @echo line %i".into()], cwd: None, env: BTreeMap::new(), target: ExecutionTarget::Native }
+    }
+
+    #[cfg(not(windows))]
+    fn marker_then_flood_spec() -> ProgramSpec {
+        ProgramSpec { program: "/bin/sh".into(), args: vec!["-c".into(), "echo READY-MARK; i=1; while [ $i -le 600 ]; do echo line $i; i=$((i+1)); done".into()], cwd: None, env: BTreeMap::new(), target: ExecutionTarget::Native }
+    }
+
+    #[test]
+    fn marker_survives_log_tail_eviction() {
+        let manager = ProcessManager::new();
+        let snapshot = manager
+            .start_watching("owner".into(), "flood".into(), ProcessKind::Asset, marker_then_flood_spec(), Some("READY-MARK".into()))
+            .expect("start");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let tail = loop {
+            let current = manager.snapshot(&snapshot.id).expect("snapshot");
+            if current.stdout_tail.last().is_some_and(|line| line.contains("line 600")) {
+                break current.stdout_tail;
+            }
+            assert!(Instant::now() < deadline, "flood did not finish");
+            thread::sleep(Duration::from_millis(50));
+        };
+        // 前提: マーカーは表示用の末尾から既に押し出されている。
+        assert!(!tail.iter().any(|line| line.contains("READY-MARK")));
+        assert!(manager.marker_seen(&snapshot.id).expect("marker"));
     }
 }

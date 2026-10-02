@@ -1,5 +1,5 @@
 use crate::{monitor::CommunicationMonitor, process::ProcessManager, types::{CoreCatalog, Workspace}};
-use std::{fs, path::PathBuf, sync::Mutex};
+use std::{fs, path::PathBuf, sync::{atomic::AtomicBool, Mutex}};
 use uuid::Uuid;
 
 pub struct AppState {
@@ -8,6 +8,9 @@ pub struct AppState {
     pub monitor: CommunicationMonitor,
     pub data_directory: PathBuf,
     pub catalog_path: PathBuf,
+    /// 一括起動の実行中フラグ。起動時の`--start-all`と画面のボタンが重なると、
+    /// 同じアセットが二重に起動され`hako-cmd start`も二度走るため、重複を拒否する。
+    pub start_all_running: AtomicBool,
 }
 
 impl AppState {
@@ -17,7 +20,7 @@ impl AppState {
         let _ = fs::create_dir_all(&data_directory);
         ensure_default_catalog(&catalog_path);
         let workspace = load_workspace(&data_directory).unwrap_or_else(|| Workspace::empty(Uuid::new_v4().to_string(), "新しいHakoniwaワークスペース".to_owned()));
-        Self { workspace: Mutex::new(workspace), processes: ProcessManager::new(), monitor: CommunicationMonitor::default(), data_directory, catalog_path }
+        Self { workspace: Mutex::new(workspace), processes: ProcessManager::new(), monitor: CommunicationMonitor::default(), data_directory, catalog_path, start_all_running: AtomicBool::new(false) }
     }
 
     pub fn persist_workspace(&self) -> Result<(), String> {
