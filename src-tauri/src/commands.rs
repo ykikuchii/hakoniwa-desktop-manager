@@ -1,7 +1,7 @@
 use crate::{
     core::{install_core, load_catalog},
     importer::inspect_directory,
-    process::run_oneshot,
+    process::{run_oneshot, ProcessError},
     state::AppState,
     types::{
         ActivationTiming, AssetDefinition, CommunicationEvent, CommunicationEventType,
@@ -100,14 +100,54 @@ pub fn start_asset(state: State<'_, AppState>, asset_id: String) -> Result<crate
     state.processes.start(asset.id, asset.name, ProcessKind::Asset, asset.command).map_err(|error| error.to_string())
 }
 
-#[tauri::command]
+// 停止後に Core の応答を確かめるため数秒ブロックしうる。UI を止めないよう async にする。
+#[tauri::command(async)]
 pub fn stop_asset(state: State<'_, AppState>, asset_id: String) -> Result<Vec<crate::types::ProcessSnapshot>, String> {
     let report = state.processes.stop_owner(&asset_id);
     if report.is_empty() { return Err("停止できる実行中プロセスがありません。".to_owned()); }
     if !report.failures.is_empty() {
         return Err(format!("停止できなかったプロセスがあります: {}", report.failures.join(" / ")));
     }
+    // 単独停止は、ほかの参加者と master を動かしたまま 1 つだけを kill する。kill が
+    // Core の master ロックを持っている最中に当たると、ロックのカウンタが戻らず残りの
+    // 参加者が固まる（toppers/hakoniwa-core-cpp#62）。一括停止と違って master も
+    // 消えないので、次の一括起動まで自然には直らない。ほかに動いているプロセスが
+    // あるときだけ Core の応答を確かめ、固まっていそうなら利用者に知らせる。
+    // ほかに何も動いていなければ master も無く、確かめても誤検知になるだけなので省く。
+    let workspace = state.workspace.lock().map_err(|_| "ワークスペースをロックできません。".to_owned())?.clone();
+    if !running_owner_names(&state, &workspace, true).is_empty() {
+        if let Some(detail) = core_lock_unresponsive(&state) {
+            let name = report.stopped.first().map(|snapshot| snapshot.owner_name.clone()).unwrap_or_default();
+            return Err(format!(
+                "{name} を停止しました。ただし Core が応答しません（{detail}）。停止したプロセスが Core のロックを持ったまま終了した可能性があります。すべて停止してから一括起動し直してください。"
+            ));
+        }
+    }
     Ok(report.stopped)
+}
+
+/// 単独停止の後に Core の応答を確かめる上限。正常なら 1 秒もかからない。
+const CORE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `hako-cmd status` が master ロックを取れずに止まるかを確かめ、止まるならその理由を返す。
+///
+/// 上限付き待ちを持つ hako-cmd は `file-lock wait timed out` を出して返り、持たない
+/// 古い hako-cmd は返らないので `CORE_PROBE_TIMEOUT` で打ち切る。どちらも固まりの兆候。
+fn core_lock_unresponsive(state: &State<'_, AppState>) -> Option<String> {
+    let (selection, env) = {
+        let workspace = state.workspace.lock().ok()?;
+        (workspace.core_release.clone()?, workspace.core_env.clone())
+    };
+    let spec = ProgramSpec { program: selection.hako_cmd_path, args: vec!["status".to_owned()], cwd: Some(selection.install_directory), env, target: crate::types::ExecutionTarget::Native };
+    match run_oneshot(&spec, CORE_PROBE_TIMEOUT) {
+        Err(ProcessError::Timeout(_)) => Some(format!("hako-cmd status が {} 秒以内に応答しませんでした", CORE_PROBE_TIMEOUT.as_secs())),
+        Ok((_, stdout, stderr)) => stdout
+            .lines()
+            .chain(stderr.lines())
+            .find(|line| line.contains("file-lock wait timed out"))
+            .map(|line| line.trim().to_owned()),
+        Err(_) => None,
+    }
 }
 
 #[tauri::command]
