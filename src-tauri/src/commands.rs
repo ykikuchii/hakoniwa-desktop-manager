@@ -117,27 +117,48 @@ pub fn stop_asset(state: State<'_, AppState>, asset_id: String) -> Result<Vec<cr
     let workspace = state.workspace.lock().map_err(|_| "ワークスペースをロックできません。".to_owned())?.clone();
     if !running_owner_names(&state, &workspace, true).is_empty() {
         if let Some(detail) = core_lock_unresponsive(&state) {
-            let name = report.stopped.first().map(|snapshot| snapshot.owner_name.clone()).unwrap_or_default();
-            return Err(format!(
-                "{name} を停止しました。ただし Core が応答しません（{detail}）。停止したプロセスが Core のロックを持ったまま終了した可能性があります。すべて停止してから一括起動し直してください。"
-            ));
+            // 確認している間に一括停止などで残りが止まっていれば、警告はもう当てはまらない。
+            if !running_owner_names(&state, &workspace, true).is_empty() {
+                let name = report.stopped.first().map(|snapshot| snapshot.owner_name.clone()).unwrap_or_default();
+                return Err(format!(
+                    "{name} を停止しました。ただし Core が固まっている可能性があります（{detail}）。停止したプロセスが Core のロックを持ったまま終了したと考えられます。すべて停止してから一括起動し直してください。"
+                ));
+            }
         }
     }
     Ok(report.stopped)
 }
 
-/// 単独停止の後に Core の応答を確かめる上限。正常なら 1 秒もかからない。
+/// master ロックの空きを探す時間。正常な Core は conductor が周期ごとにロックを
+/// 取って離すので、この間に何度も空きが見える。
+const LOCK_FREE_WINDOW: Duration = Duration::from_secs(3);
+const LOCK_SAMPLE_INTERVAL: Duration = Duration::from_millis(10);
+
+/// `hako-cmd status` で確かめるときの上限。正常なら 1 秒もかからない。
 const CORE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// `hako-cmd status` が master ロックを取れずに止まるかを確かめ、止まるならその理由を返す。
+/// Core の master ロックが固まっているかを確かめ、固まっていればその根拠を返す。
+/// 確かめられなかったときも `None` を返す（警告しない）。
 ///
-/// 上限付き待ちを持つ hako-cmd は `file-lock wait timed out` を出して返り、持たない
-/// 古い hako-cmd は返らないので `CORE_PROBE_TIMEOUT` で打ち切る。どちらも固まりの兆候。
+/// 第一の手段は `flock.bin` の master カウンタ（先頭の int）を直接見ること。
+/// ロックは `flock.bin` に置いたカウンタのセマフォで、1 以上が空きを表す。
+/// `LOCK_FREE_WINDOW` の間に一度も空きが見えなければ固まっていると判断する。
+/// `hako-cmd status` は共有ログへの書き込みのときにしかロックを取らず、ログが
+/// 満杯だとそれも省かれるため、固まっていても成功しうる。mmap の場所が分からない
+/// 構成に限って、`hako-cmd status` の応答で代用する。
 fn core_lock_unresponsive(state: &State<'_, AppState>) -> Option<String> {
     let (selection, env) = {
         let workspace = state.workspace.lock().ok()?;
         (workspace.core_release.clone()?, workspace.core_env.clone())
     };
+    if let Some(flock) = core_flock_path(&env) {
+        if let Some(seen_free) = master_lock_free_seen(&flock, LOCK_FREE_WINDOW) {
+            return (!seen_free).then(|| format!(
+                "{} 秒間、master ロックが一度も空きませんでした",
+                LOCK_FREE_WINDOW.as_secs()
+            ));
+        }
+    }
     let spec = ProgramSpec { program: selection.hako_cmd_path, args: vec!["status".to_owned()], cwd: Some(selection.install_directory), env, target: crate::types::ExecutionTarget::Native };
     match run_oneshot(&spec, CORE_PROBE_TIMEOUT) {
         Err(ProcessError::Timeout(_)) => Some(format!("hako-cmd status が {} 秒以内に応答しませんでした", CORE_PROBE_TIMEOUT.as_secs())),
@@ -148,6 +169,41 @@ fn core_lock_unresponsive(state: &State<'_, AppState>) -> Option<String> {
             .map(|line| line.trim().to_owned()),
         Err(_) => None,
     }
+}
+
+/// Core の設定（`HAKO_CONFIG_PATH`）から、mmap 構成の `flock.bin` の場所を求める。
+fn core_flock_path(core_env: &BTreeMap<String, String>) -> Option<std::path::PathBuf> {
+    let config_path = core_env.get("HAKO_CONFIG_PATH").cloned().or_else(|| std::env::var("HAKO_CONFIG_PATH").ok())?;
+    let config: serde_json::Value = serde_json::from_slice(&std::fs::read(config_path).ok()?).ok()?;
+    if config.get("shm_type").and_then(|value| value.as_str()) != Some("mmap") {
+        return None;
+    }
+    let directory = config.get("core_mmap_path")?.as_str()?;
+    Some(Path::new(directory).join("flock.bin"))
+}
+
+/// `window` の間に master カウンタが一度でも 1 以上（空き）だったか。
+/// ファイルが開けない、または一度も読めなかったときは判断できないので `None`。
+fn master_lock_free_seen(flock: &Path, window: Duration) -> Option<bool> {
+    use std::io::Read;
+    let deadline = Instant::now() + window;
+    let mut read_any = false;
+    while Instant::now() < deadline {
+        // 読み取りは、カウンタを更新中のプロセスが掛ける排他ロックと衝突して失敗しうる。
+        if let Ok(mut file) = std::fs::File::open(flock) {
+            let mut bytes = [0u8; 4];
+            if file.read_exact(&mut bytes).is_ok() {
+                read_any = true;
+                if i32::from_ne_bytes(bytes) >= 1 {
+                    return Some(true);
+                }
+            }
+        } else if !flock.exists() {
+            return None;
+        }
+        thread::sleep(LOCK_SAMPLE_INTERVAL);
+    }
+    read_any.then_some(false)
 }
 
 #[tauri::command]
@@ -684,5 +740,36 @@ mod tests {
         let mut legacy = connection("legacy");
         legacy.details.insert("bridge".to_owned(), "pdu-bridge".to_owned());
         assert_eq!(monitor_targets(&owner, &[legacy]).len(), 1);
+    }
+
+    fn flock_with(name: &str, counter: i32) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("hdm-test-{name}-{}.bin", std::process::id()));
+        let mut bytes = counter.to_ne_bytes().to_vec();
+        bytes.extend_from_slice(&[0u8; 12]);
+        std::fs::write(&path, bytes).expect("write flock");
+        path
+    }
+
+    /// 空き（1）が見えれば固まっていない。
+    #[test]
+    fn lock_probe_sees_free_counter() {
+        let path = flock_with("free", 1);
+        assert_eq!(master_lock_free_seen(&path, Duration::from_millis(200)), Some(true));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// 0 のまま空きが見えなければ固まっていると判断する。
+    #[test]
+    fn lock_probe_reports_stuck_counter() {
+        let path = flock_with("stuck", 0);
+        assert_eq!(master_lock_free_seen(&path, Duration::from_millis(200)), Some(false));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// ファイルが無ければ判断できない（警告しない）。
+    #[test]
+    fn lock_probe_without_file_is_inconclusive() {
+        let path = std::env::temp_dir().join(format!("hdm-test-missing-{}.bin", std::process::id()));
+        assert_eq!(master_lock_free_seen(&path, Duration::from_millis(200)), None);
     }
 }
