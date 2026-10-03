@@ -169,6 +169,12 @@ const READINESS_POLL: Duration = Duration::from_millis(200);
 /// 別のプロセスが同じポートを開いている場合など、条件だけが偶然満たされる
 /// ことがあるため。また、終了したプロセスはタイムアウトまで待たずに即座に
 /// 失敗させる。本当の失敗理由がタイムアウトという別の症状に置き換わるため。
+///
+/// 一括停止から中断の指示が来ても、起動途中のアセットは準備完了まで
+/// `CANCEL_SETTLE` を上限に待ってから中断する。登録や attach の最中に kill
+/// すると、そのプロセスは Core の master ロックを持ったまま死に、カウンタが
+/// 戻らず以後の参加者が固まる（toppers/hakoniwa-core-cpp#62）。準備完了は
+/// その処理が終わった目印なので、そこまで待てば kill しても安全になる。
 fn wait_for_readiness(
     state: &State<'_, AppState>,
     process_id: &str,
@@ -179,8 +185,17 @@ fn wait_for_readiness(
         return Ok(());
     }
     let deadline = Instant::now() + READINESS_TIMEOUT;
+    let mut cancel_deadline: Option<Instant> = None;
     loop {
-        check_start_all_cancel(state)?;
+        if state.start_all_cancel.load(Ordering::Acquire) {
+            let settle_by = *cancel_deadline.get_or_insert_with(|| Instant::now() + CANCEL_SETTLE);
+            if Instant::now() >= settle_by {
+                return Err(format!(
+                    "一括停止の指示により一括起動を中断しました（{owner_name} は {} 秒以内に準備完了せず、途中で停止します）。",
+                    CANCEL_SETTLE.as_secs()
+                ));
+            }
+        }
         let ready = match check {
             ReadinessCheck::Manual => true,
             // ログ末尾は保持行数で押し出されるため、読み取り時点で記録した結果を見る。
@@ -191,6 +206,8 @@ fn wait_for_readiness(
         let snapshot = state.processes.snapshot(process_id).map_err(|error| error.to_string())?;
         let terminated = matches!(snapshot.status, ProcessStatus::Exited | ProcessStatus::Failed);
         if ready && !terminated {
+            // 準備完了まで待ったうえで、後続の起動はしない。
+            check_start_all_cancel(state)?;
             return Ok(());
         }
 
@@ -291,9 +308,12 @@ fn check_start_all_cancel(state: &State<'_, AppState>) -> Result<(), String> {
     Ok(())
 }
 
-/// 一括停止が起動の中断を待つ上限。起動側は `READINESS_POLL` か
-/// `TCP_ATTEMPT_TIMEOUT` ごとに中断指示を確認するので、通常は 1 秒以内に終わる。
-const START_ALL_CANCEL_WAIT: Duration = Duration::from_secs(5);
+/// 中断指示の後、起動途中のアセットの準備完了を待つ上限。
+const CANCEL_SETTLE: Duration = Duration::from_secs(10);
+
+/// 一括停止が起動の中断を待つ上限。起動側は起動途中のアセットの準備完了を
+/// `CANCEL_SETTLE` まで待つので、それに確認間隔と TCP の 1 回の試行分を足す。
+const START_ALL_CANCEL_WAIT: Duration = Duration::from_secs(15);
 
 /// 一括停止の実行中フラグと中断指示を、関数を抜けるとき（失敗時も）に必ず下ろす。
 struct StopAllGuard<'a>(&'a AppState);
