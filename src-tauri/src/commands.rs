@@ -182,25 +182,29 @@ fn wait_for_readiness(
     check: &ReadinessCheck,
 ) -> Result<(), String> {
     if matches!(check, ReadinessCheck::Manual) {
+        check_start_all_cancel(state)?;
         return Ok(());
     }
     let deadline = Instant::now() + READINESS_TIMEOUT;
     let mut cancel_deadline: Option<Instant> = None;
+    let settle_error = || format!(
+        "一括停止の指示により一括起動を中断しました（{owner_name} は {} 秒以内に準備完了せず、途中で停止します）。",
+        CANCEL_SETTLE.as_secs()
+    );
     loop {
         if state.start_all_cancel.load(Ordering::Acquire) {
             let settle_by = *cancel_deadline.get_or_insert_with(|| Instant::now() + CANCEL_SETTLE);
             if Instant::now() >= settle_by {
-                return Err(format!(
-                    "一括停止の指示により一括起動を中断しました（{owner_name} は {} 秒以内に準備完了せず、途中で停止します）。",
-                    CANCEL_SETTLE.as_secs()
-                ));
+                return Err(settle_error());
             }
         }
+        // 中断中は、TCP の確認も猶予の期限で打ち切る。名前解決だけは上限を掛けられない。
+        let probe_deadline = cancel_deadline.map_or(deadline, |settle_by| settle_by.min(deadline));
         let ready = match check {
             ReadinessCheck::Manual => true,
             // ログ末尾は保持行数で押し出されるため、読み取り時点で記録した結果を見る。
             ReadinessCheck::LogContains { .. } => state.processes.marker_seen(process_id).map_err(|error| error.to_string())?,
-            ReadinessCheck::TcpPort { host, port } => tcp_reachable(host, *port, deadline),
+            ReadinessCheck::TcpPort { host, port } => tcp_reachable(host, *port, probe_deadline),
         };
         // probe の後に状態を取り直す。probe の最中に終了したプロセスを見逃さない。
         let snapshot = state.processes.snapshot(process_id).map_err(|error| error.to_string())?;
@@ -241,6 +245,10 @@ fn wait_for_readiness(
         }
 
         if Instant::now() >= deadline {
+            // 中断中なら、通常のタイムアウトではなく中断として報告する。
+            if cancel_deadline.is_some() {
+                return Err(settle_error());
+            }
             return Err(match check {
                 ReadinessCheck::LogContains { text } => format!(
                     "{owner_name} が {} 秒以内に「{text}」を出力しませんでした。",
@@ -394,6 +402,8 @@ pub fn start_all(state: State<'_, AppState>) -> Result<Vec<crate::types::Process
             }
         }
     }
+    // 最後のアセットの起動直後に中断された場合も、成功として報告しない。
+    check_start_all_cancel(&state)?;
     Ok(started)
 }
 
