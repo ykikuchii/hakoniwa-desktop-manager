@@ -17,6 +17,8 @@ const LOG_TAIL_LIMIT: usize = 500;
 const LOG_LINE_BYTE_LIMIT: usize = 8 * 1024;
 /// 停止時にログ読取スレッドの終了を待つ上限。孫プロセスがパイプを握ったままでも固まらないようにする。
 const READER_DRAIN_BUDGET: Duration = Duration::from_millis(500);
+/// `run_oneshot`が1ストリームあたりに保持する出力の上限。
+const ONESHOT_OUTPUT_LIMIT: usize = 64 * 1024;
 
 #[derive(Debug, Error)]
 pub enum ProcessError {
@@ -247,12 +249,25 @@ pub fn run_oneshot(spec: &ProgramSpec, timeout: Duration) -> Result<(i32, String
     command.stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null());
     let mut child = command.spawn()?;
     // パイプが詰まって子が止まらないよう、待っている間も別スレッドで読み続ける。
+    // 読んだ分は共有バッファに逐次積むので、読み取りが終わらなくてもそこまでの
+    // 出力は返せる。保持は`ONESHOT_OUTPUT_LIMIT`までで、超過分は読み捨てる。
     let collect = |pipe: Option<Box<dyn std::io::Read + Send>>| {
-        pipe.map(|mut pipe| thread::spawn(move || {
-            let mut bytes = Vec::new();
-            let _ = pipe.read_to_end(&mut bytes);
-            bytes
-        }))
+        pipe.map(|mut pipe| {
+            let buffer = Arc::new(Mutex::new(Vec::new()));
+            let sink = Arc::clone(&buffer);
+            let handle = thread::spawn(move || {
+                let mut chunk = [0u8; 4096];
+                while let Ok(read) = pipe.read(&mut chunk) {
+                    if read == 0 {
+                        break;
+                    }
+                    let mut bytes = sink.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let room = ONESHOT_OUTPUT_LIMIT.saturating_sub(bytes.len());
+                    bytes.extend_from_slice(&chunk[..read.min(room)]);
+                }
+            });
+            (handle, buffer)
+        })
     };
     let stdout = collect(child.stdout.take().map(|pipe| Box::new(pipe) as Box<dyn std::io::Read + Send>));
     let stderr = collect(child.stderr.take().map(|pipe| Box::new(pipe) as Box<dyn std::io::Read + Send>));
@@ -271,17 +286,16 @@ pub fn run_oneshot(spec: &ProgramSpec, timeout: Duration) -> Result<(i32, String
     // 孫プロセスがパイプを握っていると読み取りが終わらないため、待つのは
     // `READER_DRAIN_BUDGET`まで。間に合わなければ読み取りスレッドは手放す。
     let drain_deadline = Instant::now() + READER_DRAIN_BUDGET;
-    let text = |handle: Option<JoinHandle<Vec<u8>>>| {
-        let handle = handle?;
+    // 手放したスレッドはパイプが閉じるまで残るが、保持量は上限で頭打ちになる。
+    let text = |reader: Option<(JoinHandle<()>, Arc<Mutex<Vec<u8>>>)>| {
+        let Some((handle, buffer)) = reader else { return String::new() };
         while !handle.is_finished() && Instant::now() < drain_deadline {
             thread::sleep(Duration::from_millis(10));
         }
-        if !handle.is_finished() {
-            return None;
-        }
-        handle.join().ok().map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        let bytes = buffer.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        String::from_utf8_lossy(&bytes).into_owned()
     };
-    let (stdout, stderr) = (text(stdout).unwrap_or_default(), text(stderr).unwrap_or_default());
+    let (stdout, stderr) = (text(stdout), text(stderr));
     match status {
         Some(status) => Ok((status.code().unwrap_or(-1), stdout, stderr)),
         None => Err(ProcessError::Timeout(timeout.as_secs())),

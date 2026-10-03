@@ -11,6 +11,10 @@ pub struct AppState {
     /// 一括起動の実行中フラグ。起動時の`--start-all`と画面のボタンが重なると、
     /// 同じアセットが二重に起動され`hako-cmd start`も二度走るため、重複を拒否する。
     pub start_all_running: AtomicBool,
+    /// 一括停止から一括起動への中断指示。起動は区切りごとにこれを見て止まる。
+    pub start_all_cancel: AtomicBool,
+    /// 一括停止の実行中フラグ。停止中に始まった一括起動を拒否する。
+    pub stop_all_running: AtomicBool,
 }
 
 impl AppState {
@@ -20,7 +24,7 @@ impl AppState {
         let _ = fs::create_dir_all(&data_directory);
         ensure_default_catalog(&catalog_path);
         let workspace = load_workspace(&data_directory).unwrap_or_else(|| Workspace::empty(Uuid::new_v4().to_string(), "新しいHakoniwaワークスペース".to_owned()));
-        Self { workspace: Mutex::new(workspace), processes: ProcessManager::new(), monitor: CommunicationMonitor::default(), data_directory, catalog_path, start_all_running: AtomicBool::new(false) }
+        Self { workspace: Mutex::new(workspace), processes: ProcessManager::new(), monitor: CommunicationMonitor::default(), data_directory, catalog_path, start_all_running: AtomicBool::new(false), start_all_cancel: AtomicBool::new(false), stop_all_running: AtomicBool::new(false) }
     }
 
     pub fn persist_workspace(&self) -> Result<(), String> {

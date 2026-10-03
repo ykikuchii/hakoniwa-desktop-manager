@@ -180,6 +180,7 @@ fn wait_for_readiness(
     }
     let deadline = Instant::now() + READINESS_TIMEOUT;
     loop {
+        check_start_all_cancel(state)?;
         let ready = match check {
             ReadinessCheck::Manual => true,
             // ログ末尾は保持行数で押し出されるため、読み取り時点で記録した結果を見る。
@@ -261,13 +262,13 @@ fn tcp_reachable(host: &str, port: u16, deadline: Instant) -> bool {
     false
 }
 
-/// 一括起動の対象（有効なアセットと Core コントローラー）のうち、プロセスが
-/// 終了していないものの名前。
-fn running_owner_names(state: &State<'_, AppState>, workspace: &Workspace) -> Vec<String> {
+/// アセット（`include_disabled` が偽なら有効なものだけ）と Core コントローラーの
+/// うち、プロセスが終了していないものの名前。
+fn running_owner_names(state: &State<'_, AppState>, workspace: &Workspace, include_disabled: bool) -> Vec<String> {
     let owners: BTreeSet<&str> = workspace
         .assets
         .iter()
-        .filter(|asset| asset.enabled)
+        .filter(|asset| include_disabled || asset.enabled)
         .map(|asset| asset.id.as_str())
         .chain(workspace.core_controller.iter().map(|controller| controller.id.as_str()))
         .collect();
@@ -280,6 +281,33 @@ fn running_owner_names(state: &State<'_, AppState>, workspace: &Workspace) -> Ve
         .map(|snapshot| snapshot.owner_name)
         .collect();
     names.into_iter().collect()
+}
+
+/// 一括停止から中断の指示が出ていればエラーにする。一括起動の区切りごとに呼ぶ。
+fn check_start_all_cancel(state: &State<'_, AppState>) -> Result<(), String> {
+    if state.start_all_cancel.load(Ordering::Acquire) {
+        return Err("一括停止の指示により一括起動を中断しました。".to_owned());
+    }
+    Ok(())
+}
+
+/// 一括停止が起動の中断を待つ上限。起動側は `READINESS_POLL` か
+/// `TCP_ATTEMPT_TIMEOUT` ごとに中断指示を確認するので、通常は 1 秒以内に終わる。
+const START_ALL_CANCEL_WAIT: Duration = Duration::from_secs(5);
+
+/// 一括停止の実行中フラグと中断指示を、関数を抜けるとき（失敗時も）に必ず下ろす。
+struct StopAllGuard<'a>(&'a AppState);
+
+impl Drop for StopAllGuard<'_> {
+    fn drop(&mut self) {
+        self.0.start_all_cancel.store(false, Ordering::Release);
+        self.0.stop_all_running.store(false, Ordering::Release);
+    }
+}
+
+/// `hako-cmd` の失敗のうち、Core が動いていないことを示すもの。停止の文脈では正常。
+fn core_not_running(result: &LifecycleCommandResult) -> bool {
+    result.stdout.contains("Not found hako-master") || result.stderr.contains("Not found hako-master")
 }
 
 /// 一括起動の実行中フラグを、関数を抜けるとき（失敗時も）に必ず下ろす。
@@ -299,10 +327,15 @@ pub fn start_all(state: State<'_, AppState>) -> Result<Vec<crate::types::Process
         return Err("一括起動は既に実行中です。".to_owned());
     }
     let _guard = StartAllGuard(&state.start_all_running);
+    // フラグを立てた後に確認する。立てる前に確認すると、その隙に始まった停止を
+    // 見落とす。停止側は起動のフラグが下りるまで待つので、どちらかが必ず譲る。
+    if state.stop_all_running.load(Ordering::Acquire) {
+        return Err("一括停止の実行中は一括起動できません。".to_owned());
+    }
     let workspace = state.workspace.lock().map_err(|_| "ワークスペースをロックできません。".to_owned())?.clone();
     // 稼働中のアセットがあるまま一括起動すると、同じアセットが二重に起動する。
     // 登録アセットは Core に二重登録できず、外部アセットは同じポートを取り合う。
-    let alive = running_owner_names(&state, &workspace);
+    let alive = running_owner_names(&state, &workspace, false);
     if !alive.is_empty() {
         return Err(format!(
             "稼働中のプロセスがあるため一括起動できません（{}）。先にすべて停止してください。",
@@ -316,6 +349,7 @@ pub fn start_all(state: State<'_, AppState>) -> Result<Vec<crate::types::Process
     }
     for timing in [ActivationTiming::BeforeStart, ActivationTiming::Manual, ActivationTiming::AfterStart] {
         for asset in ordered.iter().filter(|asset| asset.enabled && asset.activation_timing == timing) {
+            check_start_all_cancel(&state)?;
             let marker = match &asset.readiness {
                 ReadinessCheck::LogContains { text } => Some(text.clone()),
                 _ => None,
@@ -328,6 +362,7 @@ pub fn start_all(state: State<'_, AppState>) -> Result<Vec<crate::types::Process
             started.push(snapshot);
         }
         if timing == ActivationTiming::BeforeStart && workspace.core_release.is_some() {
+            check_start_all_cancel(&state)?;
             // ここに到達した時点で、登録アセットはすべて準備完了を報告済み。
             // Core の起動で登録が締め切られても取りこぼしが出ない。
             // 失敗を握りつぶすと、PDU セグメントが無いまま after_start のアセットが
@@ -346,8 +381,20 @@ pub fn start_all(state: State<'_, AppState>) -> Result<Vec<crate::types::Process
 // 走り、その間 UI が固まるため async 指定でワーカースレッドに逃がす。
 #[tauri::command(async)]
 pub fn stop_all(state: State<'_, AppState>) -> Result<Vec<crate::types::ProcessSnapshot>, String> {
-    let workspace = state.workspace.lock().map_err(|_| "ワークスペースをロックできません。".to_owned())?.clone();
+    state.stop_all_running.store(true, Ordering::Release);
+    let _guard = StopAllGuard(&state);
+    // 進行中の一括起動を止めてから停止する。止めないと、停止が通り過ぎた後で
+    // 起動側が残りのアセットを起動し、停止したはずのものが動き続ける。
+    state.start_all_cancel.store(true, Ordering::Release);
+    let deadline = Instant::now() + START_ALL_CANCEL_WAIT;
+    while state.start_all_running.load(Ordering::Acquire) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
     let mut failures = Vec::new();
+    if state.start_all_running.load(Ordering::Acquire) {
+        failures.push(format!("一括起動が {} 秒以内に中断しませんでした。", START_ALL_CANCEL_WAIT.as_secs()));
+    }
+    let workspace = state.workspace.lock().map_err(|_| "ワークスペースをロックできません。".to_owned())?.clone();
     if workspace.core_release.is_some() {
         // stop だけで登録アセットを kill すると、conductor を持つアセットが Core の
         // 状態遷移の途中で落ち、以後の hako-cmd が応答しなくなる（実測）。
@@ -355,13 +402,19 @@ pub fn stop_all(state: State<'_, AppState>) -> Result<Vec<crate::types::ProcessS
         // 残ったものだけを kill する。
         for command in ["stop", "reset"] {
             // Core が動いていなければ hako-cmd は失敗を返すが、停止としては正常。
-            // 報告するのは応答しなかった場合だけにする。
-            if let Err(error) = run_lifecycle_command(state.clone(), command.to_owned()) {
-                failures.push(error);
+            // それ以外の失敗と、応答しなかった場合は報告する。
+            match run_lifecycle_command(state.clone(), command.to_owned()) {
+                Ok(result) if result.status == ProcessStatus::Failed && !core_not_running(&result) => {
+                    let detail = result.stderr.lines().chain(result.stdout.lines()).rev().find(|line| !line.trim().is_empty()).unwrap_or_default().to_owned();
+                    failures.push(format!("hako-cmd {command} が失敗しました。{detail}"));
+                }
+                Ok(_) => {}
+                Err(error) => failures.push(error),
             }
         }
         let deadline = Instant::now() + STOP_GRACE;
-        while !running_owner_names(&state, &workspace).is_empty() && Instant::now() < deadline {
+        // 待つ対象は下の kill の対象と揃える。無効化しただけで動いているアセットも含む。
+        while !running_owner_names(&state, &workspace, true).is_empty() && Instant::now() < deadline {
             thread::sleep(READINESS_POLL);
         }
     }
