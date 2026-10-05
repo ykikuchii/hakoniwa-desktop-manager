@@ -116,12 +116,12 @@ pub fn stop_asset(state: State<'_, AppState>, asset_id: String) -> Result<Vec<cr
     // ほかに何も動いていなければ master も無く、確かめても誤検知になるだけなので省く。
     let workspace = state.workspace.lock().map_err(|_| "ワークスペースをロックできません。".to_owned())?.clone();
     if !running_owner_names(&state, &workspace, true).is_empty() {
-        if let Some(detail) = core_lock_unresponsive(&state) {
+        if let CoreLockHealth::Stuck(detail) = core_lock_health(&state) {
             // 確認している間に一括停止などで残りが止まっていれば、警告はもう当てはまらない。
             if !running_owner_names(&state, &workspace, true).is_empty() {
                 let name = report.stopped.first().map(|snapshot| snapshot.owner_name.clone()).unwrap_or_default();
                 return Err(format!(
-                    "{name} を停止しました。ただし Core が固まっている可能性があります（{detail}）。停止したプロセスが Core のロックを持ったまま終了したと考えられます。すべて停止してから一括起動し直してください。"
+                    "{name} を停止しました。ただし Core が固まっている可能性があります（{detail}）。停止したプロセスが Core のロックを持ったまま終了した可能性があります。すべて停止してから一括起動し直してください。"
                 ));
             }
         }
@@ -130,56 +130,82 @@ pub fn stop_asset(state: State<'_, AppState>, asset_id: String) -> Result<Vec<cr
 }
 
 /// master ロックの空きを探す時間。正常な Core は conductor が周期ごとにロックを
-/// 取って離すので、この間に何度も空きが見える。
-const LOCK_FREE_WINDOW: Duration = Duration::from_secs(3);
+/// 取って離すので、空きは最初の数十ミリ秒で見つかり、そこで打ち切る。
+/// 長めにしているのは、生きている保持者が一時的に長くロックを持つ場合の誤警告を
+/// 減らすため。Core 側に保持時間の上限は無いので、これは証明ではなく根拠にとどまる。
+const LOCK_FREE_WINDOW: Duration = Duration::from_secs(6);
 const LOCK_SAMPLE_INTERVAL: Duration = Duration::from_millis(10);
 
 /// `hako-cmd status` で確かめるときの上限。正常なら 1 秒もかからない。
 const CORE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Core の master ロックが固まっているかを確かめ、固まっていればその根拠を返す。
-/// 確かめられなかったときも `None` を返す（警告しない）。
+/// Core の master ロックの状態。
+#[derive(Debug, PartialEq, Eq)]
+enum CoreLockHealth {
+    /// 空きを観測した。
+    Free,
+    /// 固まっている兆候があった。中身はその根拠。
+    Stuck(String),
+    /// 確かめられなかった。正常とも固まっているとも言えない。
+    Unknown,
+}
+
+/// Core の master ロックの状態を確かめる。
 ///
 /// 第一の手段は `flock.bin` の master カウンタ（先頭の int）を直接見ること。
 /// ロックは `flock.bin` に置いたカウンタのセマフォで、1 以上が空きを表す。
-/// `LOCK_FREE_WINDOW` の間に一度も空きが見えなければ固まっていると判断する。
-/// `hako-cmd status` は共有ログへの書き込みのときにしかロックを取らず、ログが
-/// 満杯だとそれも省かれるため、固まっていても成功しうる。mmap の場所が分からない
-/// 構成に限って、`hako-cmd status` の応答で代用する。
-fn core_lock_unresponsive(state: &State<'_, AppState>) -> Option<String> {
-    let (selection, env) = {
-        let workspace = state.workspace.lock().ok()?;
-        (workspace.core_release.clone()?, workspace.core_env.clone())
+/// `LOCK_FREE_WINDOW` の間に一度も空きが見えなければ固まっている兆候とする。
+///
+/// mmap の場所が分からない、または一度も読めなかった構成では `hako-cmd status` で
+/// 代用する。ただし `status` は共有ログへの書き込みのときにしかロックを取らず、
+/// ログが満杯だとそれも省かれるので、成功しても空きの証拠にはならない。代用で
+/// 言えるのは「応答しなかった」場合だけで、成功時は `Unknown` とする。
+fn core_lock_health(state: &State<'_, AppState>) -> CoreLockHealth {
+    let Some((selection, env)) = state.workspace.lock().ok().and_then(|workspace| {
+        Some((workspace.core_release.clone()?, workspace.core_env.clone()))
+    }) else {
+        return CoreLockHealth::Unknown;
     };
-    if let Some(flock) = core_flock_path(&env) {
-        if let Some(seen_free) = master_lock_free_seen(&flock, LOCK_FREE_WINDOW) {
-            return (!seen_free).then(|| format!(
-                "{} 秒間、master ロックが一度も空きませんでした",
-                LOCK_FREE_WINDOW.as_secs()
-            ));
+    let base = Path::new(&selection.install_directory);
+    if let Some(flock) = core_flock_path(&env, base) {
+        match master_lock_free_seen(&flock, LOCK_FREE_WINDOW) {
+            Some(true) => return CoreLockHealth::Free,
+            Some(false) => {
+                return CoreLockHealth::Stuck(format!(
+                    "{} 秒間、master ロックの空きが一度も観測されませんでした",
+                    LOCK_FREE_WINDOW.as_secs()
+                ))
+            }
+            None => {}
         }
     }
-    let spec = ProgramSpec { program: selection.hako_cmd_path, args: vec!["status".to_owned()], cwd: Some(selection.install_directory), env, target: crate::types::ExecutionTarget::Native };
+    let spec = ProgramSpec { program: selection.hako_cmd_path.clone(), args: vec!["status".to_owned()], cwd: Some(selection.install_directory.clone()), env, target: crate::types::ExecutionTarget::Native };
     match run_oneshot(&spec, CORE_PROBE_TIMEOUT) {
-        Err(ProcessError::Timeout(_)) => Some(format!("hako-cmd status が {} 秒以内に応答しませんでした", CORE_PROBE_TIMEOUT.as_secs())),
+        Err(ProcessError::Timeout(_)) => CoreLockHealth::Stuck(format!("hako-cmd status が {} 秒以内に応答しませんでした", CORE_PROBE_TIMEOUT.as_secs())),
         Ok((_, stdout, stderr)) => stdout
             .lines()
             .chain(stderr.lines())
             .find(|line| line.contains("file-lock wait timed out"))
-            .map(|line| line.trim().to_owned()),
-        Err(_) => None,
+            .map_or(CoreLockHealth::Unknown, |line| CoreLockHealth::Stuck(line.trim().to_owned())),
+        Err(_) => CoreLockHealth::Unknown,
     }
 }
 
 /// Core の設定（`HAKO_CONFIG_PATH`）から、mmap 構成の `flock.bin` の場所を求める。
-fn core_flock_path(core_env: &BTreeMap<String, String>) -> Option<std::path::PathBuf> {
+///
+/// 相対パスは `hako-cmd` を動かす作業ディレクトリ（`base`）を基準に解決する。
+/// 設定ファイル側の `core_mmap_path` も同じ基準にそろえる。アセットごとに作業
+/// ディレクトリが違う構成で相対パスを使うと、そもそも各プロセスが別の場所を
+/// 見ることになるので、そこまでは補正しない。
+fn core_flock_path(core_env: &BTreeMap<String, String>, base: &Path) -> Option<std::path::PathBuf> {
     let config_path = core_env.get("HAKO_CONFIG_PATH").cloned().or_else(|| std::env::var("HAKO_CONFIG_PATH").ok())?;
+    let config_path = base.join(config_path);
     let config: serde_json::Value = serde_json::from_slice(&std::fs::read(config_path).ok()?).ok()?;
     if config.get("shm_type").and_then(|value| value.as_str()) != Some("mmap") {
         return None;
     }
     let directory = config.get("core_mmap_path")?.as_str()?;
-    Some(Path::new(directory).join("flock.bin"))
+    Some(base.join(directory).join("flock.bin"))
 }
 
 /// `window` の間に master カウンタが一度でも 1 以上（空き）だったか。
@@ -764,6 +790,32 @@ mod tests {
         let path = flock_with("stuck", 0);
         assert_eq!(master_lock_free_seen(&path, Duration::from_millis(200)), Some(false));
         let _ = std::fs::remove_file(path);
+    }
+
+    /// 相対の HAKO_CONFIG_PATH と core_mmap_path は hako-cmd の作業ディレクトリ基準で解決する。
+    #[test]
+    fn flock_path_resolves_relative_paths_against_base() {
+        let base = std::env::temp_dir().join(format!("hdm-test-base-{}", std::process::id()));
+        std::fs::create_dir_all(base.join("etc")).expect("create base");
+        std::fs::write(base.join("etc").join("core.json"), r#"{"shm_type":"mmap","core_mmap_path":"mmap"}"#).expect("write config");
+        let env = BTreeMap::from([("HAKO_CONFIG_PATH".to_owned(), "etc/core.json".to_owned())]);
+        assert_eq!(core_flock_path(&env, &base), Some(base.join("mmap").join("flock.bin")));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// 絶対パスは基準ディレクトリに左右されない。shm 構成では flock.bin を探さない。
+    #[test]
+    fn flock_path_keeps_absolute_paths_and_skips_shm() {
+        let dir = std::env::temp_dir().join(format!("hdm-test-abs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let mmap = dir.join("mmap");
+        let config = dir.join("core.json");
+        std::fs::write(&config, serde_json::json!({"shm_type": "mmap", "core_mmap_path": mmap.to_string_lossy()}).to_string()).expect("write config");
+        let env = BTreeMap::from([("HAKO_CONFIG_PATH".to_owned(), config.to_string_lossy().into_owned())]);
+        assert_eq!(core_flock_path(&env, Path::new("unrelated-base")), Some(mmap.join("flock.bin")));
+        std::fs::write(&config, r#"{"shm_type":"shm"}"#).expect("rewrite config");
+        assert_eq!(core_flock_path(&env, Path::new("unrelated-base")), None);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// ファイルが無ければ判断できない（警告しない）。
