@@ -690,10 +690,14 @@ fn monitor_targets<'a>(
 
 fn topological_order(assets: &[AssetDefinition]) -> Result<Vec<AssetDefinition>, String> {
     let enabled: BTreeMap<String, AssetDefinition> = assets.iter().filter(|asset| asset.enabled).map(|asset| (asset.id.clone(), asset.clone())).collect();
+    // 一括起動の対象から外したアセットへの依存は、順序の制約にしない。外したものは
+    // 一括起動では起動されないので、待っても来ない。ワークスペースに無い ID への
+    // 依存は従来どおり未解決参照として扱う。
+    let excluded: BTreeSet<&str> = assets.iter().filter(|asset| !asset.enabled).map(|asset| asset.id.as_str()).collect();
     let mut ordered = Vec::new();
     let mut completed = BTreeSet::new();
     while completed.len() < enabled.len() {
-        let ready: Vec<AssetDefinition> = enabled.values().filter(|asset| !completed.contains(&asset.id) && asset.depends_on.iter().all(|dependency| dependency == "core" || completed.contains(dependency))).cloned().collect();
+        let ready: Vec<AssetDefinition> = enabled.values().filter(|asset| !completed.contains(&asset.id) && asset.depends_on.iter().all(|dependency| dependency == "core" || excluded.contains(dependency.as_str()) || completed.contains(dependency))).cloned().collect();
         if ready.is_empty() {
             return Err("アセットの依存関係に循環または未解決参照があります。".to_owned());
         }
@@ -725,6 +729,17 @@ mod tests {
         let order = topological_order(&[asset("owner", vec![]), asset("viewer-a", vec!["owner"]), excluded]).unwrap();
         let ids: Vec<&str> = order.iter().map(|asset| asset.id.as_str()).collect();
         assert_eq!(ids, vec!["owner", "viewer-a"]);
+    }
+
+    /// 対象外のアセットへの依存は無視し、ワークスペースに無い ID への依存は拒否する。
+    #[test]
+    fn start_all_order_ignores_edges_to_excluded_assets() {
+        let mut excluded = asset("viewer-b", vec![]);
+        excluded.enabled = false;
+        let order = topological_order(&[asset("pilot", vec!["viewer-a", "viewer-b"]), asset("viewer-a", vec![]), excluded]).unwrap();
+        let ids: Vec<&str> = order.iter().map(|asset| asset.id.as_str()).collect();
+        assert_eq!(ids, vec!["viewer-a", "pilot"]);
+        assert!(topological_order(&[asset("pilot", vec!["missing"])]).is_err());
     }
 
     fn connection(id: &str) -> crate::types::ConnectionDefinition {
