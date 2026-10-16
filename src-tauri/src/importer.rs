@@ -64,7 +64,7 @@ pub fn inspect_directory(directory: &Path) -> Result<ImportPreview, String> {
 
 fn parse_launcher(path: &Path, root: &Value, warnings: &mut Vec<String>) -> Vec<AssetDefinition> {
     let Some(items) = root.get("assets").and_then(Value::as_array) else { return Vec::new(); };
-    items.iter().filter_map(|item| {
+    let mut assets: Vec<AssetDefinition> = items.iter().filter_map(|item| {
         let name = item.get("name").and_then(Value::as_str)?.trim();
         let command = item.get("command").and_then(Value::as_str)?.trim();
         if name.is_empty() || command.is_empty() {
@@ -113,7 +113,21 @@ fn parse_launcher(path: &Path, root: &Value, warnings: &mut Vec<String>) -> Vec<
             enabled: true,
             readiness,
         })
-    }).collect()
+    }).collect();
+    // Launcher の depends_on はアセット名で書かれているが、取り込んだアセットの ID は
+    // 名前ではない。同じファイル内の名前を ID に置き換えないと、一括起動の依存解決が
+    // 「未解決参照」で必ず失敗する。`core` と、ファイル内に無い名前はそのまま残す。
+    let ids: BTreeMap<String, String> = assets.iter().map(|asset| (asset.name.clone(), asset.id.clone())).collect();
+    for asset in &mut assets {
+        for dependency in &mut asset.depends_on {
+            // `core` は予約語。同名のアセットがあっても置き換えない。
+            if dependency == "core" { continue; }
+            if let Some(id) = ids.get(dependency.as_str()) {
+                *dependency = id.clone();
+            }
+        }
+    }
+    assets
 }
 
 fn parse_endpoint(
@@ -242,6 +256,28 @@ mod tests {
         let assets = parse_launcher(Path::new("launch.json"), &root, &mut Vec::new());
         assert_eq!(assets.len(), 1);
         assert_eq!(assets[0].activation_timing, ActivationTiming::AfterStart);
+    }
+
+    /// depends_on のアセット名は、取り込み後のアセット ID に置き換わる。
+    #[test]
+    fn launcher_dependencies_refer_to_imported_ids() {
+        let root: Value = serde_json::json!({"assets":[
+            {"name":"owner","command":"python","activation_timing":"before_start"},
+            {"name":"viewer","command":"python","depends_on":["owner","core","elsewhere"],"activation_timing":"after_start"}
+        ]});
+        let assets = parse_launcher(Path::new("launch.json"), &root, &mut Vec::new());
+        assert_eq!(assets[1].depends_on, vec![assets[0].id.clone(), "core".to_owned(), "elsewhere".to_owned()]);
+    }
+
+    /// `core` という名前のアセットがあっても、予約語の `core` 依存は置き換えない。
+    #[test]
+    fn launcher_core_dependency_is_not_rewritten() {
+        let root: Value = serde_json::json!({"assets":[
+            {"name":"core","command":"python"},
+            {"name":"viewer","command":"python","depends_on":["core"]}
+        ]});
+        let assets = parse_launcher(Path::new("launch.json"), &root, &mut Vec::new());
+        assert_eq!(assets[1].depends_on, vec!["core".to_owned()]);
     }
 
     /// 突き合わせはlinking側の責務であり、parse層は解決結果を埋めない。
