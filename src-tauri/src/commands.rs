@@ -96,7 +96,8 @@ pub fn delete_asset(state: State<'_, AppState>, asset_id: String) -> Result<Work
 pub fn start_asset(state: State<'_, AppState>, asset_id: String) -> Result<crate::types::ProcessSnapshot, String> {
     let asset = state.workspace.lock().map_err(|_| "ワークスペースをロックできません。".to_owned())?
         .assets.iter().find(|candidate| candidate.id == asset_id).cloned().ok_or_else(|| "起動対象のアセットが見つかりません。".to_owned())?;
-    if !asset.enabled { return Err("このアセットは無効化されています。".to_owned()); }
+    // `enabled` は一括起動の対象かどうかだけを表す。外したアセットも単独では起動できる。
+    // 一括起動と切り離して、実行中に後から足したり差し替えたりするアセットのため。
     state.processes.start(asset.id, asset.name, ProcessKind::Asset, asset.command).map_err(|error| error.to_string())
 }
 
@@ -115,10 +116,10 @@ pub fn stop_asset(state: State<'_, AppState>, asset_id: String) -> Result<Vec<cr
     // あるときだけ Core の応答を確かめ、固まっていそうなら利用者に知らせる。
     // ほかに何も動いていなければ master も無く、確かめても誤検知になるだけなので省く。
     let workspace = state.workspace.lock().map_err(|_| "ワークスペースをロックできません。".to_owned())?.clone();
-    if !running_owner_names(&state, &workspace, true).is_empty() {
+    if !running_owner_names(&state, &workspace).is_empty() {
         if let CoreLockHealth::Stuck(detail) = core_lock_health(&state) {
             // 確認している間に一括停止などで残りが止まっていれば、警告はもう当てはまらない。
-            if !running_owner_names(&state, &workspace, true).is_empty() {
+            if !running_owner_names(&state, &workspace).is_empty() {
                 let name = report.stopped.first().map(|snapshot| snapshot.owner_name.clone()).unwrap_or_default();
                 return Err(format!(
                     "{name} を停止しました。ただし Core が固まっている可能性があります（{detail}）。停止したプロセスが Core のロックを持ったまま終了した可能性があります。すべて停止してから一括起動し直してください。"
@@ -409,13 +410,12 @@ fn tcp_reachable(host: &str, port: u16, deadline: Instant) -> bool {
     false
 }
 
-/// アセット（`include_disabled` が偽なら有効なものだけ）と Core コントローラーの
-/// うち、プロセスが終了していないものの名前。
-fn running_owner_names(state: &State<'_, AppState>, workspace: &Workspace, include_disabled: bool) -> Vec<String> {
+/// アセット（一括起動の対象から外したものも含む）と Core コントローラーのうち、
+/// プロセスが終了していないものの名前。
+fn running_owner_names(state: &State<'_, AppState>, workspace: &Workspace) -> Vec<String> {
     let owners: BTreeSet<&str> = workspace
         .assets
         .iter()
-        .filter(|asset| include_disabled || asset.enabled)
         .map(|asset| asset.id.as_str())
         .chain(workspace.core_controller.iter().map(|controller| controller.id.as_str()))
         .collect();
@@ -485,7 +485,8 @@ pub fn start_all(state: State<'_, AppState>) -> Result<Vec<crate::types::Process
     let workspace = state.workspace.lock().map_err(|_| "ワークスペースをロックできません。".to_owned())?.clone();
     // 稼働中のアセットがあるまま一括起動すると、同じアセットが二重に起動する。
     // 登録アセットは Core に二重登録できず、外部アセットは同じポートを取り合う。
-    let alive = running_owner_names(&state, &workspace, false);
+    // 一括起動の対象外でも、単独で起動したものが動いていれば同じ Core を使っているので数える。
+    let alive = running_owner_names(&state, &workspace);
     if !alive.is_empty() {
         return Err(format!(
             "稼働中のプロセスがあるため一括起動できません（{}）。先にすべて停止してください。",
@@ -565,8 +566,8 @@ pub fn stop_all(state: State<'_, AppState>) -> Result<Vec<crate::types::ProcessS
             }
         }
         let deadline = Instant::now() + STOP_GRACE;
-        // 待つ対象は下の kill の対象と揃える。無効化しただけで動いているアセットも含む。
-        while !running_owner_names(&state, &workspace, true).is_empty() && Instant::now() < deadline {
+        // 待つ対象は下の kill の対象と揃える。一括起動の対象外で単独起動したアセットも含む。
+        while !running_owner_names(&state, &workspace).is_empty() && Instant::now() < deadline {
             thread::sleep(READINESS_POLL);
         }
     }
@@ -714,6 +715,16 @@ mod tests {
     fn starts_dependencies_first() {
         let order = topological_order(&[asset("b", vec!["a"]), asset("a", vec![])]).unwrap();
         assert_eq!(order[0].id, "a");
+    }
+
+    /// 一括起動の対象から外したアセットは一括起動の順序に入らない。単独起動の可否とは無関係。
+    #[test]
+    fn start_all_order_skips_excluded_assets() {
+        let mut excluded = asset("viewer-b", vec!["owner"]);
+        excluded.enabled = false;
+        let order = topological_order(&[asset("owner", vec![]), asset("viewer-a", vec!["owner"]), excluded]).unwrap();
+        let ids: Vec<&str> = order.iter().map(|asset| asset.id.as_str()).collect();
+        assert_eq!(ids, vec!["owner", "viewer-a"]);
     }
 
     fn connection(id: &str) -> crate::types::ConnectionDefinition {

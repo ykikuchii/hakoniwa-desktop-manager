@@ -33,13 +33,14 @@ function formatDate(value?: string | null) {
     : new Intl.DateTimeFormat("ja-JP", { hour: "2-digit", minute: "2-digit", second: "2-digit" }).format(date);
 }
 
-function statusFor(process: ProcessSnapshot | undefined, connections: ConnectionSnapshot[], enabled: boolean): VisualStatus {
+function statusFor(process: ProcessSnapshot | undefined, connections: ConnectionSnapshot[]): VisualStatus {
   if (process?.status === "failed") return "error";
   if (process?.status === "starting") return "starting";
   if (process?.status === "running" && connections.some((connection) => connection.state === "connected")) return "connected";
   if (process?.status === "running") return "running";
   if (connections.some((connection) => connection.state === "disconnected")) return "disconnected";
-  return enabled ? "stopped" : "disconnected";
+  // 一括起動の対象外は「単独で起動するもの」で、止まっていても異常ではない。
+  return "stopped";
 }
 
 function positionFor(index: number, total: number): Position {
@@ -91,7 +92,7 @@ export function TopologyPage({
       id: asset.id,
       name: asset.name,
       role: asset.role,
-      status: statusFor(process, connections, asset.enabled),
+      status: statusFor(process, connections),
       position: positionFor(index, snapshot.workspace.assets.length),
       process,
       connections,
