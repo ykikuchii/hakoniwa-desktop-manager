@@ -7,6 +7,7 @@ import type {
   ImportPreview,
   LifecycleCommandResult,
   ProcessSnapshot,
+  ProjectCheck,
   Workspace,
   WorkspaceSnapshot,
 } from "./types";
@@ -35,6 +36,8 @@ export const api = {
   createProject: (name: string) => invoke<string>("create_project", { name }),
   importV1Workspace: (path: string, replace: boolean) => invoke<string>("import_v1_workspace", { path, replace }),
   clearStoreWarnings: () => invoke<void>("clear_store_warnings"),
+  checkProject: () => invoke<ProjectCheck>("check_project"),
+  acceptMemberChanges: (memberIds: string[]) => invoke<ProjectCheck>("accept_member_changes", { memberIds }),
 };
 
 export function newAsset(): AssetDefinition {

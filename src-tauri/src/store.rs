@@ -178,7 +178,12 @@ impl Store {
                 return true;
             }
         };
-        let (assets, project) = split_v1_workspace(&workspace);
+        let (assets, mut project) = split_v1_workspace(&workspace);
+        // 移行する構成は、これまでそのまま起動していたものなので、今の内容で承認しておく。
+        let library: Library = assets.iter().map(|asset| (asset.id.clone(), asset.clone())).collect();
+        if let Err(error) = crate::check::accept_all(&mut project, &library) {
+            self.warnings.push(format!("移行した構成を承認できませんでした（接続チェックで承認してください）: {error}"));
+        }
         let result = (|| {
             for asset in &assets {
                 self.save_asset(asset)?;
@@ -238,11 +243,23 @@ impl Store {
             }
             member.asset_id = Self::stage_asset(&mut draft, asset);
         }
+        // 取り込みは利用者が構成を明示的に入れる操作なので、今の内容で承認する。
+        crate::check::accept_all(&mut project, &draft.library)?;
         self.commit(draft, project.clone())?;
         if consume {
             self.backup_v1(path)?;
         }
         Ok(ImportOutcome { project_id: project.id, replaced })
+    }
+
+    /// プロジェクトのメンバーを、今の内容で承認して保存する。`member_ids` が `None` なら全員。
+    pub fn accept(&mut self, project_id: &str, member_ids: Option<&[String]>) -> Result<(), String> {
+        let mut project = self.projects.get(project_id).cloned().ok_or_else(|| "そのプロジェクトはありません。".to_owned())?;
+        match member_ids {
+            Some(ids) => crate::check::accept_members(&mut project, &self.library, ids)?,
+            None => crate::check::accept_all(&mut project, &self.library)?,
+        }
+        self.commit(self.draft(), project)
     }
 
     pub fn draft(&self) -> LibraryDraft {
@@ -470,6 +487,7 @@ mod tests {
         assert_eq!(json_files(&dir.join("backup")).len(), 1);
         assert!(store.app.migrated_from_v1.is_some());
         assert_eq!(store.library.len(), 6);
+        assert!(store.projects[store.active_project_id()].members.iter().all(|member| member.accepted.is_some()), "移行した構成は承認済み");
 
         // 開き直しても同じ。移行はやり直さない。
         let reopened = Store::open(&dir);
@@ -554,6 +572,7 @@ mod tests {
         let mut store = Store::open(&dir);
         let outcome = store.import_v1(&source, true, false).unwrap();
         assert!(!outcome.replaced);
+        assert!(store.projects[&outcome.project_id].members.iter().all(|member| member.accepted.is_some()), "取り込んだ構成は承認済み");
         assert!(source.exists(), "consume しなければ元のファイルは残す");
 
         first.id = "regenerated-uuid".to_owned();

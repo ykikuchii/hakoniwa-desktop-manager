@@ -1,3 +1,4 @@
+mod check;
 mod commands;
 mod compat;
 mod core;
@@ -137,6 +138,9 @@ pub fn run() {
             commands::create_project,
             commands::import_v1_workspace,
             commands::clear_store_warnings,
+            commands::check_project,
+            commands::accept_member_changes,
+            commands::preview_add_member,
         ])
         .run(tauri::generate_context!())
         .expect("Hakoniwa Desktop Managerを起動できませんでした。");

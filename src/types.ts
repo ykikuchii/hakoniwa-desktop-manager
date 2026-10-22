@@ -127,6 +127,33 @@ export interface WorkspaceSnapshot {
   store_warnings: string[];
 }
 
+export type Severity = "error" | "warning" | "info";
+
+export interface Finding {
+  severity: Severity;
+  code: string;
+  members: string[];
+  robot?: string | null;
+  channel_id?: number | null;
+  message: string;
+}
+
+export interface MemberCheck {
+  member_id: string;
+  name: string;
+  enabled: boolean;
+  entries: { path: string; usage: "register" | "attach"; usage_inferred: boolean }[];
+  inferred: boolean;
+  revision: string;
+  acceptance: "no_pdu_config" | "accepted" | "changed" | "not_accepted";
+  changes: string[];
+}
+
+export interface ProjectCheck {
+  report: { findings: Finding[]; coverage: "complete" | "partial" };
+  members: MemberCheck[];
+}
+
 export interface ProjectSummary {
   id: string;
   name: string;
