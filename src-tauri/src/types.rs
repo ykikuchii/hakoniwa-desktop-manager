@@ -126,8 +126,15 @@ pub struct AssetDefinition {
     pub name: String,
     pub role: AssetRole,
     pub command: ProgramSpec,
+    /// 必須の依存先。一括起動はこれらの準備完了を待ってからこのアセットを起動する。
+    /// 依存先が一括起動の対象から外れていると、一括起動は理由を示して拒否する。
     #[serde(default)]
     pub depends_on: Vec<String>,
+    /// 任意の依存先。一括起動の対象に含まれていれば `depends_on` と同じく待ち、
+    /// 対象外なら待たずに進む。差し替え可能な可視化のように、選んだほうだけを
+    /// 待てばよい依存のため。
+    #[serde(default)]
+    pub optional_depends_on: Vec<String>,
     #[serde(default)]
     pub activation_timing: ActivationTiming,
     #[serde(default)]
@@ -243,7 +250,7 @@ impl Workspace {
             }
         }
         for asset in &self.assets {
-            for dependency in &asset.depends_on {
+            for dependency in asset.depends_on.iter().chain(asset.optional_depends_on.iter()) {
                 if dependency != "core" && !ids.contains(dependency) {
                     return Err(format!(
                         "アセット「{}」は未登録の依存先「{}」を参照しています。",

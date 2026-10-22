@@ -85,7 +85,10 @@ pub fn delete_asset(state: State<'_, AppState>, asset_id: String) -> Result<Work
     let before = workspace.assets.len();
     workspace.assets.retain(|asset| asset.id != asset_id);
     if before == workspace.assets.len() { return Err("削除対象のアセットが見つかりません。".to_owned()); }
-    for asset in &mut workspace.assets { asset.depends_on.retain(|dependency| dependency != &asset_id); }
+    for asset in &mut workspace.assets {
+        asset.depends_on.retain(|dependency| dependency != &asset_id);
+        asset.optional_depends_on.retain(|dependency| dependency != &asset_id);
+    }
     let response = workspace.clone();
     drop(workspace);
     state.persist_workspace()?;
@@ -96,7 +99,15 @@ pub fn delete_asset(state: State<'_, AppState>, asset_id: String) -> Result<Work
 pub fn start_asset(state: State<'_, AppState>, asset_id: String) -> Result<crate::types::ProcessSnapshot, String> {
     let asset = state.workspace.lock().map_err(|_| "ワークスペースをロックできません。".to_owned())?
         .assets.iter().find(|candidate| candidate.id == asset_id).cloned().ok_or_else(|| "起動対象のアセットが見つかりません。".to_owned())?;
-    if !asset.enabled { return Err("このアセットは無効化されています。".to_owned()); }
+    // `enabled` は一括起動の対象かどうかだけを表す。外したアセットも単独では起動できる。
+    // 一括起動と切り離して、実行中に後から足したり差し替えたりするアセットのため。
+    // ただし一括起動・一括停止の最中は断る。一括停止が通り過ぎた後に起動して止めた
+    // はずのものが残ったり、一括起動と二重に起動したりするため。
+    // 確認からプロセスの登録まで `lifecycle_gate` を持ち、一括操作の開始と重ならないようにする。
+    let _gate = state.lifecycle_gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if state.start_all_running.load(Ordering::Acquire) || state.stop_all_running.load(Ordering::Acquire) {
+        return Err("一括起動または一括停止の実行中は、アセットを単独で起動できません。".to_owned());
+    }
     state.processes.start(asset.id, asset.name, ProcessKind::Asset, asset.command).map_err(|error| error.to_string())
 }
 
@@ -115,10 +126,10 @@ pub fn stop_asset(state: State<'_, AppState>, asset_id: String) -> Result<Vec<cr
     // あるときだけ Core の応答を確かめ、固まっていそうなら利用者に知らせる。
     // ほかに何も動いていなければ master も無く、確かめても誤検知になるだけなので省く。
     let workspace = state.workspace.lock().map_err(|_| "ワークスペースをロックできません。".to_owned())?.clone();
-    if !running_owner_names(&state, &workspace, true).is_empty() {
+    if !running_owner_names(&state, &workspace).is_empty() {
         if let CoreLockHealth::Stuck(detail) = core_lock_health(&state) {
             // 確認している間に一括停止などで残りが止まっていれば、警告はもう当てはまらない。
-            if !running_owner_names(&state, &workspace, true).is_empty() {
+            if !running_owner_names(&state, &workspace).is_empty() {
                 let name = report.stopped.first().map(|snapshot| snapshot.owner_name.clone()).unwrap_or_default();
                 return Err(format!(
                     "{name} を停止しました。ただし Core が固まっている可能性があります（{detail}）。停止したプロセスが Core のロックを持ったまま終了した可能性があります。すべて停止してから一括起動し直してください。"
@@ -409,13 +420,12 @@ fn tcp_reachable(host: &str, port: u16, deadline: Instant) -> bool {
     false
 }
 
-/// アセット（`include_disabled` が偽なら有効なものだけ）と Core コントローラーの
-/// うち、プロセスが終了していないものの名前。
-fn running_owner_names(state: &State<'_, AppState>, workspace: &Workspace, include_disabled: bool) -> Vec<String> {
+/// アセット（一括起動の対象から外したものも含む）と Core コントローラーのうち、
+/// プロセスが終了していないものの名前。
+fn running_owner_names(state: &State<'_, AppState>, workspace: &Workspace) -> Vec<String> {
     let owners: BTreeSet<&str> = workspace
         .assets
         .iter()
-        .filter(|asset| include_disabled || asset.enabled)
         .map(|asset| asset.id.as_str())
         .chain(workspace.core_controller.iter().map(|controller| controller.id.as_str()))
         .collect();
@@ -473,10 +483,14 @@ impl Drop for StartAllGuard<'_> {
 // 走り UI を止めるため、async 指定でワーカースレッドに逃がす。
 #[tauri::command(async)]
 pub fn start_all(state: State<'_, AppState>) -> Result<Vec<crate::types::ProcessSnapshot>, String> {
+    // フラグを立てるまで `lifecycle_gate` を持つ。単独起動の途中なら、その登録が
+    // 終わってからここに来るので、下の稼働中の確認で見落とさない。
+    let gate = state.lifecycle_gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if state.start_all_running.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
         return Err("一括起動は既に実行中です。".to_owned());
     }
     let _guard = StartAllGuard(&state.start_all_running);
+    drop(gate);
     // フラグを立てた後に確認する。立てる前に確認すると、その隙に始まった停止を
     // 見落とす。停止側は起動のフラグが下りるまで待つので、どちらかが必ず譲る。
     if state.stop_all_running.load(Ordering::Acquire) {
@@ -485,7 +499,8 @@ pub fn start_all(state: State<'_, AppState>) -> Result<Vec<crate::types::Process
     let workspace = state.workspace.lock().map_err(|_| "ワークスペースをロックできません。".to_owned())?.clone();
     // 稼働中のアセットがあるまま一括起動すると、同じアセットが二重に起動する。
     // 登録アセットは Core に二重登録できず、外部アセットは同じポートを取り合う。
-    let alive = running_owner_names(&state, &workspace, false);
+    // 一括起動の対象外でも、単独で起動したものが動いていれば同じ Core を使っているので数える。
+    let alive = running_owner_names(&state, &workspace);
     if !alive.is_empty() {
         return Err(format!(
             "稼働中のプロセスがあるため一括起動できません（{}）。先にすべて停止してください。",
@@ -533,7 +548,12 @@ pub fn start_all(state: State<'_, AppState>) -> Result<Vec<crate::types::Process
 // 走り、その間 UI が固まるため async 指定でワーカースレッドに逃がす。
 #[tauri::command(async)]
 pub fn stop_all(state: State<'_, AppState>) -> Result<Vec<crate::types::ProcessSnapshot>, String> {
-    state.stop_all_running.store(true, Ordering::Release);
+    {
+        // 単独起動の途中なら、その登録が終わってからフラグを立てる。下の停止で
+        // そのプロセスも止める対象に入る。
+        let _gate = state.lifecycle_gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.stop_all_running.store(true, Ordering::Release);
+    }
     let _guard = StopAllGuard(&state);
     // 進行中の一括起動を止めてから停止する。止めないと、停止が通り過ぎた後で
     // 起動側が残りのアセットを起動し、停止したはずのものが動き続ける。
@@ -565,8 +585,8 @@ pub fn stop_all(state: State<'_, AppState>) -> Result<Vec<crate::types::ProcessS
             }
         }
         let deadline = Instant::now() + STOP_GRACE;
-        // 待つ対象は下の kill の対象と揃える。無効化しただけで動いているアセットも含む。
-        while !running_owner_names(&state, &workspace, true).is_empty() && Instant::now() < deadline {
+        // 待つ対象は下の kill の対象と揃える。一括起動の対象外で単独起動したアセットも含む。
+        while !running_owner_names(&state, &workspace).is_empty() && Instant::now() < deadline {
             thread::sleep(READINESS_POLL);
         }
     }
@@ -689,10 +709,57 @@ fn monitor_targets<'a>(
 
 fn topological_order(assets: &[AssetDefinition]) -> Result<Vec<AssetDefinition>, String> {
     let enabled: BTreeMap<String, AssetDefinition> = assets.iter().filter(|asset| asset.enabled).map(|asset| (asset.id.clone(), asset.clone())).collect();
+    let names: BTreeMap<&str, &str> = assets.iter().map(|asset| (asset.id.as_str(), asset.name.as_str())).collect();
+    // 必須の依存先を一括起動の対象から外していれば、黙って進めずに拒否する。外した
+    // ものは一括起動では起動されないので待っても来ず、依存元は前提が無いまま動き出す。
+    // 待たなくてよい依存は `optional_depends_on` に書く。
+    for asset in enabled.values() {
+        let excluded_required: Vec<&str> = asset.depends_on.iter()
+            .filter(|dependency| dependency.as_str() != "core" && !enabled.contains_key(dependency.as_str()))
+            .filter_map(|dependency| names.get(dependency.as_str()).copied())
+            .collect();
+        if !excluded_required.is_empty() {
+            return Err(format!(
+                "「{}」の必須の依存先（{}）が一括起動の対象から外れています。依存先を一括起動の対象に含めるか、任意の依存先に移してください。",
+                asset.name,
+                excluded_required.join("、")
+            ));
+        }
+    }
+    // 一括起動は起動タイミングの段階ごと（before_start → manual → after_start）に進み、
+    // 段階の中だけを依存順に並べる。後の段階のアセットに依存すると、依存元が先に
+    // 起動してしまい依存が満たせないので、何かを起動する前に拒否する。
+    let phase = |timing: &ActivationTiming| match timing {
+        ActivationTiming::BeforeStart => (0, "before_start"),
+        ActivationTiming::Manual => (1, "manual"),
+        ActivationTiming::AfterStart => (2, "after_start"),
+    };
+    for asset in enabled.values() {
+        for dependency in asset.depends_on.iter().chain(asset.optional_depends_on.iter()) {
+            // `core` は Core 本体を表す予約語。同じ ID のアセットがあっても段階の比較はしない。
+            if dependency == "core" { continue; }
+            let Some(target) = enabled.get(dependency.as_str()) else { continue };
+            let (own_rank, own_label) = phase(&asset.activation_timing);
+            let (target_rank, target_label) = phase(&target.activation_timing);
+            if target_rank > own_rank {
+                return Err(format!(
+                    "「{}」（{own_label}）は、後の段階で起動する「{}」（{target_label}）に依存しています。一括起動は before_start → manual → after_start の順に進むため、この依存は満たせません。起動タイミングか依存先を見直してください。",
+                    asset.name, target.name
+                ));
+            }
+        }
+    }
+    // 任意の依存先は、対象外なら順序の制約にしない。ワークスペースに無い ID への
+    // 依存は、必須・任意とも未解決参照として扱う。
+    let excluded: BTreeSet<&str> = assets.iter().filter(|asset| !asset.enabled).map(|asset| asset.id.as_str()).collect();
     let mut ordered = Vec::new();
     let mut completed = BTreeSet::new();
     while completed.len() < enabled.len() {
-        let ready: Vec<AssetDefinition> = enabled.values().filter(|asset| !completed.contains(&asset.id) && asset.depends_on.iter().all(|dependency| dependency == "core" || completed.contains(dependency))).cloned().collect();
+        let ready: Vec<AssetDefinition> = enabled.values().filter(|asset| {
+            !completed.contains(&asset.id)
+                && asset.depends_on.iter().all(|dependency| dependency == "core" || completed.contains(dependency))
+                && asset.optional_depends_on.iter().all(|dependency| dependency == "core" || excluded.contains(dependency.as_str()) || completed.contains(dependency))
+        }).cloned().collect();
         if ready.is_empty() {
             return Err("アセットの依存関係に循環または未解決参照があります。".to_owned());
         }
@@ -707,13 +774,85 @@ mod tests {
     use crate::types::{AssetRole, ExecutionTarget, ProgramSpec};
 
     fn asset(id: &str, depends_on: Vec<&str>) -> AssetDefinition {
-        AssetDefinition { id: id.to_owned(), name: id.to_owned(), role: AssetRole::Other, command: ProgramSpec { program: "echo".to_owned(), args: vec![], cwd: None, env: BTreeMap::new(), target: ExecutionTarget::Native }, depends_on: depends_on.into_iter().map(str::to_owned).collect(), activation_timing: ActivationTiming::Manual, config_files: vec![], enabled: true, readiness: ReadinessCheck::default() }
+        AssetDefinition { id: id.to_owned(), name: id.to_owned(), role: AssetRole::Other, command: ProgramSpec { program: "echo".to_owned(), args: vec![], cwd: None, env: BTreeMap::new(), target: ExecutionTarget::Native }, depends_on: depends_on.into_iter().map(str::to_owned).collect(), optional_depends_on: vec![], activation_timing: ActivationTiming::Manual, config_files: vec![], enabled: true, readiness: ReadinessCheck::default() }
     }
 
     #[test]
     fn starts_dependencies_first() {
         let order = topological_order(&[asset("b", vec!["a"]), asset("a", vec![])]).unwrap();
         assert_eq!(order[0].id, "a");
+    }
+
+    /// 一括起動の対象から外したアセットは一括起動の順序に入らない。単独起動の可否とは無関係。
+    #[test]
+    fn start_all_order_skips_excluded_assets() {
+        let mut excluded = asset("viewer-b", vec!["owner"]);
+        excluded.enabled = false;
+        let order = topological_order(&[asset("owner", vec![]), asset("viewer-a", vec!["owner"]), excluded]).unwrap();
+        let ids: Vec<&str> = order.iter().map(|asset| asset.id.as_str()).collect();
+        assert_eq!(ids, vec!["owner", "viewer-a"]);
+    }
+
+    /// 任意の依存先は、対象なら待ち、対象外なら待たない。
+    #[test]
+    fn start_all_order_waits_for_included_optional_dependencies_only() {
+        let mut excluded = asset("viewer-b", vec![]);
+        excluded.enabled = false;
+        let mut pilot = asset("pilot", vec!["sim"]);
+        pilot.optional_depends_on = vec!["viewer-a".to_owned(), "viewer-b".to_owned()];
+        let order = topological_order(&[pilot, asset("viewer-a", vec!["sim"]), asset("sim", vec![]), excluded]).unwrap();
+        let ids: Vec<&str> = order.iter().map(|asset| asset.id.as_str()).collect();
+        assert_eq!(ids, vec!["sim", "viewer-a", "pilot"]);
+    }
+
+    /// 必須の依存先が対象外なら、理由を示して拒否する。
+    #[test]
+    fn start_all_order_rejects_excluded_required_dependency() {
+        let mut excluded = asset("viewer-b", vec![]);
+        excluded.enabled = false;
+        let error = topological_order(&[asset("pilot", vec!["viewer-b"]), excluded]).unwrap_err();
+        assert!(error.contains("pilot") && error.contains("viewer-b"), "{error}");
+    }
+
+    /// 後の段階で起動するアセットへの依存は、必須・任意とも拒否する。同じ段階や前の段階なら通す。
+    #[test]
+    fn start_all_order_rejects_dependencies_on_later_phases() {
+        let mut early = asset("early", vec!["late"]);
+        early.activation_timing = ActivationTiming::BeforeStart;
+        let mut late = asset("late", vec![]);
+        late.activation_timing = ActivationTiming::AfterStart;
+        let error = topological_order(&[early.clone(), late.clone()]).unwrap_err();
+        assert!(error.contains("early") && error.contains("late"), "{error}");
+
+        early.depends_on.clear();
+        early.optional_depends_on = vec!["late".to_owned()];
+        assert!(topological_order(&[early.clone(), late.clone()]).is_err());
+
+        let mut after = asset("after", vec!["early"]);
+        after.activation_timing = ActivationTiming::AfterStart;
+        early.optional_depends_on.clear();
+        let order = topological_order(&[after, early]).unwrap();
+        let ids: Vec<&str> = order.iter().map(|asset| asset.id.as_str()).collect();
+        assert_eq!(ids, vec!["early", "after"]);
+    }
+
+    /// 予約語の `core` への依存は、同じ ID のアセットが後の段階にあっても拒否しない。
+    #[test]
+    fn start_all_order_does_not_phase_check_the_core_sentinel() {
+        let mut core_asset = asset("core", vec![]);
+        core_asset.activation_timing = ActivationTiming::AfterStart;
+        let mut manual = asset("manual", vec!["core"]);
+        manual.activation_timing = ActivationTiming::Manual;
+        assert!(topological_order(&[manual, core_asset]).is_ok());
+    }
+
+    /// ワークスペースに無い ID への依存は、必須・任意とも拒否する。
+    #[test]
+    fn start_all_order_rejects_unknown_dependencies() {
+        assert!(topological_order(&[asset("pilot", vec!["missing"])]).is_err());
+        let mut pilot = asset("pilot", vec![]);
+        pilot.optional_depends_on = vec!["missing".to_owned()];
+        assert!(topological_order(&[pilot]).is_err());
     }
 
     fn connection(id: &str) -> crate::types::ConnectionDefinition {

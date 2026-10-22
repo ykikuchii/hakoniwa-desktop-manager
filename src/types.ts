@@ -23,6 +23,7 @@ export interface AssetDefinition {
   role: AssetRole;
   command: ProgramSpec;
   depends_on: string[];
+  optional_depends_on?: string[];
   activation_timing: ActivationTiming;
   config_files: string[];
   enabled: boolean;

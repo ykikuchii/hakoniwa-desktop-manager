@@ -198,6 +198,7 @@ mod tests {
                 target: ExecutionTarget::Native,
             },
             depends_on: Vec::new(),
+            optional_depends_on: Vec::new(),
             activation_timing: ActivationTiming::Manual,
             config_files: Vec::new(),
             enabled: true,

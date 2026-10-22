@@ -15,6 +15,10 @@ pub struct AppState {
     pub start_all_cancel: AtomicBool,
     /// 一括停止の実行中フラグ。停止中に始まった一括起動を拒否する。
     pub stop_all_running: AtomicBool,
+    /// 単独起動の受付と、一括起動・一括停止の開始を直列化する。単独起動は確認から
+    /// プロセスの登録までこれを持つので、その間に一括停止が通り過ぎることも、
+    /// 一括起動が稼働中の確認を終えてしまうこともない。
+    pub lifecycle_gate: Mutex<()>,
 }
 
 impl AppState {
@@ -24,7 +28,7 @@ impl AppState {
         let _ = fs::create_dir_all(&data_directory);
         ensure_default_catalog(&catalog_path);
         let workspace = load_workspace(&data_directory).unwrap_or_else(|| Workspace::empty(Uuid::new_v4().to_string(), "新しいHakoniwaワークスペース".to_owned()));
-        Self { workspace: Mutex::new(workspace), processes: ProcessManager::new(), monitor: CommunicationMonitor::default(), data_directory, catalog_path, start_all_running: AtomicBool::new(false), start_all_cancel: AtomicBool::new(false), stop_all_running: AtomicBool::new(false) }
+        Self { workspace: Mutex::new(workspace), processes: ProcessManager::new(), monitor: CommunicationMonitor::default(), data_directory, catalog_path, start_all_running: AtomicBool::new(false), start_all_cancel: AtomicBool::new(false), stop_all_running: AtomicBool::new(false), lifecycle_gate: Mutex::new(()) }
     }
 
     pub fn persist_workspace(&self) -> Result<(), String> {

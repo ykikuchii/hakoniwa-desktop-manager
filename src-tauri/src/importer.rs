@@ -64,7 +64,7 @@ pub fn inspect_directory(directory: &Path) -> Result<ImportPreview, String> {
 
 fn parse_launcher(path: &Path, root: &Value, warnings: &mut Vec<String>) -> Vec<AssetDefinition> {
     let Some(items) = root.get("assets").and_then(Value::as_array) else { return Vec::new(); };
-    items.iter().filter_map(|item| {
+    let mut assets: Vec<AssetDefinition> = items.iter().filter_map(|item| {
         let name = item.get("name").and_then(Value::as_str)?.trim();
         let command = item.get("command").and_then(Value::as_str)?.trim();
         if name.is_empty() || command.is_empty() {
@@ -76,7 +76,9 @@ fn parse_launcher(path: &Path, root: &Value, warnings: &mut Vec<String>) -> Vec<
         }
         let args = item.get("args").and_then(Value::as_array).map(|values| values.iter().filter_map(Value::as_str).map(str::to_owned).collect()).unwrap_or_default();
         let env = item.get("env").and_then(Value::as_object).map(|values| values.iter().filter_map(|(key, value)| value.as_str().map(|string| (key.clone(), string.to_owned()))).collect()).unwrap_or_default();
-        let depends_on = item.get("depends_on").and_then(Value::as_array).map(|values| values.iter().filter_map(Value::as_str).map(str::to_owned).collect()).unwrap_or_default();
+        let string_list = |key: &str| -> Vec<String> { item.get(key).and_then(Value::as_array).map(|values| values.iter().filter_map(Value::as_str).map(str::to_owned).collect()).unwrap_or_default() };
+        let depends_on = string_list("depends_on");
+        let optional_depends_on = string_list("optional_depends_on");
         let activation_timing = match item.get("activation_timing").and_then(Value::as_str) {
             Some("before_start") => ActivationTiming::BeforeStart,
             Some("after_start") => ActivationTiming::AfterStart,
@@ -108,12 +110,41 @@ fn parse_launcher(path: &Path, root: &Value, warnings: &mut Vec<String>) -> Vec<
                 env, target: ExecutionTarget::Native,
             },
             depends_on,
+            optional_depends_on,
             activation_timing,
             config_files: vec![path.display().to_string()],
             enabled: true,
             readiness,
         })
-    }).collect()
+    }).collect();
+    // Launcher の depends_on はアセット名で書かれているが、取り込んだアセットの ID は
+    // 名前ではない。同じファイル内の名前を ID に置き換えないと、一括起動の依存解決が
+    // 「未解決参照」で必ず失敗する。`core` と、ファイル内に無い名前はそのまま残す。
+    // すでに取り込み後の ID を指している参照は書き換えない。同じ名前のアセットが
+    // ファイル内に複数あると、どれを指すか決められないので、書き換えずに警告する。
+    let own_ids: BTreeSet<String> = assets.iter().map(|asset| asset.id.clone()).collect();
+    let mut ids: BTreeMap<String, Option<String>> = BTreeMap::new();
+    for asset in &assets {
+        ids.entry(asset.name.clone())
+            .and_modify(|id| *id = None)
+            .or_insert_with(|| Some(asset.id.clone()));
+    }
+    for asset in &mut assets {
+        let owner = asset.name.clone();
+        for dependency in asset.depends_on.iter_mut().chain(asset.optional_depends_on.iter_mut()) {
+            // `core` は予約語。同名のアセットがあっても置き換えない。
+            if dependency == "core" || own_ids.contains(dependency.as_str()) { continue; }
+            match ids.get(dependency.as_str()) {
+                Some(Some(id)) => *dependency = id.clone(),
+                Some(None) => warnings.push(format!(
+                    "{}: asset「{}」の依存先「{}」は同名のアセットが複数あるため特定できません。依存先を確認してください。",
+                    path.display(), owner, dependency
+                )),
+                None => {}
+            }
+        }
+    }
+    assets
 }
 
 fn parse_endpoint(
@@ -242,6 +273,44 @@ mod tests {
         let assets = parse_launcher(Path::new("launch.json"), &root, &mut Vec::new());
         assert_eq!(assets.len(), 1);
         assert_eq!(assets[0].activation_timing, ActivationTiming::AfterStart);
+    }
+
+    /// depends_on のアセット名は、取り込み後のアセット ID に置き換わる。
+    #[test]
+    fn launcher_dependencies_refer_to_imported_ids() {
+        let root: Value = serde_json::json!({"assets":[
+            {"name":"owner","command":"python","activation_timing":"before_start"},
+            {"name":"viewer","command":"python","depends_on":["owner","core","elsewhere"],"activation_timing":"after_start"}
+        ]});
+        let assets = parse_launcher(Path::new("launch.json"), &root, &mut Vec::new());
+        assert_eq!(assets[1].depends_on, vec![assets[0].id.clone(), "core".to_owned(), "elsewhere".to_owned()]);
+    }
+
+    /// 任意の依存先も ID に置き換わる。同名のアセットが複数あれば警告し、置き換えない。
+    #[test]
+    fn launcher_optional_dependencies_and_duplicate_names() {
+        let root: Value = serde_json::json!({"assets":[
+            {"name":"viewer","command":"python"},
+            {"name":"viewer","command":"python"},
+            {"name":"sim","command":"python"},
+            {"name":"pilot","command":"python","depends_on":["sim"],"optional_depends_on":["viewer"]}
+        ]});
+        let mut warnings = Vec::new();
+        let assets = parse_launcher(Path::new("launch.json"), &root, &mut warnings);
+        assert_eq!(assets[3].depends_on, vec![assets[2].id.clone()]);
+        assert_eq!(assets[3].optional_depends_on, vec!["viewer".to_owned()]);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+    }
+
+    /// `core` という名前のアセットがあっても、予約語の `core` 依存は置き換えない。
+    #[test]
+    fn launcher_core_dependency_is_not_rewritten() {
+        let root: Value = serde_json::json!({"assets":[
+            {"name":"core","command":"python"},
+            {"name":"viewer","command":"python","depends_on":["core"]}
+        ]});
+        let assets = parse_launcher(Path::new("launch.json"), &root, &mut Vec::new());
+        assert_eq!(assets[1].depends_on, vec!["core".to_owned()]);
     }
 
     /// 突き合わせはlinking側の責務であり、parse層は解決結果を埋めない。
