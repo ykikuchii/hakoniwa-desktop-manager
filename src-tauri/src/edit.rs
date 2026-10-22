@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use uuid::Uuid;
 
 use crate::model::{library_asset_from_definition, member_from_definition, Member, Variant};
-use crate::store::Store;
+use crate::store::{LibraryDraft, Store};
 use crate::types::{AssetDefinition, Workspace};
 
 /// 画面で新しく足したメンバーのアセットの id。同じプロジェクトに同じ id で取り込み直すと
@@ -21,6 +21,9 @@ fn new_member_asset_id(project_id: &str, member_id: &str) -> String {
 }
 
 /// `workspace` の内容で、プロジェクト `project_id` を置き換える。
+///
+/// 変更はライブラリの下書きに集め、プロジェクトと合わせて検証してから保存する。
+/// 検証に落ちれば、アセットも含めて何も保存しない。
 pub fn apply_workspace(store: &mut Store, project_id: &str, workspace: &Workspace) -> Result<(), String> {
     workspace.validate()?;
     let mut project = store.projects.get(project_id).cloned().ok_or_else(|| "編集するプロジェクトがありません。".to_owned())?;
@@ -31,26 +34,25 @@ pub fn apply_workspace(store: &mut Store, project_id: &str, workspace: &Workspac
     project.core_env = workspace.core_env.clone();
     project.connections = workspace.imported_connections.clone();
 
+    let mut draft = store.draft();
     let mut members = Vec::with_capacity(workspace.assets.len());
     for definition in &workspace.assets {
         let member = match project.member(&definition.id).cloned() {
-            Some(member) => update_member(store, project_id, member, definition)?,
+            Some(member) => update_member(store, &mut draft, member, definition)?,
             None => {
                 let asset = library_asset_from_definition(new_member_asset_id(project_id, &definition.id), definition);
-                let asset_id = store.write_asset_for(asset, project_id)?;
+                let asset_id = Store::stage_asset(&mut draft, asset);
                 member_from_definition(definition, asset_id)
             }
         };
         members.push(member);
     }
     project.members = members;
-    project.validate(&store.library)?;
-    store.save_project(&project)?;
-    store.projects.insert(project.id.clone(), project);
-    Ok(())
+    store.commit(draft, project)
 }
 
-fn update_member(store: &mut Store, project_id: &str, mut member: Member, definition: &AssetDefinition) -> Result<Member, String> {
+/// メンバー 1 つ分の編集を振り分ける。アセットの元の内容は、保存済みのライブラリ（不変）から取る。
+fn update_member(store: &Store, draft: &mut LibraryDraft, mut member: Member, definition: &AssetDefinition) -> Result<Member, String> {
     let asset = store.library.get(&member.asset_id).cloned().ok_or_else(|| format!("メンバー「{}」のアセットがライブラリにありません。", member.id))?;
     let variant = asset.variant(&member.variant_id).cloned().ok_or_else(|| format!("メンバー「{}」のバリエーションがありません。", member.id))?;
 
@@ -89,9 +91,8 @@ fn update_member(store: &mut Store, project_id: &str, mut member: Member, defini
             *slot = edited_variant.clone();
         }
     }
-    if json(&without_timestamp(&edited)) != json(&without_timestamp(&asset)) {
-        member.asset_id = store.write_asset_for(edited, project_id)?;
-    }
+    // 内容が変わっていれば新しい id に置かれ、元を参照するほかのメンバーは変わらない。
+    member.asset_id = Store::stage_asset(draft, edited);
     Ok(member)
 }
 
@@ -99,6 +100,7 @@ fn json<T: serde::Serialize>(value: &T) -> serde_json::Value {
     serde_json::to_value(value).unwrap_or_default()
 }
 
+#[cfg(test)]
 fn without_timestamp(asset: &crate::model::LibraryAsset) -> serde_json::Value {
     let mut value = json(asset);
     if let Some(object) = value.as_object_mut() {
@@ -199,6 +201,31 @@ mod tests {
         assert_eq!(json(&resolved(&store, "other")), other_before);
         assert_ne!(store.projects[&id].members[0].asset_id, store.projects["other"].members[0].asset_id);
         assert!(resolved(&store, &id).assets[0].command.args.contains(&"--edited".to_owned()));
+    }
+
+    /// 同じプロジェクトの 2 つのメンバーが同じアセットを使うとき、片方の編集はもう片方に
+    /// 効かず、もう片方の書き戻しで消えもしない。
+    #[test]
+    fn two_members_sharing_an_asset_in_one_project_stay_independent() {
+        let (mut store, id) = store_with_demo("twins");
+        // 2 つ目のメンバーを、1 つ目と同じアセットを参照させて足す（同じアセットを 2 回使う構成）。
+        let mut project = store.projects[&id].clone();
+        let mut twin = project.member("viz-foxglove").unwrap().clone();
+        twin.id = "viz-foxglove-2".to_owned();
+        twin.name = Some("Visualization (Foxglove, 2nd)".to_owned());
+        twin.enabled = false;
+        project.members.push(twin);
+        store.commit(store.draft(), project).unwrap();
+        let project = &store.projects[&id];
+        assert_eq!(project.member("viz-foxglove").unwrap().asset_id, project.member("viz-foxglove-2").unwrap().asset_id);
+
+        let mut workspace = resolved(&store, &id);
+        workspace.assets.iter_mut().find(|a| a.id == "viz-foxglove").unwrap().command.args.push("--first-only".to_owned());
+        apply_workspace(&mut store, &id, &workspace).unwrap();
+        let after = resolved(&store, &id);
+        assert!(after.assets.iter().find(|a| a.id == "viz-foxglove").unwrap().command.args.contains(&"--first-only".to_owned()));
+        assert!(!after.assets.iter().find(|a| a.id == "viz-foxglove-2").unwrap().command.args.contains(&"--first-only".to_owned()));
+        assert_eq!(json(&after), json(&workspace));
     }
 
     /// 足したアセットは新しいメンバーとアセットになり、消したものはメンバーから外れる（アセットは残る）。

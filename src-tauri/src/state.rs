@@ -153,20 +153,23 @@ impl AppState {
     pub fn select_project(&self, project_id: &str) -> Result<(), String> {
         let _gate = self.lock_gate();
         self.release_if_idle_locked();
-        if self.lock_run().is_some() {
+        if self.lock_run().is_some() || self.start_all_running.load(Ordering::Acquire) || self.stop_all_running.load(Ordering::Acquire) {
             return Err("実行中はプロジェクトを切り替えられません。すべて停止してから切り替えてください。".to_owned());
         }
-        {
-            let mut store = self.lock_store()?;
-            if !store.projects.contains_key(project_id) {
-                return Err("そのプロジェクトはありません。".to_owned());
-            }
-            if store.active_project_id() == project_id {
-                return Ok(());
-            }
-            store.app.active_project_id = Some(project_id.to_owned());
-            store.save_app()?;
+        let mut store = self.lock_store()?;
+        if !store.projects.contains_key(project_id) {
+            return Err("そのプロジェクトはありません。".to_owned());
         }
+        if store.active_project_id() == project_id {
+            return Ok(());
+        }
+        // 先に保存し、成功してから切り替えと履歴の消去をまとめて行う。保存に失敗したときに
+        // アクティブだけが変わり、前のプロジェクトの履歴が残るのを防ぐ。
+        let mut app = store.app.clone();
+        app.active_project_id = Some(project_id.to_owned());
+        store.write_app(&app)?;
+        store.app = app;
+        drop(store);
         self.processes.forget_finished();
         self.monitor.reset();
         Ok(())
@@ -190,7 +193,8 @@ fn has_live_processes(processes: &ProcessManager, workspace: &Workspace) -> bool
     processes
         .snapshots()
         .iter()
-        .any(|snapshot| owners.contains(&snapshot.owner_id.as_str()) && matches!(snapshot.status, ProcessStatus::Starting | ProcessStatus::Running | ProcessStatus::Stopping))
+        // 状態が分からないプロセスは、生きているものとして扱う（解放も切り替えもしない）。
+        .any(|snapshot| owners.contains(&snapshot.owner_id.as_str()) && matches!(snapshot.status, ProcessStatus::Starting | ProcessStatus::Running | ProcessStatus::Stopping | ProcessStatus::Unknown))
 }
 
 fn ensure_default_catalog(path: &PathBuf) {
@@ -304,6 +308,35 @@ mod tests {
         state.start_all_running.store(false, Ordering::Release);
         state.release_if_idle();
         assert!(state.running_project_id().is_none());
+    }
+
+    /// 一括起動・一括停止の最中は、実行コンテキストがなくても切り替えを拒否する。
+    #[test]
+    fn switching_is_refused_during_a_bulk_operation() {
+        let (state, _, other) = state("bulk-switch");
+        state.stop_all_running.store(true, Ordering::Release);
+        assert!(state.select_project(&other).is_err());
+        state.stop_all_running.store(false, Ordering::Release);
+        state.select_project(&other).unwrap();
+    }
+
+    /// 切り替えの保存に失敗したら、アクティブも履歴も変えない。
+    #[test]
+    fn a_failed_switch_changes_nothing() {
+        let (state, demo, other) = state("switch-fail");
+        start(&state, "rig-owner");
+        state.processes.stop_owner("rig-owner");
+        // app.json をディレクトリにして、置き換えを失敗させる。
+        let app = state.data_directory.join("app.json");
+        fs::remove_file(&app).unwrap();
+        fs::create_dir(&app).unwrap();
+        assert!(state.select_project(&other).is_err());
+        assert_eq!(state.lock_store().unwrap().active_project_id(), demo);
+        assert_eq!(state.processes.snapshots().len(), 1, "履歴は消さない");
+        fs::remove_dir(&app).unwrap();
+        state.select_project(&other).unwrap();
+        assert_eq!(state.lock_store().unwrap().active_project_id(), other);
+        assert!(state.processes.snapshots().is_empty());
     }
 
     /// 切り替えると、前のプロジェクトの終了済みプロセスの記録を消す。

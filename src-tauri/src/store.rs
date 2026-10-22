@@ -34,6 +34,22 @@ pub struct Store {
     pub app: AppConfig,
     /// 読み込みと移行で起きたこと。画面に出す。
     pub warnings: Vec<String>,
+    /// v1 の移行が途中で止まった。`app.json` を書くと次の起動で移行をやり直さなくなる
+    /// ので、この間は書かない。
+    pub migration_pending: bool,
+    /// この起動で移行した v1 のファイルと、そこから作ったプロジェクト。移行で消費した
+    /// ファイルを `--import` で指定されたときに、取り込み直さずにそのプロジェクトを選ぶ。
+    pub migrated_now: Option<(PathBuf, String)>,
+}
+
+/// ライブラリへの書き込みの下書き。プロジェクトと合わせて検証してから
+/// [`Store::commit`] でまとめて反映する。検証に落ちた変更が保存に残らないようにするため。
+pub struct LibraryDraft {
+    pub library: Library,
+    writes: Vec<LibraryAsset>,
+    /// 内容を変えたため新しい id に置き換えたアセット。反映後にどこからも参照されて
+    /// いなければ片付ける。
+    superseded: Vec<String>,
 }
 
 /// v1 を取り込んだ結果。
@@ -47,7 +63,7 @@ pub struct ImportOutcome {
 impl Store {
     /// 保存場所を開く。`app.json` がなく v1 の `workspace.json` があれば、先に移行する。
     pub fn open(root: &Path) -> Self {
-        let mut store = Self { root: root.to_path_buf(), library: Library::new(), projects: BTreeMap::new(), app: AppConfig::new(), warnings: Vec::new() };
+        let mut store = Self { root: root.to_path_buf(), library: Library::new(), projects: BTreeMap::new(), app: AppConfig::new(), warnings: Vec::new(), migration_pending: false, migrated_now: None };
         for directory in [store.assets_dir(), store.projects_dir()] {
             if let Err(error) = fs::create_dir_all(&directory) {
                 store.warnings.push(format!("{} を作れません: {error}", directory.display()));
@@ -56,7 +72,7 @@ impl Store {
         let app_path = store.app_path();
         let v1_path = root.join(V1_WORKSPACE_FILE);
         if !app_path.exists() && v1_path.is_file() {
-            store.migrate_v1(&v1_path);
+            store.migration_pending = !store.migrate_v1(&v1_path);
         }
         store.load();
         if app_path.exists() && v1_path.is_file() {
@@ -114,8 +130,11 @@ impl Store {
     fn ensure_active_project(&mut self) {
         if self.projects.is_empty() {
             let project = Project::empty(Uuid::new_v4().to_string(), "新しいプロジェクト".to_owned());
-            if let Err(error) = self.save_project(&project) {
-                self.warnings.push(error);
+            // 移行が途中なら書かない。次の起動で移行をやり直すとき、余分な空のプロジェクトが残るため。
+            if !self.migration_pending {
+                if let Err(error) = self.save_project(&project) {
+                    self.warnings.push(error);
+                }
             }
             self.projects.insert(project.id.clone(), project);
         }
@@ -124,8 +143,10 @@ impl Store {
             let mut candidates: Vec<&Project> = self.projects.values().collect();
             candidates.sort_by(|a, b| b.last_opened_at.cmp(&a.last_opened_at).then_with(|| a.name.cmp(&b.name)));
             self.app.active_project_id = candidates.first().map(|project| project.id.clone());
-            if let Err(error) = self.save_app() {
-                self.warnings.push(error);
+            if !self.migration_pending {
+                if let Err(error) = self.save_app() {
+                    self.warnings.push(error);
+                }
             }
         }
     }
@@ -139,19 +160,22 @@ impl Store {
     /// ライブラリ → プロジェクト → v1 の退避 → `app.json` の順に行う。id は v1 の内容から
     /// 決まるので、途中で落ちて次に起動したときにやり直しても同じファイルを書くだけになる。
     /// `app.json` は最後に書くので、それがある時点で移行は終わっている。
-    fn migrate_v1(&mut self, v1_path: &Path) {
+    ///
+    /// 移行が終わったか、移行するものがなかった（読めない v1 を隔離した）ときに true。
+    /// 途中で止まったときは false で、呼び出し側は `app.json` を書かない。
+    fn migrate_v1(&mut self, v1_path: &Path) -> bool {
         let bytes = match fs::read(v1_path) {
             Ok(bytes) => bytes,
             Err(error) => {
-                self.warnings.push(format!("{} を読めません: {error}", v1_path.display()));
-                return;
+                self.warnings.push(format!("{} を読めません（次の起動で移行をやり直します）: {error}", v1_path.display()));
+                return false;
             }
         };
         let workspace = match serde_json::from_slice::<Workspace>(&bytes).map_err(|error| error.to_string()).and_then(|workspace| workspace.validate().map(|()| workspace)) {
             Ok(workspace) => workspace,
             Err(reason) => {
                 self.quarantine(v1_path, &format!("v1 のワークスペースとして読めないため移行しませんでした: {reason}"));
-                return;
+                return true;
             }
         };
         let (assets, project) = split_v1_workspace(&workspace);
@@ -161,12 +185,21 @@ impl Store {
             }
             self.save_project(&project)?;
             self.backup_v1(v1_path)?;
-            self.app = AppConfig { schema_version: STORE_SCHEMA_VERSION, active_project_id: Some(project.id.clone()), migrated_from_v1: Some(MigrationRecord { source_sha256: hex::encode(Sha256::digest(&bytes)), at: Utc::now() }) };
-            self.save_app()
+            let app = AppConfig { schema_version: STORE_SCHEMA_VERSION, active_project_id: Some(project.id.clone()), migrated_from_v1: Some(MigrationRecord { source_sha256: hex::encode(Sha256::digest(&bytes)), at: Utc::now() }) };
+            self.write_app(&app)?;
+            self.app = app;
+            Ok::<(), String>(())
         })();
         match result {
-            Ok(()) => self.warnings.push(format!("v1 のワークスペース「{}」を、プロジェクトとライブラリに移行しました。", workspace.name)),
-            Err(error) => self.warnings.push(format!("v1 の移行が途中で止まりました（次の起動でやり直します）: {error}")),
+            Ok(()) => {
+                self.warnings.push(format!("v1 のワークスペース「{}」を、プロジェクトとライブラリに移行しました。", workspace.name));
+                self.migrated_now = Some((v1_path.to_path_buf(), project.id.clone()));
+                true
+            }
+            Err(error) => {
+                self.warnings.push(format!("v1 の移行が途中で止まりました。アプリを再起動すると移行をやり直します。それまで設定の保存の一部はできません: {error}"));
+                false
+            }
         }
     }
 
@@ -195,34 +228,74 @@ impl Store {
                 project.origin = None;
             }
         }
-        for (asset, member) in assets.into_iter().zip(project.members.iter_mut()) {
-            member.asset_id = self.write_asset_for(asset, &project.id)?;
+        // 置き換えるときは、同じメンバーが今使っているアセットを引き継ぐ。内容が同じなら
+        // 書かないので、取り込み直すたびにライブラリが増えることはない。
+        let previous: BTreeMap<String, String> = self.projects.get(&project.id).map(|old| old.members.iter().map(|member| (member.id.clone(), member.asset_id.clone())).collect()).unwrap_or_default();
+        let mut draft = self.draft();
+        for (mut asset, member) in assets.into_iter().zip(project.members.iter_mut()) {
+            if let Some(id) = previous.get(&member.id) {
+                asset.id = id.clone();
+            }
+            member.asset_id = Self::stage_asset(&mut draft, asset);
         }
-        project.validate(&self.library)?;
-        self.save_project(&project)?;
-        self.projects.insert(project.id.clone(), project.clone());
+        self.commit(draft, project.clone())?;
         if consume {
             self.backup_v1(path)?;
         }
         Ok(ImportOutcome { project_id: project.id, replaced })
     }
 
-    /// ライブラリにアセットを書く（コピーオンライト）。
+    pub fn draft(&self) -> LibraryDraft {
+        LibraryDraft { library: self.library.clone(), writes: Vec::new(), superseded: Vec::new() }
+    }
+
+    /// アセットを下書きに置き、使う id を返す（コピーオンライト）。
     ///
-    /// 同じ id のアセットを `project_id` 以外のプロジェクトも使っていれば、新しい id で
-    /// 複製して書く。ほかのプロジェクトが黙って変わらないようにするため。返り値は、
-    /// 書いたアセットの id。
-    pub fn write_asset_for(&mut self, mut asset: LibraryAsset, project_id: &str) -> Result<String, String> {
-        let shared = self.projects.values().any(|project| project.id != project_id && project.members.iter().any(|member| member.asset_id == asset.id));
-        if shared {
+    /// 同じ id で同じ内容のものがあれば、そのまま使う。内容が違えば、元を書き換えずに
+    /// 新しい id で置く。元を参照しているほかのメンバー（同じプロジェクトでも、ほかの
+    /// プロジェクトでも）は、元のまま変わらない。
+    pub fn stage_asset(draft: &mut LibraryDraft, mut asset: LibraryAsset) -> String {
+        if let Some(existing) = draft.library.get(&asset.id) {
+            if same_content(existing, &asset) {
+                return asset.id;
+            }
+            draft.superseded.push(asset.id.clone());
             asset.id = Uuid::new_v4().to_string();
         }
         asset.updated_at = Utc::now();
-        asset.validate()?;
-        self.save_asset(&asset)?;
         let id = asset.id.clone();
-        self.library.insert(id.clone(), asset);
-        Ok(id)
+        draft.library.insert(id.clone(), asset.clone());
+        draft.writes.push(asset);
+        id
+    }
+
+    /// 下書きとプロジェクトを検証してから保存し、成功したらメモリ上の状態も差し替える。
+    ///
+    /// 書く順は、新しいアセット → プロジェクト。変わったアセットは新しい id なので、
+    /// プロジェクトを保存する前に落ちても、既存の参照先は書き換わらない（残るのは
+    /// どこからも参照されないアセットだけ）。最後に、置き換えられて参照されなくなった
+    /// アセットを片付ける。
+    pub fn commit(&mut self, draft: LibraryDraft, project: Project) -> Result<(), String> {
+        for asset in &draft.writes {
+            asset.validate()?;
+        }
+        project.validate(&draft.library)?;
+        for asset in &draft.writes {
+            self.save_asset(asset)?;
+        }
+        self.save_project(&project)?;
+        self.library = draft.library;
+        self.projects.insert(project.id.clone(), project);
+        for id in draft.superseded {
+            let referenced = self.projects.values().any(|candidate| candidate.members.iter().any(|member| member.asset_id == id));
+            if !referenced {
+                self.library.remove(&id);
+                if let Ok(stem) = file_stem(&id) {
+                    let _ = fs::remove_file(self.assets_dir().join(format!("{stem}.json")));
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn save_asset(&self, asset: &LibraryAsset) -> Result<(), String> {
@@ -234,7 +307,15 @@ impl Store {
     }
 
     pub fn save_app(&self) -> Result<(), String> {
-        write_json(&self.app_path(), &self.app)
+        self.write_app(&self.app)
+    }
+
+    /// `app` を `app.json` に書く。メモリ上の値は変えない。呼び出し側は、成功してから差し替える。
+    pub fn write_app(&self, app: &AppConfig) -> Result<(), String> {
+        if self.migration_pending {
+            return Err("v1 の移行が途中のため、この設定は保存できません。アプリを再起動して移行をやり直してください。".to_owned());
+        }
+        write_json(&self.app_path(), app)
     }
 
     fn backup_v1(&self, path: &Path) -> Result<(), String> {
@@ -274,6 +355,18 @@ impl Store {
             Err(error) => self.warnings.push(format!("{} は使えません（隔離にも失敗: {error}）: {reason}", path.display())),
         }
     }
+}
+
+/// 更新時刻を除いて、同じ内容か。
+fn same_content(a: &LibraryAsset, b: &LibraryAsset) -> bool {
+    let strip = |asset: &LibraryAsset| {
+        let mut value = serde_json::to_value(asset).unwrap_or_default();
+        if let Some(object) = value.as_object_mut() {
+            object.remove("updated_at");
+        }
+        value
+    };
+    strip(a) == strip(b)
 }
 
 fn json_files(directory: &Path) -> Vec<PathBuf> {
@@ -451,38 +544,96 @@ mod tests {
         assert_eq!(store.library.len(), 6);
         assert_eq!(store.library[&store.projects[&outcome.project_id].members[0].asset_id].name, "Gimbal rig (owner, v2)");
 
+        // 取り込み直しても、同じ内容ならアセットは増えない。
+        let assets = store.library.len();
+        store.import_v1(&source, true, false).unwrap();
+        assert_eq!(store.library.len(), assets);
+
         // 置き換えでなければ、複製として足す。
         let copy = store.import_v1(&source, false, false).unwrap();
         assert_ne!(copy.project_id, outcome.project_id);
         assert!(store.projects[&copy.project_id].origin.is_none());
     }
 
-    /// ほかのプロジェクトも使っているアセットを書き換えると、複製して書き、ほかは変えない。
+    /// 内容を変えたアセットは新しい id に置き、元を参照するほかのメンバーは変えない。
+    /// 検証に落ちれば何も保存しない。参照されなくなった元は片付ける。
     #[test]
-    fn writing_a_shared_asset_copies_it() {
+    fn staged_changes_copy_and_commit_only_after_validation() {
         let dir = scratch("cow");
-        let source = scratch("cow-src").join("workspace.v1.json");
-        fs::write(&source, serde_json::to_vec(&v1_demo()).unwrap()).unwrap();
+        write_v1(&dir, &v1_demo());
         let mut store = Store::open(&dir);
-        let a = store.import_v1(&source, true, false).unwrap().project_id;
-        // 別のプロジェクトに同じアセットを参照させる。
-        let mut b = store.projects[&a].clone();
-        b.id = "project-b".to_owned();
-        b.origin = None;
-        store.save_project(&b).unwrap();
-        store.projects.insert(b.id.clone(), b);
+        let id = store.active_project_id().to_owned();
+        let original = store.projects[&id].members[0].asset_id.clone();
 
-        let shared_id = store.projects[&a].members[0].asset_id.clone();
-        let mut edited = store.library[&shared_id].clone();
-        edited.name = "edited in A".to_owned();
-        let written = store.write_asset_for(edited.clone(), &a).unwrap();
-        assert_ne!(written, shared_id);
-        assert_eq!(store.library[&shared_id].name, "Gimbal rig (owner)");
-        assert_eq!(store.library[&written].name, "edited in A");
+        // 同じプロジェクトの 2 つ目のメンバーが同じアセットを使う。
+        let mut project = store.projects[&id].clone();
+        let mut twin = project.members[0].clone();
+        twin.id = "twin".to_owned();
+        project.members.push(twin);
+        store.commit(store.draft(), project.clone()).unwrap();
 
-        // 使っているのが自分だけなら、そのまま書き換える。
-        let only_b = store.write_asset_for(store.library[&written].clone(), "project-b").unwrap();
-        assert_eq!(only_b, written);
+        // 1 つ目だけを変える。
+        let mut draft = store.draft();
+        let mut edited = store.library[&original].clone();
+        edited.name = "edited".to_owned();
+        let edited_id = Store::stage_asset(&mut draft, edited.clone());
+        assert_ne!(edited_id, original);
+        project.members[0].asset_id = edited_id.clone();
+        store.commit(draft, project.clone()).unwrap();
+        assert_eq!(store.library[&original].name, "Gimbal rig (owner)", "twin が参照する元は変えない");
+        assert_eq!(store.library[&edited_id].name, "edited");
+
+        // 同じ内容なら id は変わらず、何も書かない。
+        let mut draft = store.draft();
+        assert_eq!(Store::stage_asset(&mut draft, store.library[&edited_id].clone()), edited_id);
+        assert!(draft.writes.is_empty());
+
+        // 検証に落ちる変更は、アセットも含めて何も残さない。
+        let files_before = json_files(&dir.join("library").join("assets"));
+        let mut draft = store.draft();
+        let mut broken = store.library[&edited_id].clone();
+        broken.name = "should not persist".to_owned();
+        let broken_id = Store::stage_asset(&mut draft, broken);
+        let mut invalid = project.clone();
+        invalid.members[0].asset_id = broken_id;
+        invalid.members[1].id = invalid.members[0].id.clone();
+        assert!(store.commit(draft, invalid).is_err());
+        assert_eq!(json_files(&dir.join("library").join("assets")), files_before);
+        assert!(store.library.values().all(|asset| asset.name != "should not persist"));
+
+        // twin を外してから元を置き換えると、参照されなくなった元は片付く。
+        project.members.retain(|member| member.id != "twin");
+        store.commit(store.draft(), project.clone()).unwrap();
+        let mut draft = store.draft();
+        let mut again = store.library[&original].clone();
+        again.name = "replaced".to_owned();
+        let mut with_original = project.clone();
+        with_original.members[0].asset_id = original.clone();
+        store.commit(store.draft(), with_original.clone()).unwrap();
+        with_original.members[0].asset_id = Store::stage_asset(&mut draft, again);
+        store.commit(draft, with_original).unwrap();
+        assert!(!store.library.contains_key(&original));
+        assert!(!dir.join("library").join("assets").join(format!("{original}.json")).exists());
+    }
+
+    /// 移行が途中で止まったら app.json を書かず、次に開くとやり直す。
+    #[test]
+    fn a_failed_migration_is_retried_on_the_next_open() {
+        let dir = scratch("migrate-retry");
+        write_v1(&dir, &v1_demo());
+        // projects を同名のファイルにして、プロジェクトの保存を失敗させる。
+        fs::write(dir.join("projects"), b"not a directory").unwrap();
+        let store = Store::open(&dir);
+        assert!(store.migration_pending);
+        assert!(!dir.join("app.json").exists());
+        assert!(dir.join(V1_WORKSPACE_FILE).exists(), "退避前に止まったので v1 は残る");
+        assert!(store.write_app(&store.app).is_err());
+
+        fs::remove_file(dir.join("projects")).unwrap();
+        let reopened = Store::open(&dir);
+        assert!(!reopened.migration_pending);
+        assert!(dir.join("app.json").exists());
+        assert_eq!(resolved_active(&reopened), serde_json::to_value(v1_demo()).unwrap());
     }
 
     /// 区切り文字を含む id は、別の場所に書かないよう拒否する。

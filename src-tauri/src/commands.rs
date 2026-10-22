@@ -152,10 +152,19 @@ pub fn import_v1(state: &AppState, path: &Path, replace: bool) -> Result<String,
     }
     // 保存場所に置かれた v1 は、取り込んだら退避する。残すと毎回警告が出る。
     let consume = path == state.data_directory.join(crate::store::V1_WORKSPACE_FILE);
-    let outcome = state.lock_store()?.import_v1(path, replace, consume)?;
+    let project_id = {
+        let mut store = state.lock_store()?;
+        // この起動の移行で、同じファイルを既に取り込んで退避している。取り込み直さず、
+        // 移行で作ったプロジェクトを使う。
+        let migrated = store.migrated_now.as_ref().filter(|(migrated, _)| migrated == path && !path.exists()).map(|(_, id)| id.clone());
+        match migrated {
+            Some(id) => id,
+            None => store.import_v1(path, replace, consume)?.project_id,
+        }
+    };
     drop(gate);
-    state.select_project(&outcome.project_id)?;
-    Ok(outcome.project_id)
+    state.select_project(&project_id)?;
+    Ok(project_id)
 }
 
 #[tauri::command]
@@ -606,7 +615,7 @@ fn running_owner_names(state: &State<'_, AppState>, workspace: &Workspace) -> Ve
         .snapshots()
         .into_iter()
         .filter(|snapshot| owners.contains(snapshot.owner_id.as_str()))
-        .filter(|snapshot| matches!(snapshot.status, ProcessStatus::Starting | ProcessStatus::Running | ProcessStatus::Stopping))
+        .filter(|snapshot| matches!(snapshot.status, ProcessStatus::Starting | ProcessStatus::Running | ProcessStatus::Stopping | ProcessStatus::Unknown))
         .map(|snapshot| snapshot.owner_name)
         .collect();
     names.into_iter().collect()
@@ -736,12 +745,24 @@ pub fn stop_all(state: State<'_, AppState>) -> Result<Vec<crate::types::ProcessS
 }
 
 fn stop_all_inner(state: State<'_, AppState>) -> Result<Vec<crate::types::ProcessSnapshot>, String> {
-    {
-        // 単独起動の途中なら、その登録が終わってからフラグを立てる。下の停止で
-        // そのプロセスも止める対象に入る。
-        let _gate = state.lifecycle_gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.stop_all_running.store(true, Ordering::Release);
-    }
+    // 単独起動の途中なら、その登録が終わってからフラグを立てる。下の停止で
+    // そのプロセスも止める対象に入る。止める対象（実行中の構成）も、ゲートを持ったまま
+    // 決めて固定する。重なった一括停止は拒否する。先に終わった方がフラグを下ろすと、
+    // 実行中の構成が解放されて別のプロジェクトが起動でき、遅れた方がその同じ id の
+    // プロセスを止めてしまうため。
+    let workspace = {
+        let _gate = state.lock_gate();
+        if state.stop_all_running.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            return Err("一括停止は既に実行中です。".to_owned());
+        }
+        match state.begin_run_locked() {
+            Ok(workspace) => workspace,
+            Err(error) => {
+                state.stop_all_running.store(false, Ordering::Release);
+                return Err(error);
+            }
+        }
+    };
     let _guard = StopAllGuard(&state);
     // 進行中の一括起動を止めてから停止する。止めないと、停止が通り過ぎた後で
     // 起動側が残りのアセットを起動し、停止したはずのものが動き続ける。
@@ -754,7 +775,6 @@ fn stop_all_inner(state: State<'_, AppState>) -> Result<Vec<crate::types::Proces
     if state.start_all_running.load(Ordering::Acquire) {
         failures.push(format!("一括起動が {} 秒以内に中断しませんでした。", START_ALL_CANCEL_WAIT.as_secs()));
     }
-    let workspace = state.run_workspace()?;
     if workspace.core_release.is_some() {
         // stop だけで登録アセットを kill すると、conductor を持つアセットが Core の
         // 状態遷移の途中で落ち、以後の hako-cmd が応答しなくなる（実測）。
@@ -861,7 +881,7 @@ fn harvest_monitor_logs(state: &AppState, workspace: &Workspace, processes: &[cr
         if !matches!(asset.role, crate::types::AssetRole::Bridge | crate::types::AssetRole::Monitor) {
             continue;
         }
-        for connection in monitor_targets(asset, &workspace.imported_connections) {
+        for connection in monitor_targets(asset, &workspace.assets, &workspace.imported_connections) {
             for (index, line) in process.stdout_tail.iter().enumerate() {
                 state.monitor.record_bridge_process_line(&connection.id, &process.id, "stdout", index, line);
             }
@@ -879,15 +899,19 @@ fn harvest_monitor_logs(state: &AppState, workspace: &Workspace, processes: &[cr
 /// Launcher JSONのパスしか入れず`endpoint_config`にはendpoint/bridge JSONのパスしか
 /// 入れないため恒常的に成立しなかったので落とした。Bridge名の一致は、解決結果を
 /// 持たない古いworkspace.jsonのための後方互換として残す。
+/// `asset` のログを流し込む接続。解決済みの所有者が一致するもの。解決結果を持たない古い
+/// 接続には Bridge 名の一致も使うが、同じ名前のアセットが複数あればどちらとも決めない。
 fn monitor_targets<'a>(
     asset: &AssetDefinition,
+    assets: &[AssetDefinition],
     connections: &'a [crate::types::ConnectionDefinition],
 ) -> Vec<&'a crate::types::ConnectionDefinition> {
+    let unique_name = assets.iter().filter(|candidate| candidate.name == asset.name).count() == 1;
     connections
         .iter()
         .filter(|connection| {
             connection.owner_asset_id.as_deref() == Some(asset.id.as_str())
-                || connection.details.get("bridge").map(|bridge| bridge == &asset.name).unwrap_or(false)
+                || (unique_name && connection.details.get("bridge").map(|bridge| bridge == &asset.name).unwrap_or(false))
         })
         .collect()
 }
@@ -1063,7 +1087,7 @@ mod tests {
         let mut mine = connection("mine");
         mine.owner_asset_id = Some(owner.id.clone());
         let connections = [mine, connection("others")];
-        let matched = monitor_targets(&owner, &connections);
+        let matched = monitor_targets(&owner, std::slice::from_ref(&owner), &connections);
         assert_eq!(matched.len(), 1);
         assert_eq!(matched[0].id, "mine");
     }
@@ -1078,7 +1102,7 @@ mod tests {
         candidate.endpoint_config = Some("/recipe/endpoint_a.json".to_owned());
         let connections = [candidate];
         assert!(
-            monitor_targets(&owner, &connections).is_empty(),
+            monitor_targets(&owner, std::slice::from_ref(&owner), &connections).is_empty(),
             "解決を経ずに設定ファイルの一致だけで帰属させています。"
         );
     }
@@ -1089,7 +1113,20 @@ mod tests {
         let owner = asset("pdu-bridge", vec![]);
         let mut legacy = connection("legacy");
         legacy.details.insert("bridge".to_owned(), "pdu-bridge".to_owned());
-        assert_eq!(monitor_targets(&owner, &[legacy]).len(), 1);
+        assert_eq!(monitor_targets(&owner, std::slice::from_ref(&owner), &[legacy.clone()]).len(), 1);
+    }
+
+    /// 同じ名前のアセットが 2 つあると、Bridge 名ではどちらにも割り当てない。
+    #[test]
+    fn monitor_targets_skip_the_bridge_name_when_ambiguous() {
+        let first = asset("pdu-bridge", vec![]);
+        let mut second = asset("pdu-bridge", vec![]);
+        second.id = "second-bridge".to_owned();
+        let mut legacy = connection("legacy");
+        legacy.details.insert("bridge".to_owned(), "pdu-bridge".to_owned());
+        let assets = [first.clone(), second.clone()];
+        assert!(monitor_targets(&first, &assets, std::slice::from_ref(&legacy)).is_empty());
+        assert!(monitor_targets(&second, &assets, std::slice::from_ref(&legacy)).is_empty());
     }
 
     fn flock_with(name: &str, counter: i32) -> std::path::PathBuf {

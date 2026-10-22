@@ -77,6 +77,10 @@ export default function App() {
     const selection = await open({ directory: false, multiple: false, title: "v1 の workspace.json を選択", filters: [{ name: "JSON", extensions: ["json"] }] });
     if (typeof selection !== "string") return;
     const replace = window.confirm("同じ出所から取り込んだプロジェクトがあれば、置き換えますか？\n［キャンセル］を選ぶと、新しいプロジェクトとして取り込みます。");
+    setSelectedAssetId(null);
+    setDraftAsset(null);
+    setSelectedConnectionId(null);
+    setPreview(null);
     await run(() => api.importV1Workspace(selection, replace), "v1 のワークスペースを取り込みました。");
   }
 
@@ -84,6 +88,7 @@ export default function App() {
     setSelectedAssetId(null);
     setDraftAsset(null);
     setSelectedConnectionId(null);
+    setPreview(null);
     void run(() => api.selectProject(projectId), "プロジェクトを切り替えました。");
   }
 
@@ -93,6 +98,7 @@ export default function App() {
     setSelectedAssetId(null);
     setDraftAsset(null);
     setSelectedConnectionId(null);
+    setPreview(null);
     void run(() => api.createProject(name), "プロジェクトを作りました。");
   }
 
@@ -157,10 +163,10 @@ export default function App() {
         {snapshot.store_warnings.length > 0 && <div className="banner error"><div>{snapshot.store_warnings.map((warning, index) => <p key={index}>{warning}</p>)}</div><button onClick={() => void run(() => api.clearStoreWarnings(), "")}>閉じる</button></div>}
         {(notice || error) && <div className={error ? "banner error" : "banner"}><span>{error || notice}</span><button onClick={() => { setError(""); setNotice(""); }}>閉じる</button></div>}
         {tab === "dashboard" && <Dashboard snapshot={snapshot} activeCore={activeCore?.status ?? "unknown"} onStartCore={() => void run(api.startCore, "Coreコントローラーを起動しました。")} onStopCore={() => void run(api.stopCore, "Coreコントローラーを停止しました。")} onLifecycle={(command) => void run(async () => { const result = await api.runLifecycle(command); if (result.status === "failed") throw new Error(result.stderr || "hako-cmdが失敗しました。"); }, `hako-cmd ${command} を実行しました。`)} onAssetClick={(id) => { setSelectedAssetId(id); setTab("assets"); }} onConnectionClick={(id) => { setSelectedConnectionId(id); setTab("topology"); }} />}
-        {tab === "assets" && <AssetsPage workspace={workspace} processes={snapshot.processes} selected={selectedAsset} draft={draftAsset} busy={busy} onSelect={selectAsset} onSave={upsertAsset} onDelete={removeAsset} onStart={(id) => void run(() => api.startAsset(id), "アセットを起動しました。")} onStop={(id) => void run(() => api.stopAsset(id), "アセットを停止しました。")} onCreate={createDraftAsset} />}
+        {tab === "assets" && <AssetsPage key={workspace.id} workspace={workspace} processes={snapshot.processes} selected={selectedAsset} draft={draftAsset} busy={busy} onSelect={selectAsset} onSave={upsertAsset} onDelete={removeAsset} onStart={(id) => void run(() => api.startAsset(id), "アセットを起動しました。")} onStop={(id) => void run(() => api.stopAsset(id), "アセットを停止しました。")} onCreate={createDraftAsset} />}
         {tab === "topology" && <TopologyPage snapshot={snapshot} selected={selectedConnection} onSelect={setSelectedConnectionId} onHeartbeat={(id) => void run(() => api.recordHeartbeat(id, "ユーザー操作による確認イベント"), "通信確認イベントを記録しました。")} />}
-        {tab === "core" && <CorePage workspace={workspace} catalog={catalog} activeCore={activeCore?.status ?? "unknown"} busy={busy} onSaveWorkspace={(next) => void run(() => api.saveWorkspace(next), "Core設定を保存しました。")} onInstall={(version) => void run(() => api.installCore(version), "Coreを検証して導入しました。")} onStart={() => void run(api.startCore, "Coreコントローラーを起動しました。")} onStop={() => void run(api.stopCore, "Coreコントローラーを停止しました。")} />}
-        {tab === "workspace" && <WorkspacePage workspace={workspace} preview={preview} onChoose={() => void chooseDirectory()} onImportV1={() => void importV1()} onApply={() => preview && void run(() => api.applyPreview(preview), "インポート結果をワークスペースへ適用しました。")} onSave={(next) => void run(() => api.saveWorkspace(next), "ワークスペースを保存しました。")} />}
+        {tab === "core" && <CorePage key={workspace.id} workspace={workspace} catalog={catalog} activeCore={activeCore?.status ?? "unknown"} busy={busy} onSaveWorkspace={(next) => void run(() => api.saveWorkspace(next), "Core設定を保存しました。")} onInstall={(version) => void run(() => api.installCore(version), "Coreを検証して導入しました。")} onStart={() => void run(api.startCore, "Coreコントローラーを起動しました。")} onStop={() => void run(api.stopCore, "Coreコントローラーを停止しました。")} />}
+        {tab === "workspace" && <WorkspacePage key={workspace.id} workspace={workspace} preview={preview} onChoose={() => void chooseDirectory()} onImportV1={() => void importV1()} onApply={() => preview && void run(() => api.applyPreview(preview), "インポート結果をワークスペースへ適用しました。")} onSave={(next) => void run(() => api.saveWorkspace(next), "ワークスペースを保存しました。")} />}
       </main>
     </div>
   );
