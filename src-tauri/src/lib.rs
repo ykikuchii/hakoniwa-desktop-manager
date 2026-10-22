@@ -1,8 +1,10 @@
 mod commands;
+mod compat;
 mod core;
 mod importer;
 mod linking;
 mod monitor;
+mod ports;
 mod process;
 mod state;
 mod types;
