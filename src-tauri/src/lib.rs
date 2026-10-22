@@ -3,9 +3,11 @@ mod compat;
 mod core;
 mod importer;
 mod linking;
+mod model;
 mod monitor;
 mod ports;
 mod process;
+mod resolve;
 mod state;
 mod types;
 
