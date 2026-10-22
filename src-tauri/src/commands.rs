@@ -697,10 +697,8 @@ fn start_all_inner(state: State<'_, AppState>) -> Result<Vec<crate::types::Proce
     // 接続チェックの Error と、承認した後に変わったメンバーがあれば起動しない。実行中の
     // プロジェクトは変更できないので、ここで見た内容のまま起動する。
     let reasons = {
-        let project_id = state.running_project_id().unwrap_or_default();
-        let store = state.lock_store()?;
-        let project = store.projects.get(&project_id).ok_or_else(|| "実行するプロジェクトがありません。".to_owned())?;
-        crate::check::check_project(project, &store.library)?.blocking_reasons()
+        let (project, library) = check_snapshot(&state, state.running_project_id())?;
+        crate::check::check_project(&project, &library)?.blocking_reasons()
     };
     if !reasons.is_empty() {
         return Err(format!("接続チェックで問題があるため一括起動しません。\n{}", reasons.join("\n")));
@@ -849,35 +847,54 @@ pub fn apply_import_preview(state: State<'_, AppState>, preview: ImportPreview) 
     let mut store = state.lock_store()?;
     crate::edit::apply_workspace(&mut store, &project_id, &workspace)?;
     // 取り込みは利用者が構成を明示的に入れる操作なので、今の内容で承認する。
-    store.accept(&project_id, None)?;
+    store.accept(&project_id)?;
     drop(store);
     state.active_workspace()
 }
 
-/// アクティブなプロジェクトの接続チェック。実行中なら、実行中のプロジェクトを見る。
-#[tauri::command]
-pub fn check_project(state: State<'_, AppState>) -> Result<crate::check::ProjectCheck, String> {
-    let project_id = state.running_project_id().unwrap_or_else(|| state.lock_store().map(|store| store.active_project_id().to_owned()).unwrap_or_default());
+/// 接続チェック用に、プロジェクトとライブラリを複製する。ファイルはロックの外で読むため。
+/// `project_id` が `None` ならアクティブなプロジェクト。
+fn check_snapshot(state: &AppState, project_id: Option<String>) -> Result<(crate::model::Project, crate::model::Library), String> {
     let store = state.lock_store()?;
-    let project = store.projects.get(&project_id).ok_or_else(|| "プロジェクトがありません。".to_owned())?;
-    crate::check::check_project(project, &store.library)
+    let id = project_id.unwrap_or_else(|| store.active_project_id().to_owned());
+    let project = store.projects.get(&id).cloned().ok_or_else(|| "プロジェクトがありません。".to_owned())?;
+    let library = project.members.iter().filter_map(|member| store.library.get(&member.asset_id).map(|asset| (asset.id.clone(), asset.clone()))).collect();
+    Ok((project, library))
 }
 
-/// アクティブなプロジェクトのメンバーを、今の内容で承認する。実行中なら拒否する。
-#[tauri::command]
-pub fn accept_member_changes(state: State<'_, AppState>, member_ids: Vec<String>) -> Result<crate::check::ProjectCheck, String> {
-    let project_id = state.lock_store()?.active_project_id().to_owned();
+/// アクティブなプロジェクトの接続チェック。実行中なら、実行中のプロジェクトを見る。
+// ファイルを読むので、UI を止めないよう async にする。
+#[tauri::command(async)]
+pub fn check_project(state: State<'_, AppState>) -> Result<crate::check::ProjectCheck, String> {
+    let (project, library) = check_snapshot(&state, state.running_project_id())?;
+    crate::check::check_project(&project, &library)
+}
+
+/// 画面が表示していた接続チェックのとおりに、メンバーを承認する。表示したプロジェクトが
+/// アクティブでないか、表示した後に内容が変わっていれば拒否する。実行中も拒否する。
+#[tauri::command(async)]
+pub fn accept_member_changes(state: State<'_, AppState>, project_id: String, revisions: BTreeMap<String, String>) -> Result<crate::check::ProjectCheck, String> {
+    if state.lock_store()?.active_project_id() != project_id {
+        return Err("表示中のプロジェクトが切り替わっています。接続チェックを見直してから承認してください。".to_owned());
+    }
     let _gate = state.ensure_mutable(&project_id)?;
     let mut store = state.lock_store()?;
-    store.accept(&project_id, Some(&member_ids))?;
-    crate::check::check_project(&store.projects[&project_id], &store.library)
+    if store.active_project_id() != project_id {
+        return Err("表示中のプロジェクトが切り替わっています。接続チェックを見直してから承認してください。".to_owned());
+    }
+    store.accept_shown(&project_id, &revisions)?;
+    drop(store);
+    let (project, library) = check_snapshot(&state, Some(project_id))?;
+    crate::check::check_project(&project, &library)
 }
 
 /// ライブラリのアセットをメンバーとして足したら、接続チェックがどうなるかを返す。保存しない。
 #[tauri::command]
 pub fn preview_add_member(state: State<'_, AppState>, asset_id: String, variant_id: String, member_id: String) -> Result<crate::check::ProjectCheck, String> {
-    let store = state.lock_store()?;
-    let project = store.projects.get(store.active_project_id()).ok_or_else(|| "アクティブなプロジェクトがありません。".to_owned())?;
+    let (project, mut library) = check_snapshot(&state, None)?;
+    if let Some(asset) = state.lock_store()?.library.get(&asset_id) {
+        library.insert(asset.id.clone(), asset.clone());
+    }
     let member = crate::model::Member {
         id: member_id,
         asset_id,
@@ -891,7 +908,7 @@ pub fn preview_add_member(state: State<'_, AppState>, asset_id: String, variant_
         env_overrides: Default::default(),
         accepted: None,
     };
-    crate::check::preview_add(project, &store.library, member)
+    crate::check::preview_add(&project, &library, member)
 }
 
 #[tauri::command]

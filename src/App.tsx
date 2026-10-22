@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { api, newAsset } from "./api";
 import type { AssetDefinition, ConnectionSnapshot, CoreCatalog, ImportPreview, ProjectCheck, Workspace, WorkspaceSnapshot } from "./types";
@@ -32,6 +32,9 @@ export default function App() {
   const [preview, setPreview] = useState<ImportPreview | null>(null);
   const [selectedConnectionId, setSelectedConnectionId] = useState<string | null>(null);
   const [check, setCheck] = useState<ProjectCheck | null>(null);
+  // 接続チェックはファイルを読むので、概要を開いているときだけ確かめる。
+  const tabRef = useRef<Tab>("dashboard");
+  tabRef.current = tab;
   const [checkError, setCheckError] = useState<string>("");
 
   const refresh = async () => {
@@ -39,8 +42,15 @@ export default function App() {
       const [next, coreCatalog] = await Promise.all([api.snapshot(), api.catalog()]);
       setSnapshot(next);
       setCatalog(coreCatalog);
-      // 接続チェックが失敗しても、ほかの表示は続ける。
-      api.checkProject().then((result) => { setCheck(result); setCheckError(""); }, (reason) => { setCheck(null); setCheckError(messageOf(reason)); });
+      // 接続チェックが失敗しても、ほかの表示は続ける。結果は、表示中のプロジェクトのもの
+      // だけを使う（切り替えの前に出した問い合わせの結果は捨てる）。
+      if (tabRef.current === "dashboard") {
+        const shownProject = next.running_project_id ?? next.active_project_id;
+        api.checkProject().then(
+          (result) => { if (result.project_id === shownProject) { setCheck(result); setCheckError(""); } },
+          (reason) => { setCheck(null); setCheckError(messageOf(reason)); },
+        );
+      }
     } catch (reason) {
       setError(messageOf(reason));
     }
@@ -86,6 +96,7 @@ export default function App() {
     setDraftAsset(null);
     setSelectedConnectionId(null);
     setPreview(null);
+    setCheck(null);
     await run(() => api.importV1Workspace(selection, replace), "v1 のワークスペースを取り込みました。");
   }
 
@@ -94,6 +105,7 @@ export default function App() {
     setDraftAsset(null);
     setSelectedConnectionId(null);
     setPreview(null);
+    setCheck(null);
     void run(() => api.selectProject(projectId), "プロジェクトを切り替えました。");
   }
 
@@ -104,6 +116,7 @@ export default function App() {
     setDraftAsset(null);
     setSelectedConnectionId(null);
     setPreview(null);
+    setCheck(null);
     void run(() => api.createProject(name), "プロジェクトを作りました。");
   }
 
@@ -167,7 +180,7 @@ export default function App() {
         </header>
         {snapshot.store_warnings.length > 0 && <div className="banner error"><div>{snapshot.store_warnings.map((warning, index) => <p key={index}>{warning}</p>)}</div><button onClick={() => void run(() => api.clearStoreWarnings(), "")}>閉じる</button></div>}
         {(notice || error) && <div className={error ? "banner error" : "banner"}><span>{error || notice}</span><button onClick={() => { setError(""); setNotice(""); }}>閉じる</button></div>}
-        {tab === "dashboard" && <CheckPanel check={check} error={checkError} disabled={busy || !!snapshot.running_project_id} onAccept={(ids) => void run(() => api.acceptMemberChanges(ids), "変更を承認しました。")} />}
+        {tab === "dashboard" && <CheckPanel check={check && check.project_id === (snapshot.running_project_id ?? snapshot.active_project_id) ? check : null} error={checkError} disabled={busy || !!snapshot.running_project_id} onAccept={(projectId, revisions) => void run(() => api.acceptMemberChanges(projectId, revisions), "変更を承認しました。")} />}
         {tab === "dashboard" && <Dashboard snapshot={snapshot} activeCore={activeCore?.status ?? "unknown"} onStartCore={() => void run(api.startCore, "Coreコントローラーを起動しました。")} onStopCore={() => void run(api.stopCore, "Coreコントローラーを停止しました。")} onLifecycle={(command) => void run(async () => { const result = await api.runLifecycle(command); if (result.status === "failed") throw new Error(result.stderr || "hako-cmdが失敗しました。"); }, `hako-cmd ${command} を実行しました。`)} onAssetClick={(id) => { setSelectedAssetId(id); setTab("assets"); }} onConnectionClick={(id) => { setSelectedConnectionId(id); setTab("topology"); }} />}
         {tab === "assets" && <AssetsPage key={workspace.id} workspace={workspace} processes={snapshot.processes} selected={selectedAsset} draft={draftAsset} busy={busy} onSelect={selectAsset} onSave={upsertAsset} onDelete={removeAsset} onStart={(id) => void run(() => api.startAsset(id), "アセットを起動しました。")} onStop={(id) => void run(() => api.stopAsset(id), "アセットを停止しました。")} onCreate={createDraftAsset} />}
         {tab === "topology" && <TopologyPage snapshot={snapshot} selected={selectedConnection} onSelect={setSelectedConnectionId} onHeartbeat={(id) => void run(() => api.recordHeartbeat(id, "ユーザー操作による確認イベント"), "通信確認イベントを記録しました。")} />}

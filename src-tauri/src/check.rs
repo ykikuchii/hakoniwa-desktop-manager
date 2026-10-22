@@ -30,6 +30,8 @@ pub enum AcceptanceState {
     Changed,
     /// まだ一度も承認していない。
     NotAccepted,
+    /// この PC からは確かめられない（WSL で動くアセットなど）。一括起動は止めない。
+    Unverified,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,6 +53,8 @@ pub struct MemberCheck {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectCheck {
+    /// どのプロジェクトの結果か。画面は、表示中のプロジェクトと一致するときだけ使う。
+    pub project_id: String,
     pub report: CompatReport,
     pub members: Vec<MemberCheck>,
 }
@@ -63,7 +67,7 @@ impl ProjectCheck {
             match member.acceptance {
                 AcceptanceState::Changed => reasons.push(format!("{} の起動定義か PDU 設定が、承認した後に変わっています（{}）。接続チェックで確認して承認してください。", member.name, member.changes.join("、"))),
                 AcceptanceState::NotAccepted => reasons.push(format!("{} の PDU 設定はまだ承認されていません。接続チェックで確認して承認してください。", member.name)),
-                AcceptanceState::NoPduConfig | AcceptanceState::Accepted => {}
+                AcceptanceState::NoPduConfig | AcceptanceState::Accepted | AcceptanceState::Unverified => {}
             }
         }
         reasons
@@ -86,14 +90,24 @@ fn resolve_entry_path(path: &str, variant: &Variant) -> PathBuf {
 /// （`asset_register` に渡す）、それ以外は接続とみなす。`robots` を持つ legacy 形式は
 /// 接続。service 設定は、変更の検知とカバレッジのために接続として入れる。pdutypes の
 /// ような配列や、PDU に関係しない設定は入れない。
+///
+/// 読めない、または JSON として壊れている `.json` は、入口として残す。黙って外すと、
+/// 承認した後に PDU 設定が消えたり壊れたりしたメンバーが、確認の対象から抜けてしまう。
+/// 抽出の段階で問題として報告され、一括起動を止める。
 pub fn effective_entries(variant: &Variant, timing: &ActivationTiming) -> (Vec<PduEntrySpec>, bool) {
     if !variant.pdu_entries.is_empty() {
         return (variant.pdu_entries.clone(), false);
     }
     let mut entries = Vec::new();
     for file in &variant.config_files {
-        let Ok(bytes) = std::fs::read(resolve_entry_path(file, variant)) else { continue };
-        let Ok(value) = serde_json::from_str::<Value>(String::from_utf8_lossy(&bytes).trim_start_matches('\u{feff}')) else { continue };
+        let is_json = Path::new(file).extension().is_some_and(|extension| extension.eq_ignore_ascii_case("json"));
+        let parsed = std::fs::read(resolve_entry_path(file, variant)).ok().and_then(|bytes| serde_json::from_str::<Value>(String::from_utf8_lossy(&bytes).trim_start_matches('\u{feff}')).ok());
+        let Some(value) = parsed else {
+            if is_json {
+                entries.push(PduEntrySpec { path: file.clone(), usage: Usage::Attach, usage_inferred: true });
+            }
+            continue;
+        };
         let usage = if value.get("paths").is_some() {
             if *timing == ActivationTiming::BeforeStart { Usage::Register } else { Usage::Attach }
         } else if value.get("robots").is_some() || value.get("pdu_config_path").is_some() || value.get("services").is_some() {
@@ -139,6 +153,13 @@ fn extra_digests(variant: &Variant) -> Vec<FileDigest> {
 fn revision(variant: &Variant, member: &Member, entries: &[PduEntrySpec], manifest: &[FileDigest], problems: &[String]) -> String {
     let material = json!({
         "launch": variant.launch,
+        // 起動の段取り（タイミング・準備完了の条件・依存）も、起動のしかたの一部として含める。
+        "startup": {
+            "activation_timing": member.activation_timing.clone().unwrap_or_else(|| variant.activation_timing.clone()),
+            "readiness": member.readiness.clone().unwrap_or_else(|| variant.readiness.clone()),
+            "depends_on": member.depends_on,
+            "optional_depends_on": member.optional_depends_on,
+        },
         "entries": entries,
         "manual_access": variant.manual_access,
         "extra_inputs": variant.extra_inputs,
@@ -166,7 +187,7 @@ fn describe_changes(accepted: &Acceptance, manifest: &[FileDigest]) -> Vec<Strin
         changes.push(format!("{} がなくなった", name(path)));
     }
     if changes.is_empty() {
-        changes.push("起動定義が変わった".to_owned());
+        changes.push("起動定義か起動の段取りが変わった".to_owned());
     }
     changes
 }
@@ -179,13 +200,24 @@ struct Evaluated {
 fn evaluate(member: &Member, asset: &LibraryAsset) -> Result<Evaluated, String> {
     let variant = asset.variant(&member.variant_id).ok_or_else(|| format!("メンバー「{}」のバリエーションがありません。", member.id))?;
     let timing = member.activation_timing.clone().unwrap_or_else(|| variant.activation_timing.clone());
-    let (entries, inferred) = effective_entries(variant, &timing);
+    // WSL で動くアセットのファイルは、この PC のファイルとしては読めない。読んだつもりで
+    // 誤って通したり止めたりしないよう、確かめずにその旨を示す。
+    let wsl = matches!(variant.launch.target, crate::types::ExecutionTarget::Wsl { .. });
+    let (entries, inferred) = if wsl { (Vec::new(), false) } else { effective_entries(variant, &timing) };
     let ports = member_ports(variant, &entries);
     let mut manifest = ports.files.clone();
-    manifest.extend(extra_digests(variant));
+    if !wsl {
+        manifest.extend(extra_digests(variant));
+    }
     let revision = revision(variant, member, &entries, &manifest, &ports.problems);
-    let (acceptance, changes) = if entries.is_empty() {
-        (AcceptanceState::NoPduConfig, Vec::new())
+    let (acceptance, changes) = if wsl {
+        (AcceptanceState::Unverified, Vec::new())
+    } else if entries.is_empty() {
+        // 承認したときには PDU 設定があったのに、今は見つからない。変化として扱う。
+        match &member.accepted {
+            Some(accepted) if !accepted.manifest.is_empty() => (AcceptanceState::Changed, describe_changes(accepted, &manifest)),
+            _ => (AcceptanceState::NoPduConfig, Vec::new()),
+        }
     } else {
         match &member.accepted {
             None => (AcceptanceState::NotAccepted, Vec::new()),
@@ -214,17 +246,48 @@ pub fn check_project(project: &Project, library: &Library) -> Result<ProjectChec
         }
         members.push(evaluated.check);
     }
-    let report = compat::check(&ports, project.core_env.get(CORE_NAMESPACE_VARIABLE).map(String::as_str));
-    Ok(ProjectCheck { report, members })
+    let mut report = compat::check(&ports, project.core_env.get(CORE_NAMESPACE_VARIABLE).map(String::as_str));
+    // 確かめられないメンバーがいれば、そのメンバーが登録するチャネルかもしれないので
+    // 「登録者がいない」は止めずに注意にとどめる。
+    let unverified: Vec<&str> = members.iter().filter(|member| member.enabled && member.acceptance == AcceptanceState::Unverified).map(|member| member.name.as_str()).collect();
+    if !unverified.is_empty() {
+        report.coverage = crate::ports::Coverage::Partial;
+        for finding in report.findings.iter_mut().filter(|finding| finding.code == "no_owner") {
+            finding.severity = compat::Severity::Warning;
+            finding.message = format!("{}（確かめられないメンバー {} が登録している可能性があります）", finding.message, unverified.join("、"));
+        }
+        report.findings.push(compat::Finding { severity: compat::Severity::Info, code: "unverified_member".to_owned(), members: Vec::new(), robot: None, channel_id: None, message: format!("この PC からは確かめられないメンバー: {}", unverified.join("、")) });
+        report.findings.sort_by(|a, b| a.severity.cmp(&b.severity).then_with(|| a.code.cmp(&b.code)));
+    }
+    Ok(ProjectCheck { project_id: project.id.clone(), report, members })
 }
 
 /// `member_ids` のメンバーを、今の内容で承認する。
 pub fn accept_members(project: &mut Project, library: &Library, member_ids: &[String]) -> Result<(), String> {
-    for id in member_ids {
-        let member = project.members.iter_mut().find(|member| &member.id == id).ok_or_else(|| format!("メンバー「{id}」がありません。"))?;
+    accept_revisions(project, library, member_ids.iter().map(|id| (id.clone(), None)).collect())
+}
+
+/// 画面が表示していた revision を添えて承認する。どれか 1 つでも今の内容と違えば、
+/// 何も承認しない。表示した後にファイルが変わっていれば、利用者はその変化を見ていない。
+pub fn accept_shown(project: &mut Project, library: &Library, shown: &BTreeMap<String, String>) -> Result<(), String> {
+    accept_revisions(project, library, shown.iter().map(|(id, revision)| (id.clone(), Some(revision.clone()))).collect())
+}
+
+fn accept_revisions(project: &mut Project, library: &Library, wanted: Vec<(String, Option<String>)>) -> Result<(), String> {
+    let mut accepted = Vec::new();
+    for (id, shown) in wanted {
+        let member = project.members.iter().find(|member| member.id == id).ok_or_else(|| format!("メンバー「{id}」がありません。"))?;
         let asset = library.get(&member.asset_id).ok_or_else(|| format!("メンバー「{id}」のアセットがライブラリにありません。"))?;
         let evaluated = evaluate(member, asset)?;
-        member.accepted = Some(Acceptance { revision: evaluated.check.revision, manifest: evaluated.check.manifest, accepted_at: Utc::now() });
+        if shown.as_ref().is_some_and(|shown| shown != &evaluated.check.revision) {
+            return Err(format!("{} の内容が、表示した後に変わっています。接続チェックを見直してから承認してください。", evaluated.check.name));
+        }
+        accepted.push((id, Acceptance { revision: evaluated.check.revision, manifest: evaluated.check.manifest, accepted_at: Utc::now() }));
+    }
+    for (id, acceptance) in accepted {
+        if let Some(member) = project.members.iter_mut().find(|member| member.id == id) {
+            member.accepted = Some(acceptance);
+        }
     }
     Ok(())
 }
@@ -333,7 +396,72 @@ mod tests {
         let check = check_project(&project, &library).unwrap();
         let sim = check.members.iter().find(|m| m.member_id == "sim").unwrap();
         assert_eq!(sim.acceptance, AcceptanceState::Changed);
-        assert_eq!(sim.changes, vec!["起動定義が変わった"]);
+        assert_eq!(sim.changes, vec!["起動定義か起動の段取りが変わった"]);
+    }
+
+    /// 起動タイミングや依存を変えても、承認が要る。
+    #[test]
+    fn startup_changes_need_acceptance() {
+        let (_, mut project, library) = project("check-startup");
+        accept_all(&mut project, &library).unwrap();
+        project.members[1].activation_timing = Some(ActivationTiming::Manual);
+        assert_eq!(check_project(&project, &library).unwrap().members[1].acceptance, AcceptanceState::Changed);
+        accept_all(&mut project, &library).unwrap();
+        project.members[1].depends_on.push("owner".to_owned());
+        assert_eq!(check_project(&project, &library).unwrap().members[1].acceptance, AcceptanceState::Changed);
+    }
+
+    /// 承認した後に PDU 設定が消えたり壊れたりすると、確認から抜けずに止める。
+    #[test]
+    fn deleted_or_broken_configs_after_acceptance_block() {
+        let (dir, mut project, library) = project("check-deleted");
+        accept_all(&mut project, &library).unwrap();
+        std::fs::write(dir.join("sim.json"), b"{ truncated").unwrap();
+        let check = check_project(&project, &library).unwrap();
+        assert!(check.report.has_errors(), "{:#?}", check.report.findings);
+        assert!(!check.blocking_reasons().is_empty());
+        std::fs::remove_file(dir.join("sim.json")).unwrap();
+        let check = check_project(&project, &library).unwrap();
+        assert!(!check.blocking_reasons().is_empty());
+        assert_ne!(check.members[1].acceptance, AcceptanceState::NoPduConfig);
+    }
+
+    /// 承認した後に config_files から PDU 設定を外すと、変化として止める。
+    #[test]
+    fn removing_the_pdu_config_after_acceptance_is_a_change() {
+        let (_, mut project, mut library) = project("check-removed");
+        accept_all(&mut project, &library).unwrap();
+        library.get_mut("asset-sim").unwrap().variants[0].config_files = vec!["other.json".to_owned()];
+        let check = check_project(&project, &library).unwrap();
+        assert_eq!(check.members[1].acceptance, AcceptanceState::Changed);
+        assert!(check.members[1].changes.iter().any(|change| change.contains("sim.json")), "{:?}", check.members[1].changes);
+    }
+
+    /// 表示した revision と今の内容が違えば、何も承認しない。
+    #[test]
+    fn acceptance_rejects_content_changed_after_it_was_shown() {
+        let (dir, mut project, library) = project("check-shown");
+        let shown: BTreeMap<String, String> = check_project(&project, &library).unwrap().members.iter().map(|m| (m.member_id.clone(), m.revision.clone())).collect();
+        legacy(&dir, "sim.json", "Rig", &[(0, "cmd", 136)], &[(1, "attitude", 72), (1, "attitude", 72)]);
+        assert!(accept_shown(&mut project, &library, &shown).is_err());
+        assert!(project.members.iter().all(|m| m.accepted.is_none()), "一部だけ承認しない");
+        let shown: BTreeMap<String, String> = check_project(&project, &library).unwrap().members.iter().map(|m| (m.member_id.clone(), m.revision.clone())).collect();
+        accept_shown(&mut project, &library, &shown).unwrap();
+        assert!(check_project(&project, &library).unwrap().blocking_reasons().is_empty());
+    }
+
+    /// WSL で動くメンバーは確かめず、一括起動は止めない。そのメンバーが登録しうるチャネルの
+    /// 「登録者がいない」は注意にとどめる。
+    #[test]
+    fn wsl_members_are_reported_as_unverified() {
+        let (_, mut project, mut library) = project("check-wsl");
+        library.get_mut("asset-owner").unwrap().variants[0].launch.target = crate::types::ExecutionTarget::Wsl { distribution: "Ubuntu".to_owned() };
+        accept_all(&mut project, &library).unwrap();
+        let check = check_project(&project, &library).unwrap();
+        assert_eq!(check.members[0].acceptance, AcceptanceState::Unverified);
+        assert!(check.blocking_reasons().is_empty(), "{:?}", check.blocking_reasons());
+        assert!(check.report.findings.iter().any(|f| f.code == "no_owner" && f.severity == compat::Severity::Warning));
+        assert_eq!(check.report.coverage, crate::ports::Coverage::Partial);
     }
 
     /// 承認しても、接続チェックの Error は一括起動を止める。

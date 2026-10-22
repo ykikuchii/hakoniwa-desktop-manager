@@ -145,11 +145,12 @@ export interface MemberCheck {
   entries: { path: string; usage: "register" | "attach"; usage_inferred: boolean }[];
   inferred: boolean;
   revision: string;
-  acceptance: "no_pdu_config" | "accepted" | "changed" | "not_accepted";
+  acceptance: "no_pdu_config" | "accepted" | "changed" | "not_accepted" | "unverified";
   changes: string[];
 }
 
 export interface ProjectCheck {
+  project_id: string;
   report: { findings: Finding[]; coverage: "complete" | "partial" };
   members: MemberCheck[];
 }

@@ -252,13 +252,17 @@ impl Store {
         Ok(ImportOutcome { project_id: project.id, replaced })
     }
 
-    /// プロジェクトのメンバーを、今の内容で承認して保存する。`member_ids` が `None` なら全員。
-    pub fn accept(&mut self, project_id: &str, member_ids: Option<&[String]>) -> Result<(), String> {
+    /// プロジェクトのメンバーを、今の内容で承認して保存する（全員）。
+    pub fn accept(&mut self, project_id: &str) -> Result<(), String> {
         let mut project = self.projects.get(project_id).cloned().ok_or_else(|| "そのプロジェクトはありません。".to_owned())?;
-        match member_ids {
-            Some(ids) => crate::check::accept_members(&mut project, &self.library, ids)?,
-            None => crate::check::accept_all(&mut project, &self.library)?,
-        }
+        crate::check::accept_all(&mut project, &self.library)?;
+        self.commit(self.draft(), project)
+    }
+
+    /// 画面が表示していた revision で承認して保存する。どれかが今の内容と違えば何もしない。
+    pub fn accept_shown(&mut self, project_id: &str, shown: &BTreeMap<String, String>) -> Result<(), String> {
+        let mut project = self.projects.get(project_id).cloned().ok_or_else(|| "そのプロジェクトはありません。".to_owned())?;
+        crate::check::accept_shown(&mut project, &self.library, shown)?;
         self.commit(self.draft(), project)
     }
 

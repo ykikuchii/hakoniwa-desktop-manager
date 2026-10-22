@@ -37,7 +37,7 @@ export const api = {
   importV1Workspace: (path: string, replace: boolean) => invoke<string>("import_v1_workspace", { path, replace }),
   clearStoreWarnings: () => invoke<void>("clear_store_warnings"),
   checkProject: () => invoke<ProjectCheck>("check_project"),
-  acceptMemberChanges: (memberIds: string[]) => invoke<ProjectCheck>("accept_member_changes", { memberIds }),
+  acceptMemberChanges: (projectId: string, revisions: Record<string, string>) => invoke<ProjectCheck>("accept_member_changes", { projectId, revisions }),
 };
 
 export function newAsset(): AssetDefinition {

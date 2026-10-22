@@ -3,7 +3,7 @@ import type { ProjectCheck } from "./types";
 const severityLabel: Record<string, string> = { error: "エラー", warning: "注意", info: "情報" };
 
 /** 一括起動の前に行う接続チェックの結果と、承認が必要なメンバー。 */
-export function CheckPanel({ check, error, disabled, onAccept }: { check: ProjectCheck | null; error: string; disabled: boolean; onAccept: (memberIds: string[]) => void }) {
+export function CheckPanel({ check, error, disabled, onAccept }: { check: ProjectCheck | null; error: string; disabled: boolean; onAccept: (projectId: string, revisions: Record<string, string>) => void }) {
   if (!check) {
     return <div className="panel check-panel"><div className="panel-heading"><div><p className="eyebrow">PDU CHECK</p><h3>接続チェック</h3></div></div><p className="muted">{error || "確認しています。"}</p></div>;
   }
@@ -12,6 +12,7 @@ export function CheckPanel({ check, error, disabled, onAccept }: { check: Projec
   const infos = check.report.findings.length - findings.length;
   const errors = findings.filter((finding) => finding.severity === "error").length;
   const unchecked = check.members.filter((member) => member.enabled && member.acceptance === "no_pdu_config").map((member) => member.name);
+  const unverified = check.members.filter((member) => member.enabled && member.acceptance === "unverified").map((member) => member.name);
   const ok = errors === 0 && pending.length === 0;
   return (
     <div className="panel check-panel">
@@ -24,7 +25,7 @@ export function CheckPanel({ check, error, disabled, onAccept }: { check: Projec
         <div className="check-pending">
           <p><strong>承認が必要な変更</strong></p>
           {pending.map((member) => <p key={member.member_id}>{member.name}：{member.acceptance === "not_accepted" ? "まだ承認されていません" : member.changes.join("、")}</p>)}
-          <div className="form-actions"><button className="button primary" disabled={disabled} onClick={() => onAccept(pending.map((member) => member.member_id))}>内容を確認したので承認する</button></div>
+          <div className="form-actions"><button className="button primary" disabled={disabled} onClick={() => onAccept(check.project_id, Object.fromEntries(pending.map((member) => [member.member_id, member.revision])))}>内容を確認したので承認する</button></div>
         </div>
       )}
       {findings.length === 0 ? <p className="muted">問題は見つかりませんでした{infos > 0 ? `（情報 ${infos} 件）` : ""}。</p> : (
@@ -34,6 +35,7 @@ export function CheckPanel({ check, error, disabled, onAccept }: { check: Projec
         </div>
       )}
       {unchecked.length > 0 && <p className="muted">PDU 設定が見つからず確かめていないメンバー：{unchecked.join("、")}</p>}
+      {unverified.length > 0 && <p className="muted">WSL で動くため、この PC からは確かめられないメンバー：{unverified.join("、")}</p>}
     </div>
   );
 }
