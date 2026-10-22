@@ -31,6 +31,10 @@ export const api = {
   installCore: (version: string) => invoke<CoreInstallResult>("install_approved_core", { version }),
   ingestBridgeLine: (connectionId: string, line: string) => invoke<void>("ingest_bridge_monitor_line", { connectionId, line }),
   recordHeartbeat: (connectionId: string, message: string) => invoke<void>("record_manual_communication_event", { connectionId, message }),
+  selectProject: (projectId: string) => invoke<void>("select_project", { projectId }),
+  createProject: (name: string) => invoke<string>("create_project", { name }),
+  importV1Workspace: (path: string, replace: boolean) => invoke<string>("import_v1_workspace", { path, replace }),
+  clearStoreWarnings: () => invoke<void>("clear_store_warnings"),
 };
 
 export function newAsset(): AssetDefinition {

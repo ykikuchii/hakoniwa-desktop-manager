@@ -7,7 +7,7 @@ use crate::{
         ActivationTiming, AssetDefinition, CommunicationEvent, CommunicationEventType,
         CoreCatalog, CoreInstallResult, EventDirection,
         ImportPreview, LifecycleCommandResult, ObservationSource, ProcessKind, ProcessStatus,
-        ProgramSpec, ReadinessCheck, Workspace, WorkspaceSnapshot,
+        ProgramSpec, ProjectSummary, ReadinessCheck, Workspace, WorkspaceSnapshot,
     },
 };
 use chrono::Utc;
@@ -24,12 +24,27 @@ use uuid::Uuid;
 
 #[tauri::command]
 pub fn get_snapshot(state: State<'_, AppState>) -> Result<WorkspaceSnapshot, String> {
-    let mut workspace = state.workspace.lock().map_err(|_| "ワークスペースをロックできません。".to_owned())?.clone();
+    state.release_if_idle();
+    let mut store_warnings = Vec::new();
+    // 開けないプロジェクト（参照先のアセットが隔離されたなど）でも画面は出す。
+    // 空の構成を見せ、理由を警告に載せる。
+    let mut workspace = state.run_workspace().unwrap_or_else(|error| {
+        store_warnings.push(error);
+        let (id, name) = state.lock_store().ok().and_then(|store| store.projects.get(store.active_project_id()).map(|project| (project.id.clone(), project.name.clone()))).unwrap_or_default();
+        Workspace::empty(id, name)
+    });
     // 保存済みの解決結果はキャッシュに過ぎない。アセットの追加・改名・削除に追従させるため、
     // 表示に渡すコピーの上で毎回引き直す（永続値はここでは書き換えない）。
     let _ = crate::linking::resolve_links(&workspace.assets, &mut workspace.imported_connections);
     let processes = state.processes.snapshots();
     harvest_monitor_logs(&state, &workspace, &processes);
+    let (projects, active_project_id) = {
+        let store = state.lock_store()?;
+        store_warnings.splice(0..0, store.warnings.iter().cloned());
+        let mut projects: Vec<ProjectSummary> = store.projects.values().map(|project| ProjectSummary { id: project.id.clone(), name: project.name.clone() }).collect();
+        projects.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
+        (projects, store.active_project_id().to_owned())
+    };
     Ok(WorkspaceSnapshot {
         workspace: workspace.clone(),
         platform: crate::types::HostPlatform::current(),
@@ -37,83 +52,169 @@ pub fn get_snapshot(state: State<'_, AppState>) -> Result<WorkspaceSnapshot, Str
         processes,
         connections: state.monitor.snapshots(&workspace.imported_connections),
         recent_events: state.monitor.recent_events(250),
+        projects,
+        active_project_id,
+        running_project_id: state.running_project_id(),
+        store_warnings,
     })
+}
+
+/// アクティブなプロジェクトを、編集した `Workspace` で置き換える。実行中なら拒否する。
+/// `edit` は解決済みの構成を受け取って書き換える。
+fn edit_active_workspace(state: &AppState, edit: impl FnOnce(&mut Workspace) -> Result<(), String>) -> Result<Workspace, String> {
+    let project_id = state.lock_store()?.active_project_id().to_owned();
+    let _gate = state.ensure_mutable(&project_id)?;
+    let mut workspace = state.active_workspace()?;
+    edit(&mut workspace)?;
+    crate::edit::apply_workspace(&mut *state.lock_store()?, &project_id, &workspace)?;
+    state.active_workspace()
 }
 
 #[tauri::command]
 pub fn save_workspace(state: State<'_, AppState>, workspace: Workspace) -> Result<Workspace, String> {
-    workspace.validate()?;
-    {
-        let mut stored = state.workspace.lock().map_err(|_| "ワークスペースをロックできません。".to_owned())?;
-        *stored = workspace.clone();
-    }
-    state.persist_workspace()?;
-    Ok(workspace)
+    edit_active_workspace(&state, |current| {
+        // 画面が切り替え前のプロジェクトを送ってきたら拒否する。書くと、前のプロジェクトの
+        // 内容で今のプロジェクトを上書きしてしまう。
+        if workspace.id != current.id {
+            return Err("表示中のプロジェクトが切り替わっています。画面が更新されてから、もう一度保存してください。".to_owned());
+        }
+        *current = Workspace { schema_version: current.schema_version, ..workspace };
+        Ok(())
+    })
 }
 
 #[tauri::command]
 pub fn create_asset(state: State<'_, AppState>, asset: AssetDefinition) -> Result<Workspace, String> {
     asset.command.validate()?;
-    let mut workspace = state.workspace.lock().map_err(|_| "ワークスペースをロックできません。".to_owned())?;
-    if workspace.assets.iter().any(|candidate| candidate.id == asset.id) {
-        return Err("同じアセットIDが既に存在します。".to_owned());
-    }
-    workspace.assets.push(asset);
-    workspace.validate()?;
-    let response = workspace.clone();
-    drop(workspace);
-    state.persist_workspace()?;
-    Ok(response)
+    edit_active_workspace(&state, |workspace| {
+        if workspace.assets.iter().any(|candidate| candidate.id == asset.id) {
+            return Err("同じアセットIDが既に存在します。".to_owned());
+        }
+        workspace.assets.push(asset);
+        Ok(())
+    })
 }
 
 #[tauri::command]
 pub fn update_asset(state: State<'_, AppState>, asset: AssetDefinition) -> Result<Workspace, String> {
     asset.command.validate()?;
-    let mut workspace = state.workspace.lock().map_err(|_| "ワークスペースをロックできません。".to_owned())?;
-    let existing = workspace.assets.iter_mut().find(|candidate| candidate.id == asset.id).ok_or_else(|| "更新対象のアセットが見つかりません。".to_owned())?;
-    *existing = asset;
-    workspace.validate()?;
-    let response = workspace.clone();
-    drop(workspace);
-    state.persist_workspace()?;
-    Ok(response)
+    edit_active_workspace(&state, |workspace| {
+        let existing = workspace.assets.iter_mut().find(|candidate| candidate.id == asset.id).ok_or_else(|| "更新対象のアセットが見つかりません。".to_owned())?;
+        *existing = asset;
+        Ok(())
+    })
 }
 
 #[tauri::command]
 pub fn delete_asset(state: State<'_, AppState>, asset_id: String) -> Result<Workspace, String> {
-    let mut workspace = state.workspace.lock().map_err(|_| "ワークスペースをロックできません。".to_owned())?;
-    let before = workspace.assets.len();
-    workspace.assets.retain(|asset| asset.id != asset_id);
-    if before == workspace.assets.len() { return Err("削除対象のアセットが見つかりません。".to_owned()); }
-    for asset in &mut workspace.assets {
-        asset.depends_on.retain(|dependency| dependency != &asset_id);
-        asset.optional_depends_on.retain(|dependency| dependency != &asset_id);
+    edit_active_workspace(&state, |workspace| {
+        let before = workspace.assets.len();
+        workspace.assets.retain(|asset| asset.id != asset_id);
+        if before == workspace.assets.len() { return Err("削除対象のアセットが見つかりません。".to_owned()); }
+        for asset in &mut workspace.assets {
+            asset.depends_on.retain(|dependency| dependency != &asset_id);
+            asset.optional_depends_on.retain(|dependency| dependency != &asset_id);
+        }
+        Ok(())
+    })
+}
+
+#[tauri::command]
+pub fn select_project(state: State<'_, AppState>, project_id: String) -> Result<(), String> {
+    state.select_project(&project_id)
+}
+
+#[tauri::command]
+pub fn create_project(state: State<'_, AppState>, name: String) -> Result<String, String> {
+    if name.trim().is_empty() {
+        return Err("プロジェクト名を指定してください。".to_owned());
     }
-    let response = workspace.clone();
-    drop(workspace);
-    state.persist_workspace()?;
-    Ok(response)
+    let project = crate::model::Project::empty(Uuid::new_v4().to_string(), name.trim().to_owned());
+    {
+        let mut store = state.lock_store()?;
+        store.save_project(&project)?;
+        store.projects.insert(project.id.clone(), project.clone());
+    }
+    state.select_project(&project.id)?;
+    Ok(project.id)
+}
+
+/// v1 の `workspace.json` を取り込む。`replace` なら同じ出所のプロジェクトを置き換える。
+/// 取り込んだプロジェクトをアクティブにする。
+#[tauri::command]
+pub fn import_v1_workspace(state: State<'_, AppState>, path: String, replace: bool) -> Result<String, String> {
+    import_v1(&state, Path::new(&path), replace)
+}
+
+pub fn import_v1(state: &AppState, path: &Path, replace: bool) -> Result<String, String> {
+    // 置き換える相手が実行中なら拒否する。相手は取り込むまで分からないので、
+    // 何かが実行中なら一律に拒否する。取り込んだ後でアクティブにも切り替える。
+    state.release_if_idle();
+    let gate = state.lock_gate();
+    if state.start_all_running.load(Ordering::Acquire) || state.stop_all_running.load(Ordering::Acquire) || state.running_project_id().is_some() {
+        return Err("実行中は取り込めません。すべて停止してから取り込んでください。".to_owned());
+    }
+    // 保存場所に置かれた v1 は、取り込んだら退避する。残すと毎回警告が出る。
+    // 同じファイルかは、表記ではなくファイルの同一性で比べる。
+    let requested = crate::store::file_identity(path);
+    let data_dir_v1 = crate::store::file_identity(&state.data_directory.join(crate::store::V1_WORKSPACE_FILE));
+    let consume = requested.is_some() && requested == data_dir_v1;
+    let project_id = {
+        let mut store = state.lock_store()?;
+        // この起動の移行で、同じファイルを既に取り込んで退避している。取り込み直さず、
+        // 移行で作ったプロジェクトを使う。
+        let migrated = store.migrated_now.as_ref().filter(|(migrated, _)| requested.as_ref() == Some(migrated) && !path.exists()).map(|(_, id)| id.clone());
+        match migrated {
+            Some(id) => id,
+            None => store.import_v1(path, replace, consume)?.project_id,
+        }
+    };
+    drop(gate);
+    state.select_project(&project_id)?;
+    Ok(project_id)
+}
+
+#[tauri::command]
+pub fn clear_store_warnings(state: State<'_, AppState>) -> Result<(), String> {
+    state.lock_store()?.warnings.clear();
+    Ok(())
 }
 
 #[tauri::command]
 pub fn start_asset(state: State<'_, AppState>, asset_id: String) -> Result<crate::types::ProcessSnapshot, String> {
-    let asset = state.workspace.lock().map_err(|_| "ワークスペースをロックできません。".to_owned())?
-        .assets.iter().find(|candidate| candidate.id == asset_id).cloned().ok_or_else(|| "起動対象のアセットが見つかりません。".to_owned())?;
     // `enabled` は一括起動の対象かどうかだけを表す。外したアセットも単独では起動できる。
     // 一括起動と切り離して、実行中に後から足したり差し替えたりするアセットのため。
     // ただし一括起動・一括停止の最中は断る。一括停止が通り過ぎた後に起動して止めた
     // はずのものが残ったり、一括起動と二重に起動したりするため。
     // 確認からプロセスの登録まで `lifecycle_gate` を持ち、一括操作の開始と重ならないようにする。
-    let _gate = state.lifecycle_gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let gate = state.lock_gate();
     if state.start_all_running.load(Ordering::Acquire) || state.stop_all_running.load(Ordering::Acquire) {
         return Err("一括起動または一括停止の実行中は、アセットを単独で起動できません。".to_owned());
     }
-    state.processes.start(asset.id, asset.name, ProcessKind::Asset, asset.command).map_err(|error| error.to_string())
+    // 起動するのは実行中の構成（なければアクティブなプロジェクトを凍結したもの）から。
+    let workspace = state.begin_run_locked()?;
+    let started = workspace
+        .assets
+        .iter()
+        .find(|candidate| candidate.id == asset_id)
+        .cloned()
+        .ok_or_else(|| "起動対象のアセットが見つかりません。".to_owned())
+        .and_then(|asset| state.processes.start(asset.id, asset.name, ProcessKind::Asset, asset.command).map_err(|error| error.to_string()));
+    drop(gate);
+    // 起動に失敗して何も動いていなければ、用意した実行コンテキストを手放す。
+    state.release_if_idle();
+    started
 }
 
 // 停止後に Core の応答を確かめるため数秒ブロックしうる。UI を止めないよう async にする。
 #[tauri::command(async)]
 pub fn stop_asset(state: State<'_, AppState>, asset_id: String) -> Result<Vec<crate::types::ProcessSnapshot>, String> {
+    let result = stop_asset_inner(state.clone(), asset_id);
+    state.release_if_idle();
+    result
+}
+
+fn stop_asset_inner(state: State<'_, AppState>, asset_id: String) -> Result<Vec<crate::types::ProcessSnapshot>, String> {
     let report = state.processes.stop_owner(&asset_id);
     if report.is_empty() { return Err("停止できる実行中プロセスがありません。".to_owned()); }
     if !report.failures.is_empty() {
@@ -125,9 +226,9 @@ pub fn stop_asset(state: State<'_, AppState>, asset_id: String) -> Result<Vec<cr
     // 消えないので、次の一括起動まで自然には直らない。ほかに動いているプロセスが
     // あるときだけ Core の応答を確かめ、固まっていそうなら利用者に知らせる。
     // ほかに何も動いていなければ master も無く、確かめても誤検知になるだけなので省く。
-    let workspace = state.workspace.lock().map_err(|_| "ワークスペースをロックできません。".to_owned())?.clone();
+    let workspace = state.run_workspace()?;
     if !running_owner_names(&state, &workspace).is_empty() {
-        let health = core_lock_health(&state);
+        let health = core_lock_health(&workspace);
         let name = report.stopped.first().map(|snapshot| snapshot.owner_name.clone()).unwrap_or_default();
         match health {
             // ABORT は Core のファイルに残り、すべて止めても `hako-cmd recover` を実行する
@@ -188,10 +289,8 @@ enum CoreLockHealth {
 /// 代用する。ただし `status` は共有ログへの書き込みのときにしかロックを取らず、
 /// ログが満杯だとそれも省かれるので、成功しても空きの証拠にはならない。代用で
 /// 言えるのは「応答しなかった」場合だけで、成功時は `Unknown` とする。
-fn core_lock_health(state: &State<'_, AppState>) -> CoreLockHealth {
-    let Some((selection, env)) = state.workspace.lock().ok().and_then(|workspace| {
-        Some((workspace.core_release.clone()?, workspace.core_env.clone()))
-    }) else {
+fn core_lock_health(workspace: &Workspace) -> CoreLockHealth {
+    let Some((selection, env)) = workspace.core_release.clone().map(|selection| (selection, workspace.core_env.clone())) else {
         return CoreLockHealth::Unknown;
     };
     // 新しい Core（toppers/hakoniwa-core-cpp#62 の修正以降）は `hako-cmd check` で、
@@ -319,16 +418,29 @@ fn master_lock_free_seen(flock: &Path, window: Duration) -> Option<bool> {
 
 #[tauri::command]
 pub fn start_core_controller(state: State<'_, AppState>) -> Result<crate::types::ProcessSnapshot, String> {
-    let controller = state.workspace.lock().map_err(|_| "ワークスペースをロックできません。".to_owned())?.core_controller.clone()
-        .ok_or_else(|| "Coreコントローラーを設定してください。".to_owned())?;
+    let gate = state.lock_gate();
+    if state.start_all_running.load(Ordering::Acquire) || state.stop_all_running.load(Ordering::Acquire) {
+        return Err("一括起動または一括停止の実行中は、Coreコントローラーを単独で起動できません。".to_owned());
+    }
+    let started = state.begin_run_locked().and_then(|workspace| {
+        let controller = workspace.core_controller.ok_or_else(|| "Coreコントローラーを設定してください。".to_owned())?;
+        spawn_controller(&state, controller)
+    });
+    drop(gate);
+    state.release_if_idle();
+    started
+}
+
+fn spawn_controller(state: &AppState, controller: crate::types::CoreController) -> Result<crate::types::ProcessSnapshot, String> {
     state.processes.start(controller.id, controller.name, ProcessKind::CoreController, controller.command).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
 pub fn stop_core_controller(state: State<'_, AppState>) -> Result<Vec<crate::types::ProcessSnapshot>, String> {
-    let controller = state.workspace.lock().map_err(|_| "ワークスペースをロックできません。".to_owned())?.core_controller.clone()
+    let controller = state.run_workspace()?.core_controller
         .ok_or_else(|| "Coreコントローラーを設定してください。".to_owned())?;
     let report = state.processes.stop_owner(&controller.id);
+    state.release_if_idle();
     if report.is_empty() { return Err("停止できるCoreプロセスがありません。".to_owned()); }
     if !report.failures.is_empty() {
         return Err(format!("停止できなかったCoreプロセスがあります: {}", report.failures.join(" / ")));
@@ -338,14 +450,16 @@ pub fn stop_core_controller(state: State<'_, AppState>) -> Result<Vec<crate::typ
 
 #[tauri::command]
 pub fn run_lifecycle_command(state: State<'_, AppState>, command: String) -> Result<LifecycleCommandResult, String> {
+    lifecycle(&state.run_workspace()?, command)
+}
+
+/// `workspace` の Core に `hako-cmd` を実行する。一括起動・一括停止は凍結した構成を渡す。
+fn lifecycle(workspace: &Workspace, command: String) -> Result<LifecycleCommandResult, String> {
     if !matches!(command.as_str(), "start" | "stop" | "reset") {
         return Err("許可されていないライフサイクル操作です。".to_owned());
     }
-    let (selection, env) = {
-        let workspace = state.workspace.lock().map_err(|_| "ワークスペースをロックできません。".to_owned())?;
-        (workspace.core_release.clone(), workspace.core_env.clone())
-    };
-    let selection = selection.ok_or_else(|| "承認済みCoreを導入して選択してください。".to_owned())?;
+    let selection = workspace.core_release.clone().ok_or_else(|| "承認済みCoreを導入して選択してください。".to_owned())?;
+    let env = workspace.core_env.clone();
     let spec = ProgramSpec { program: selection.hako_cmd_path, args: vec![command.clone()], cwd: Some(selection.install_directory), env, target: crate::types::ExecutionTarget::Native };
     let (code, stdout, stderr) = run_oneshot(&spec, LIFECYCLE_TIMEOUT).map_err(|error| format!("hako-cmd {command}: {error}"))?;
     Ok(LifecycleCommandResult { command, status: if code == 0 { ProcessStatus::Exited } else { ProcessStatus::Failed }, stdout, stderr })
@@ -508,7 +622,7 @@ fn running_owner_names(state: &State<'_, AppState>, workspace: &Workspace) -> Ve
         .snapshots()
         .into_iter()
         .filter(|snapshot| owners.contains(snapshot.owner_id.as_str()))
-        .filter(|snapshot| matches!(snapshot.status, ProcessStatus::Starting | ProcessStatus::Running | ProcessStatus::Stopping))
+        .filter(|snapshot| matches!(snapshot.status, ProcessStatus::Starting | ProcessStatus::Running | ProcessStatus::Stopping | ProcessStatus::Unknown))
         .map(|snapshot| snapshot.owner_name)
         .collect();
     names.into_iter().collect()
@@ -557,6 +671,14 @@ impl Drop for StartAllGuard<'_> {
 // 走り UI を止めるため、async 指定でワーカースレッドに逃がす。
 #[tauri::command(async)]
 pub fn start_all(state: State<'_, AppState>) -> Result<Vec<crate::types::ProcessSnapshot>, String> {
+    let result = start_all_inner(state.clone());
+    // 起動に失敗して何も動いていなければ、実行コンテキストを手放す。部分的に起動した
+    // ものが残っていれば保持し、次の一括停止が凍結した構成で止められるようにする。
+    state.release_if_idle();
+    result
+}
+
+fn start_all_inner(state: State<'_, AppState>) -> Result<Vec<crate::types::ProcessSnapshot>, String> {
     // フラグを立てるまで `lifecycle_gate` を持つ。単独起動の途中なら、その登録が
     // 終わってからここに来るので、下の稼働中の確認で見落とさない。
     let gate = state.lifecycle_gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -564,13 +686,14 @@ pub fn start_all(state: State<'_, AppState>) -> Result<Vec<crate::types::Process
         return Err("一括起動は既に実行中です。".to_owned());
     }
     let _guard = StartAllGuard(&state.start_all_running);
+    // 実行コンテキストもゲートを持ったまま用意する。以後はこの凍結した構成だけを使う。
+    let workspace = state.begin_run_locked()?;
     drop(gate);
     // フラグを立てた後に確認する。立てる前に確認すると、その隙に始まった停止を
     // 見落とす。停止側は起動のフラグが下りるまで待つので、どちらかが必ず譲る。
     if state.stop_all_running.load(Ordering::Acquire) {
         return Err("一括停止の実行中は一括起動できません。".to_owned());
     }
-    let workspace = state.workspace.lock().map_err(|_| "ワークスペースをロックできません。".to_owned())?.clone();
     // 稼働中のアセットがあるまま一括起動すると、同じアセットが二重に起動する。
     // 登録アセットは Core に二重登録できず、外部アセットは同じポートを取り合う。
     // 一括起動の対象外でも、単独で起動したものが動いていれば同じ Core を使っているので数える。
@@ -583,8 +706,8 @@ pub fn start_all(state: State<'_, AppState>) -> Result<Vec<crate::types::Process
     }
     let ordered = topological_order(&workspace.assets)?;
     let mut started = Vec::new();
-    if workspace.core_controller.is_some() {
-        started.push(start_core_controller(state.clone())?);
+    if let Some(controller) = workspace.core_controller.clone() {
+        started.push(spawn_controller(&state, controller)?);
     }
     for timing in [ActivationTiming::BeforeStart, ActivationTiming::Manual, ActivationTiming::AfterStart] {
         for asset in ordered.iter().filter(|asset| asset.enabled && asset.activation_timing == timing) {
@@ -606,7 +729,7 @@ pub fn start_all(state: State<'_, AppState>) -> Result<Vec<crate::types::Process
             // Core の起動で登録が締め切られても取りこぼしが出ない。
             // 失敗を握りつぶすと、PDU セグメントが無いまま after_start のアセットが
             // 起動され、原因と離れた場所（attach 時のクラッシュ）で症状が出る。
-            let result = run_lifecycle_command(state.clone(), "start".to_owned())?;
+            let result = lifecycle(&workspace, "start".to_owned())?;
             if result.status == ProcessStatus::Failed {
                 let detail = result.stderr.lines().chain(result.stdout.lines()).rev().find(|line| !line.trim().is_empty()).unwrap_or_default().to_owned();
                 return Err(format!("hako-cmd start が失敗しました。{detail}"));
@@ -622,12 +745,31 @@ pub fn start_all(state: State<'_, AppState>) -> Result<Vec<crate::types::Process
 // 走り、その間 UI が固まるため async 指定でワーカースレッドに逃がす。
 #[tauri::command(async)]
 pub fn stop_all(state: State<'_, AppState>) -> Result<Vec<crate::types::ProcessSnapshot>, String> {
-    {
-        // 単独起動の途中なら、その登録が終わってからフラグを立てる。下の停止で
-        // そのプロセスも止める対象に入る。
-        let _gate = state.lifecycle_gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.stop_all_running.store(true, Ordering::Release);
-    }
+    let result = stop_all_inner(state.clone());
+    // 停止のフラグを下ろした後で確かめる。下ろす前は解放を見送るため。
+    state.release_if_idle();
+    result
+}
+
+fn stop_all_inner(state: State<'_, AppState>) -> Result<Vec<crate::types::ProcessSnapshot>, String> {
+    // 単独起動の途中なら、その登録が終わってからフラグを立てる。下の停止で
+    // そのプロセスも止める対象に入る。止める対象（実行中の構成）も、ゲートを持ったまま
+    // 決めて固定する。重なった一括停止は拒否する。先に終わった方がフラグを下ろすと、
+    // 実行中の構成が解放されて別のプロジェクトが起動でき、遅れた方がその同じ id の
+    // プロセスを止めてしまうため。
+    let workspace = {
+        let _gate = state.lock_gate();
+        if state.stop_all_running.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            return Err("一括停止は既に実行中です。".to_owned());
+        }
+        match state.begin_run_locked() {
+            Ok(workspace) => workspace,
+            Err(error) => {
+                state.stop_all_running.store(false, Ordering::Release);
+                return Err(error);
+            }
+        }
+    };
     let _guard = StopAllGuard(&state);
     // 進行中の一括起動を止めてから停止する。止めないと、停止が通り過ぎた後で
     // 起動側が残りのアセットを起動し、停止したはずのものが動き続ける。
@@ -640,7 +782,6 @@ pub fn stop_all(state: State<'_, AppState>) -> Result<Vec<crate::types::ProcessS
     if state.start_all_running.load(Ordering::Acquire) {
         failures.push(format!("一括起動が {} 秒以内に中断しませんでした。", START_ALL_CANCEL_WAIT.as_secs()));
     }
-    let workspace = state.workspace.lock().map_err(|_| "ワークスペースをロックできません。".to_owned())?.clone();
     if workspace.core_release.is_some() {
         // stop だけで登録アセットを kill すると、conductor を持つアセットが Core の
         // 状態遷移の途中で落ち、以後の hako-cmd が応答しなくなる（実測）。
@@ -649,7 +790,7 @@ pub fn stop_all(state: State<'_, AppState>) -> Result<Vec<crate::types::ProcessS
         for command in ["stop", "reset"] {
             // Core が動いていなければ hako-cmd は失敗を返すが、停止としては正常。
             // それ以外の失敗と、応答しなかった場合は報告する。
-            match run_lifecycle_command(state.clone(), command.to_owned()) {
+            match lifecycle(&workspace, command.to_owned()) {
                 Ok(result) if result.status == ProcessStatus::Failed && !core_not_running(&result) => {
                     let detail = result.stderr.lines().chain(result.stdout.lines()).rev().find(|line| !line.trim().is_empty()).unwrap_or_default().to_owned();
                     failures.push(format!("hako-cmd {command} が失敗しました。{detail}"));
@@ -688,15 +829,12 @@ pub fn inspect_business_pack_directory(path: String) -> Result<ImportPreview, St
 
 #[tauri::command]
 pub fn apply_import_preview(state: State<'_, AppState>, preview: ImportPreview) -> Result<Workspace, String> {
-    let mut workspace = state.workspace.lock().map_err(|_| "ワークスペースをロックできません。".to_owned())?;
-    workspace.source_directory = Some(preview.source_directory);
-    workspace.assets = preview.assets;
-    workspace.imported_connections = preview.connections;
-    workspace.validate()?;
-    let response = workspace.clone();
-    drop(workspace);
-    state.persist_workspace()?;
-    Ok(response)
+    edit_active_workspace(&state, |workspace| {
+        workspace.source_directory = Some(preview.source_directory);
+        workspace.assets = preview.assets;
+        workspace.imported_connections = preview.connections;
+        Ok(())
+    })
 }
 
 #[tauri::command]
@@ -720,17 +858,17 @@ pub fn save_core_catalog(state: State<'_, AppState>, catalog: CoreCatalog) -> Re
 pub fn install_approved_core(state: State<'_, AppState>, version: String) -> Result<CoreInstallResult, String> {
     let catalog = load_catalog(&state.catalog_path).map_err(|error| error.to_string())?;
     let result = install_core(&catalog, &version, &state.data_directory).map_err(|error| error.to_string())?;
-    {
-        let mut workspace = state.workspace.lock().map_err(|_| "ワークスペースをロックできません。".to_owned())?;
-        workspace.core_release = Some(result.selection.clone());
-    }
-    state.persist_workspace()?;
+    let selection = result.selection.clone();
+    edit_active_workspace(&state, |workspace| {
+        workspace.core_release = Some(selection);
+        Ok(())
+    })?;
     Ok(result)
 }
 
 #[tauri::command]
 pub fn ingest_bridge_monitor_line(state: State<'_, AppState>, connection_id: String, line: String) -> Result<(), String> {
-    let exists = state.workspace.lock().map_err(|_| "ワークスペースをロックできません。".to_owned())?.imported_connections.iter().any(|connection| connection.id == connection_id);
+    let exists = state.run_workspace()?.imported_connections.iter().any(|connection| connection.id == connection_id);
     if !exists { return Err("接続定義が見つかりません。".to_owned()); }
     state.monitor.record_bridge_monitor_line(&connection_id, &line);
     Ok(())
@@ -738,7 +876,7 @@ pub fn ingest_bridge_monitor_line(state: State<'_, AppState>, connection_id: Str
 
 #[tauri::command]
 pub fn record_manual_communication_event(state: State<'_, AppState>, connection_id: String, message: String) -> Result<(), String> {
-    let exists = state.workspace.lock().map_err(|_| "ワークスペースをロックできません。".to_owned())?.imported_connections.iter().any(|connection| connection.id == connection_id);
+    let exists = state.run_workspace()?.imported_connections.iter().any(|connection| connection.id == connection_id);
     if !exists { return Err("接続定義が見つかりません。".to_owned()); }
     state.monitor.record(CommunicationEvent { id: Uuid::new_v4().to_string(), connection_id, observed_at: Utc::now(), direction: EventDirection::Bidirectional, event_type: CommunicationEventType::Heartbeat, pdu_name: None, byte_count: None, message, source: ObservationSource::Manual });
     Ok(())
@@ -750,7 +888,7 @@ fn harvest_monitor_logs(state: &AppState, workspace: &Workspace, processes: &[cr
         if !matches!(asset.role, crate::types::AssetRole::Bridge | crate::types::AssetRole::Monitor) {
             continue;
         }
-        for connection in monitor_targets(asset, &workspace.imported_connections) {
+        for connection in monitor_targets(asset, &workspace.assets, &workspace.imported_connections) {
             for (index, line) in process.stdout_tail.iter().enumerate() {
                 state.monitor.record_bridge_process_line(&connection.id, &process.id, "stdout", index, line);
             }
@@ -768,15 +906,20 @@ fn harvest_monitor_logs(state: &AppState, workspace: &Workspace, processes: &[cr
 /// Launcher JSONのパスしか入れず`endpoint_config`にはendpoint/bridge JSONのパスしか
 /// 入れないため恒常的に成立しなかったので落とした。Bridge名の一致は、解決結果を
 /// 持たない古いworkspace.jsonのための後方互換として残す。
+/// `asset` のログを流し込む接続。解決済みの所有者が一致するもの。解決結果を持たない古い
+/// 接続には Bridge 名の一致も使うが、同じ名前のアセットが複数あればどちらとも決めない。
 fn monitor_targets<'a>(
     asset: &AssetDefinition,
+    assets: &[AssetDefinition],
     connections: &'a [crate::types::ConnectionDefinition],
 ) -> Vec<&'a crate::types::ConnectionDefinition> {
+    // linking と同じく、前後の空白を除いた名前で一意かを見る。
+    let unique_name = assets.iter().filter(|candidate| candidate.name.trim() == asset.name.trim()).count() == 1;
     connections
         .iter()
         .filter(|connection| {
             connection.owner_asset_id.as_deref() == Some(asset.id.as_str())
-                || connection.details.get("bridge").map(|bridge| bridge == &asset.name).unwrap_or(false)
+                || (unique_name && connection.owner_asset_id.is_none() && connection.details.get("bridge").map(|bridge| bridge.trim() == asset.name.trim()).unwrap_or(false))
         })
         .collect()
 }
@@ -952,7 +1095,7 @@ mod tests {
         let mut mine = connection("mine");
         mine.owner_asset_id = Some(owner.id.clone());
         let connections = [mine, connection("others")];
-        let matched = monitor_targets(&owner, &connections);
+        let matched = monitor_targets(&owner, std::slice::from_ref(&owner), &connections);
         assert_eq!(matched.len(), 1);
         assert_eq!(matched[0].id, "mine");
     }
@@ -967,7 +1110,7 @@ mod tests {
         candidate.endpoint_config = Some("/recipe/endpoint_a.json".to_owned());
         let connections = [candidate];
         assert!(
-            monitor_targets(&owner, &connections).is_empty(),
+            monitor_targets(&owner, std::slice::from_ref(&owner), &connections).is_empty(),
             "解決を経ずに設定ファイルの一致だけで帰属させています。"
         );
     }
@@ -978,7 +1121,20 @@ mod tests {
         let owner = asset("pdu-bridge", vec![]);
         let mut legacy = connection("legacy");
         legacy.details.insert("bridge".to_owned(), "pdu-bridge".to_owned());
-        assert_eq!(monitor_targets(&owner, &[legacy]).len(), 1);
+        assert_eq!(monitor_targets(&owner, std::slice::from_ref(&owner), &[legacy.clone()]).len(), 1);
+    }
+
+    /// 同じ名前のアセットが 2 つあると、Bridge 名ではどちらにも割り当てない。
+    #[test]
+    fn monitor_targets_skip_the_bridge_name_when_ambiguous() {
+        let first = asset("pdu-bridge", vec![]);
+        let mut second = asset(" pdu-bridge ", vec![]);
+        second.id = "second-bridge".to_owned();
+        let mut legacy = connection("legacy");
+        legacy.details.insert("bridge".to_owned(), "pdu-bridge".to_owned());
+        let assets = [first.clone(), second.clone()];
+        assert!(monitor_targets(&first, &assets, std::slice::from_ref(&legacy)).is_empty());
+        assert!(monitor_targets(&second, &assets, std::slice::from_ref(&legacy)).is_empty());
     }
 
     fn flock_with(name: &str, counter: i32) -> std::path::PathBuf {

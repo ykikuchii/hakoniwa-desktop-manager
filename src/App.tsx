@@ -73,6 +73,35 @@ export default function App() {
     await run(async () => setPreview(await api.inspectDirectory(selection)), "構成を解析しました。内容を確認して適用してください。");
   }
 
+  async function importV1() {
+    const selection = await open({ directory: false, multiple: false, title: "v1 の workspace.json を選択", filters: [{ name: "JSON", extensions: ["json"] }] });
+    if (typeof selection !== "string") return;
+    const replace = window.confirm("同じ出所から取り込んだプロジェクトがあれば、置き換えますか？\n［キャンセル］を選ぶと、新しいプロジェクトとして取り込みます。");
+    setSelectedAssetId(null);
+    setDraftAsset(null);
+    setSelectedConnectionId(null);
+    setPreview(null);
+    await run(() => api.importV1Workspace(selection, replace), "v1 のワークスペースを取り込みました。");
+  }
+
+  function switchProject(projectId: string) {
+    setSelectedAssetId(null);
+    setDraftAsset(null);
+    setSelectedConnectionId(null);
+    setPreview(null);
+    void run(() => api.selectProject(projectId), "プロジェクトを切り替えました。");
+  }
+
+  function addProject() {
+    const name = window.prompt("新しいプロジェクトの名前");
+    if (!name?.trim()) return;
+    setSelectedAssetId(null);
+    setDraftAsset(null);
+    setSelectedConnectionId(null);
+    setPreview(null);
+    void run(() => api.createProject(name), "プロジェクトを作りました。");
+  }
+
   async function upsertAsset(asset: AssetDefinition) {
     await run(async () => {
       if (workspace?.assets.some((candidate) => candidate.id === asset.id)) await api.updateAsset(asset);
@@ -116,18 +145,28 @@ export default function App() {
       </aside>
       <main className="main-content">
         <header className="topbar">
-          <div><p className="eyebrow">WORKSPACE</p><h1>{workspace.name}</h1></div>
+          <div>
+            <p className="eyebrow">PROJECT</p>
+            <div className="project-switcher">
+              <select aria-label="プロジェクト" value={snapshot.active_project_id} disabled={busy || !!snapshot.running_project_id} title={snapshot.running_project_id ? "実行中は切り替えられません。すべて停止してください。" : undefined} onChange={(event) => switchProject(event.target.value)}>
+                {snapshot.projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}
+              </select>
+              <button className="button subtle small" disabled={busy || !!snapshot.running_project_id} onClick={addProject}>新規</button>
+              {snapshot.running_project_id && <span className="muted">実行中</span>}
+            </div>
+          </div>
           <div className="top-actions">
             <button className="button secondary" disabled={busy} onClick={() => void run(() => api.stopAll(), "すべての管理対象プロセスを停止しました。")}>すべて停止</button>
             <button className="button primary" disabled={busy} onClick={() => void run(() => api.startAll(), "Coreと有効なアセットの起動を開始しました。")}>一括起動</button>
           </div>
         </header>
+        {snapshot.store_warnings.length > 0 && <div className="banner error"><div>{snapshot.store_warnings.map((warning, index) => <p key={index}>{warning}</p>)}</div><button onClick={() => void run(() => api.clearStoreWarnings(), "")}>閉じる</button></div>}
         {(notice || error) && <div className={error ? "banner error" : "banner"}><span>{error || notice}</span><button onClick={() => { setError(""); setNotice(""); }}>閉じる</button></div>}
         {tab === "dashboard" && <Dashboard snapshot={snapshot} activeCore={activeCore?.status ?? "unknown"} onStartCore={() => void run(api.startCore, "Coreコントローラーを起動しました。")} onStopCore={() => void run(api.stopCore, "Coreコントローラーを停止しました。")} onLifecycle={(command) => void run(async () => { const result = await api.runLifecycle(command); if (result.status === "failed") throw new Error(result.stderr || "hako-cmdが失敗しました。"); }, `hako-cmd ${command} を実行しました。`)} onAssetClick={(id) => { setSelectedAssetId(id); setTab("assets"); }} onConnectionClick={(id) => { setSelectedConnectionId(id); setTab("topology"); }} />}
-        {tab === "assets" && <AssetsPage workspace={workspace} processes={snapshot.processes} selected={selectedAsset} draft={draftAsset} busy={busy} onSelect={selectAsset} onSave={upsertAsset} onDelete={removeAsset} onStart={(id) => void run(() => api.startAsset(id), "アセットを起動しました。")} onStop={(id) => void run(() => api.stopAsset(id), "アセットを停止しました。")} onCreate={createDraftAsset} />}
+        {tab === "assets" && <AssetsPage key={workspace.id} workspace={workspace} processes={snapshot.processes} selected={selectedAsset} draft={draftAsset} busy={busy} onSelect={selectAsset} onSave={upsertAsset} onDelete={removeAsset} onStart={(id) => void run(() => api.startAsset(id), "アセットを起動しました。")} onStop={(id) => void run(() => api.stopAsset(id), "アセットを停止しました。")} onCreate={createDraftAsset} />}
         {tab === "topology" && <TopologyPage snapshot={snapshot} selected={selectedConnection} onSelect={setSelectedConnectionId} onHeartbeat={(id) => void run(() => api.recordHeartbeat(id, "ユーザー操作による確認イベント"), "通信確認イベントを記録しました。")} />}
-        {tab === "core" && <CorePage workspace={workspace} catalog={catalog} activeCore={activeCore?.status ?? "unknown"} busy={busy} onSaveWorkspace={(next) => void run(() => api.saveWorkspace(next), "Core設定を保存しました。")} onInstall={(version) => void run(() => api.installCore(version), "Coreを検証して導入しました。")} onStart={() => void run(api.startCore, "Coreコントローラーを起動しました。")} onStop={() => void run(api.stopCore, "Coreコントローラーを停止しました。")} />}
-        {tab === "workspace" && <WorkspacePage workspace={workspace} preview={preview} onChoose={() => void chooseDirectory()} onApply={() => preview && void run(() => api.applyPreview(preview), "インポート結果をワークスペースへ適用しました。")} onSave={(next) => void run(() => api.saveWorkspace(next), "ワークスペースを保存しました。")} />}
+        {tab === "core" && <CorePage key={workspace.id} workspace={workspace} catalog={catalog} activeCore={activeCore?.status ?? "unknown"} busy={busy} onSaveWorkspace={(next) => void run(() => api.saveWorkspace(next), "Core設定を保存しました。")} onInstall={(version) => void run(() => api.installCore(version), "Coreを検証して導入しました。")} onStart={() => void run(api.startCore, "Coreコントローラーを起動しました。")} onStop={() => void run(api.stopCore, "Coreコントローラーを停止しました。")} />}
+        {tab === "workspace" && <WorkspacePage key={workspace.id} workspace={workspace} busy={busy} preview={preview} onChoose={() => void chooseDirectory()} onImportV1={() => void importV1()} onApply={() => preview && void run(() => api.applyPreview(preview), "インポート結果をワークスペースへ適用しました。")} onSave={(next) => void run(() => api.saveWorkspace(next), "ワークスペースを保存しました。")} />}
       </main>
     </div>
   );
@@ -165,9 +204,9 @@ function CorePage({ workspace, catalog, activeCore, busy, onSaveWorkspace, onIns
   return <section className="core-page"><div className="panel"><div className="panel-heading"><div><p className="eyebrow">APPROVED CORE RELEASES</p><h2>Coreの導入と切替</h2></div><StatusBadge value={activeCore} /></div>{catalog && catalog.releases.length > 0 ? <div className="release-list">{catalog.releases.map((release) => <div className="release" key={release.version}><div><strong>hakoniwa-core-pro {release.version}</strong><small>revision: {release.source_revision} · 承認済みアーティファクト {release.artifacts.length}件</small></div><div>{currentVersion === release.version ? <span className="installed">選択中</span> : <button className="button primary small" disabled={busy} onClick={() => onInstall(release.version)}>検証して導入</button>}</div></div>)}</div> : <div className="empty-state"><strong>承認済みのOS別バイナリが未登録です。</strong><p>公式リリースには現時点でOS別バイナリ配布の整合性情報が揃っていません。リリースCIで生成した署名・SHA-256付きのアーティファクトを、管理者が承認カタログへ追加してください。</p></div>}<p className="security-note">導入時はHTTPS取得、SHA-256照合、zip-slip防止、アトミック配置を行います。検証に失敗した実行ファイルは利用しません。</p></div><div className="panel"><div className="panel-heading"><div><p className="eyebrow">CORE CONTROLLER</p><h2>実行コントローラー</h2></div><div className="button-row"><button className="button subtle" onClick={onStart}>起動</button><button className="button subtle" onClick={onStop}>停止</button></div></div><p className="muted">例: Conductor所有アセットやLauncherを指定します。<code>hako-cmd start</code>は別途ライフサイクル制御として実行されます。</p><div className="form-grid"><Field label="名称"><input value={controller.name} onChange={(event) => setController({ ...controller, name: event.target.value })} /></Field><Field label="実行ファイル / コマンド" wide><input value={controller.command.program} placeholder="例: /path/to/hako-conductor または python3.12" onChange={(event) => setController({ ...controller, command: { ...controller.command, program: event.target.value } })} /></Field><Field label="引数（1行に1個）" wide><textarea value={controller.command.args.join("\n")} onChange={(event) => setController({ ...controller, command: { ...controller.command, args: event.target.value.split("\n").map((value) => value.trim()).filter(Boolean) } })} /></Field><Field label="作業ディレクトリ" wide><input value={controller.command.cwd ?? ""} onChange={(event) => setController({ ...controller, command: { ...controller.command, cwd: event.target.value || null } })} /></Field></div><div className="form-actions"><button className="button primary" disabled={busy} onClick={() => onSaveWorkspace({ ...workspace, core_controller: controller })}>コントローラー設定を保存</button></div></div></section>;
 }
 
-function WorkspacePage({ workspace, preview, onChoose, onApply, onSave }: { workspace: Workspace; preview: ImportPreview | null; onChoose: () => void; onApply: () => void; onSave: (workspace: Workspace) => void }) {
+function WorkspacePage({ workspace, busy, preview, onChoose, onImportV1, onApply, onSave }: { workspace: Workspace; busy: boolean; preview: ImportPreview | null; onChoose: () => void; onImportV1: () => void; onApply: () => void; onSave: (workspace: Workspace) => void }) {
   const [name, setName] = useState(workspace.name);
-  return <section className="workspace-page"><div className="panel"><div className="panel-heading"><div><p className="eyebrow">BUSINESS PACK IMPORT</p><h2>設定ディレクトリを取り込む</h2></div><button className="button primary" onClick={onChoose}>ディレクトリを選択</button></div><p className="muted">Launcherのassets、Endpointのtransport、Bridgeの経路を読み取り、ワークスペースへ反映します。元ファイルは変更しません。</p>{preview && <div className="import-preview"><div className="metric-row"><Metric label="検出ファイル" value={preview.discovered_files.length} hint="JSON設定" /><Metric label="アセット" value={preview.assets.length} hint="Launcher assets[]" /><Metric label="接続" value={preview.connections.length} hint="Endpoint / Bridge" /><Metric label="注意" value={preview.warnings.length} hint="確認が必要" /></div><div className="warning-list">{preview.warnings.map((warning) => <p key={warning}>{warning}</p>)}</div><div className="form-actions"><button className="button primary" onClick={onApply}>この結果を適用</button></div></div>}</div><div className="panel"><div className="panel-heading"><div><p className="eyebrow">WORKSPACE</p><h2>ローカル保存設定</h2></div></div><div className="form-grid"><Field label="ワークスペース名" wide><input value={name} onChange={(event) => setName(event.target.value)} /></Field><Field label="取込元ディレクトリ" wide><input value={workspace.source_directory ?? "未設定"} disabled /></Field></div><div className="form-actions"><button className="button primary" onClick={() => onSave({ ...workspace, name })}>保存</button></div></div></section>;
+  return <section className="workspace-page"><div className="panel"><div className="panel-heading"><div><p className="eyebrow">BUSINESS PACK IMPORT</p><h2>設定ディレクトリを取り込む</h2></div><button className="button primary" onClick={onChoose}>ディレクトリを選択</button></div><p className="muted">Launcherのassets、Endpointのtransport、Bridgeの経路を読み取り、ワークスペースへ反映します。元ファイルは変更しません。</p>{preview && <div className="import-preview"><div className="metric-row"><Metric label="検出ファイル" value={preview.discovered_files.length} hint="JSON設定" /><Metric label="アセット" value={preview.assets.length} hint="Launcher assets[]" /><Metric label="接続" value={preview.connections.length} hint="Endpoint / Bridge" /><Metric label="注意" value={preview.warnings.length} hint="確認が必要" /></div><div className="warning-list">{preview.warnings.map((warning) => <p key={warning}>{warning}</p>)}</div><div className="form-actions"><button className="button primary" onClick={onApply}>この結果を適用</button></div></div>}</div><div className="panel"><div className="panel-heading"><div><p className="eyebrow">V1 WORKSPACE</p><h2>v1 の workspace.json を取り込む</h2></div><button className="button secondary" onClick={onImportV1}>ファイルを選択</button></div><p className="muted">以前の形式（workspace.json）の構成を、プロジェクトとして取り込みます。同じ出所のプロジェクトは置き換えるか、新しいプロジェクトとして足すかを選べます。</p></div><div className="panel"><div className="panel-heading"><div><p className="eyebrow">PROJECT</p><h2>プロジェクトの設定</h2></div></div><div className="form-grid"><Field label="プロジェクト名" wide><input value={name} onChange={(event) => setName(event.target.value)} /></Field><Field label="取込元ディレクトリ" wide><input value={workspace.source_directory ?? "未設定"} disabled /></Field></div><div className="form-actions"><button className="button primary" disabled={busy} onClick={() => onSave({ ...workspace, name })}>保存</button></div></div></section>;
 }
 
 function Metric({ label, value, hint }: { label: string; value: string | number; hint: string }) { return <div className="metric"><span>{label}</span><strong>{value}</strong><small>{hint}</small></div>; }

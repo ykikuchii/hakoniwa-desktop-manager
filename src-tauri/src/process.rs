@@ -187,7 +187,8 @@ impl ProcessManager {
                 .get_mut(process_id)
                 .ok_or_else(|| ProcessError::NotFound(process_id.to_owned()))?;
             refresh(managed);
-            if !matches!(managed.snapshot.status, ProcessStatus::Running | ProcessStatus::Starting) {
+            // 状態が分からないものも、生きているかもしれないので止めにいく。
+            if !matches!(managed.snapshot.status, ProcessStatus::Running | ProcessStatus::Starting | ProcessStatus::Unknown) {
                 return Ok(managed.snapshot.clone());
             }
             managed.snapshot.status = ProcessStatus::Stopping;
@@ -221,6 +222,16 @@ impl ProcessManager {
             .ok_or_else(|| ProcessError::NotFound(process_id.to_owned()))?;
         refresh(managed);
         Ok(managed.snapshot.clone())
+    }
+
+    /// 終了を確かめたプロセスの記録を消す。動いているものと、状態が分からない（Unknown）
+    /// ものは残す。Unknown を消すと、生きているかもしれないプロセスを管理から外してしまう。
+    pub fn forget_finished(&self) {
+        let mut processes = self.lock_processes();
+        for managed in processes.values_mut() {
+            refresh(managed);
+        }
+        processes.retain(|_, managed| matches!(managed.snapshot.status, ProcessStatus::Starting | ProcessStatus::Running | ProcessStatus::Stopping | ProcessStatus::Unknown));
     }
 
     pub fn stop_owner(&self, owner_id: &str) -> StopReport {
@@ -450,13 +461,16 @@ fn finish_line(mut bytes: Vec<u8>, truncated: bool) -> String {
 }
 
 fn refresh(managed: &mut ManagedProcess) {
-    if matches!(managed.snapshot.status, ProcessStatus::Starting | ProcessStatus::Running) {
+    // Unknown も確かめ直す。終了が分かれば確定させ、動いていれば Running に戻す。
+    if matches!(managed.snapshot.status, ProcessStatus::Starting | ProcessStatus::Running | ProcessStatus::Unknown) {
         match managed.child.try_wait() {
             Ok(Some(status)) => finalize(managed, status),
             Ok(None) => managed.snapshot.status = ProcessStatus::Running,
             Err(error) => {
+                if managed.snapshot.status != ProcessStatus::Unknown {
+                    managed.diagnostics.push(format!("状態確認エラー: {error}"));
+                }
                 managed.snapshot.status = ProcessStatus::Unknown;
-                managed.diagnostics.push(format!("状態確認エラー: {error}"));
             }
         }
     }

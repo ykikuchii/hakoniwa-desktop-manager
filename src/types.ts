@@ -120,6 +120,16 @@ export interface WorkspaceSnapshot {
   processes: ProcessSnapshot[];
   connections: ConnectionSnapshot[];
   recent_events: CommunicationEvent[];
+  projects: ProjectSummary[];
+  active_project_id: string;
+  /** 実行中のプロジェクト。実行中は切り替えも変更もできない。 */
+  running_project_id?: string | null;
+  store_warnings: string[];
+}
+
+export interface ProjectSummary {
+  id: string;
+  name: string;
 }
 
 export interface ImportPreview {
