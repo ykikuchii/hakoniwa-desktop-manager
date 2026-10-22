@@ -103,6 +103,8 @@ pub fn start_asset(state: State<'_, AppState>, asset_id: String) -> Result<crate
     // 一括起動と切り離して、実行中に後から足したり差し替えたりするアセットのため。
     // ただし一括起動・一括停止の最中は断る。一括停止が通り過ぎた後に起動して止めた
     // はずのものが残ったり、一括起動と二重に起動したりするため。
+    // 確認からプロセスの登録まで `lifecycle_gate` を持ち、一括操作の開始と重ならないようにする。
+    let _gate = state.lifecycle_gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if state.start_all_running.load(Ordering::Acquire) || state.stop_all_running.load(Ordering::Acquire) {
         return Err("一括起動または一括停止の実行中は、アセットを単独で起動できません。".to_owned());
     }
@@ -481,10 +483,14 @@ impl Drop for StartAllGuard<'_> {
 // 走り UI を止めるため、async 指定でワーカースレッドに逃がす。
 #[tauri::command(async)]
 pub fn start_all(state: State<'_, AppState>) -> Result<Vec<crate::types::ProcessSnapshot>, String> {
+    // フラグを立てるまで `lifecycle_gate` を持つ。単独起動の途中なら、その登録が
+    // 終わってからここに来るので、下の稼働中の確認で見落とさない。
+    let gate = state.lifecycle_gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if state.start_all_running.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
         return Err("一括起動は既に実行中です。".to_owned());
     }
     let _guard = StartAllGuard(&state.start_all_running);
+    drop(gate);
     // フラグを立てた後に確認する。立てる前に確認すると、その隙に始まった停止を
     // 見落とす。停止側は起動のフラグが下りるまで待つので、どちらかが必ず譲る。
     if state.stop_all_running.load(Ordering::Acquire) {
@@ -542,7 +548,12 @@ pub fn start_all(state: State<'_, AppState>) -> Result<Vec<crate::types::Process
 // 走り、その間 UI が固まるため async 指定でワーカースレッドに逃がす。
 #[tauri::command(async)]
 pub fn stop_all(state: State<'_, AppState>) -> Result<Vec<crate::types::ProcessSnapshot>, String> {
-    state.stop_all_running.store(true, Ordering::Release);
+    {
+        // 単独起動の途中なら、その登録が終わってからフラグを立てる。下の停止で
+        // そのプロセスも止める対象に入る。
+        let _gate = state.lifecycle_gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.stop_all_running.store(true, Ordering::Release);
+    }
     let _guard = StopAllGuard(&state);
     // 進行中の一括起動を止めてから停止する。止めないと、停止が通り過ぎた後で
     // 起動側が残りのアセットを起動し、停止したはずのものが動き続ける。
@@ -715,6 +726,27 @@ fn topological_order(assets: &[AssetDefinition]) -> Result<Vec<AssetDefinition>,
             ));
         }
     }
+    // 一括起動は起動タイミングの段階ごと（before_start → manual → after_start）に進み、
+    // 段階の中だけを依存順に並べる。後の段階のアセットに依存すると、依存元が先に
+    // 起動してしまい依存が満たせないので、何かを起動する前に拒否する。
+    let phase = |timing: &ActivationTiming| match timing {
+        ActivationTiming::BeforeStart => (0, "before_start"),
+        ActivationTiming::Manual => (1, "manual"),
+        ActivationTiming::AfterStart => (2, "after_start"),
+    };
+    for asset in enabled.values() {
+        for dependency in asset.depends_on.iter().chain(asset.optional_depends_on.iter()) {
+            let Some(target) = enabled.get(dependency.as_str()) else { continue };
+            let (own_rank, own_label) = phase(&asset.activation_timing);
+            let (target_rank, target_label) = phase(&target.activation_timing);
+            if target_rank > own_rank {
+                return Err(format!(
+                    "「{}」（{own_label}）は、後の段階で起動する「{}」（{target_label}）に依存しています。一括起動は before_start → manual → after_start の順に進むため、この依存は満たせません。起動タイミングか依存先を見直してください。",
+                    asset.name, target.name
+                ));
+            }
+        }
+    }
     // 任意の依存先は、対象外なら順序の制約にしない。ワークスペースに無い ID への
     // 依存は、必須・任意とも未解決参照として扱う。
     let excluded: BTreeSet<&str> = assets.iter().filter(|asset| !asset.enabled).map(|asset| asset.id.as_str()).collect();
@@ -778,6 +810,28 @@ mod tests {
         excluded.enabled = false;
         let error = topological_order(&[asset("pilot", vec!["viewer-b"]), excluded]).unwrap_err();
         assert!(error.contains("pilot") && error.contains("viewer-b"), "{error}");
+    }
+
+    /// 後の段階で起動するアセットへの依存は、必須・任意とも拒否する。同じ段階や前の段階なら通す。
+    #[test]
+    fn start_all_order_rejects_dependencies_on_later_phases() {
+        let mut early = asset("early", vec!["late"]);
+        early.activation_timing = ActivationTiming::BeforeStart;
+        let mut late = asset("late", vec![]);
+        late.activation_timing = ActivationTiming::AfterStart;
+        let error = topological_order(&[early.clone(), late.clone()]).unwrap_err();
+        assert!(error.contains("early") && error.contains("late"), "{error}");
+
+        early.depends_on.clear();
+        early.optional_depends_on = vec!["late".to_owned()];
+        assert!(topological_order(&[early.clone(), late.clone()]).is_err());
+
+        let mut after = asset("after", vec!["early"]);
+        after.activation_timing = ActivationTiming::AfterStart;
+        early.optional_depends_on.clear();
+        let order = topological_order(&[after, early]).unwrap();
+        let ids: Vec<&str> = order.iter().map(|asset| asset.id.as_str()).collect();
+        assert_eq!(ids, vec!["early", "after"]);
     }
 
     /// ワークスペースに無い ID への依存は、必須・任意とも拒否する。
