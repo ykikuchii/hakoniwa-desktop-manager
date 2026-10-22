@@ -43,7 +43,7 @@ pub struct RunContext {
 
 impl AppState {
     pub fn new() -> Self {
-        let data_directory = dirs::data_local_dir().unwrap_or_else(std::env::temp_dir).join("HakoniwaDesktopManager");
+        let data_directory = data_directory();
         let catalog_path = data_directory.join("approved-core-catalog.json");
         let _ = fs::create_dir_all(&data_directory);
         ensure_default_catalog(&catalog_path);
@@ -170,6 +170,17 @@ impl AppState {
         self.processes.forget_finished();
         self.monitor.reset();
         Ok(())
+    }
+}
+
+/// 保存場所を指定する環境変数。試験で利用者の保存場所に触れずに動かすためと、
+/// 持ち運び用の構成のために使う。
+pub const DATA_DIR_VARIABLE: &str = "HAKONIWA_DESKTOP_MANAGER_DATA_DIR";
+
+fn data_directory() -> PathBuf {
+    match std::env::var_os(DATA_DIR_VARIABLE) {
+        Some(value) if !value.is_empty() => PathBuf::from(value),
+        _ => dirs::data_local_dir().unwrap_or_else(std::env::temp_dir).join("HakoniwaDesktopManager"),
     }
 }
 
