@@ -138,6 +138,10 @@ pub struct Acceptance {
     pub revision: String,
     pub manifest: Vec<FileDigest>,
     pub accepted_at: DateTime<Utc>,
+    /// 承認したときに PDU 設定の入口があったか。後で入口がなくなったことを、
+    /// manifest（ほかの監視ファイルも含む）から推し量らずに判断するため。
+    #[serde(default)]
+    pub had_pdu_entries: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

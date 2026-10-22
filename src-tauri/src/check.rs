@@ -214,8 +214,9 @@ fn evaluate(member: &Member, asset: &LibraryAsset) -> Result<Evaluated, String> 
         (AcceptanceState::Unverified, Vec::new())
     } else if entries.is_empty() {
         // 承認したときには PDU 設定があったのに、今は見つからない。変化として扱う。
+        // 承認した内容のままなら（PDU 設定がもともとない場合も含めて）対象外にする。
         match &member.accepted {
-            Some(accepted) if !accepted.manifest.is_empty() => (AcceptanceState::Changed, describe_changes(accepted, &manifest)),
+            Some(accepted) if accepted.revision != revision && accepted.had_pdu_entries => (AcceptanceState::Changed, describe_changes(accepted, &manifest)),
             _ => (AcceptanceState::NoPduConfig, Vec::new()),
         }
     } else {
@@ -282,7 +283,8 @@ fn accept_revisions(project: &mut Project, library: &Library, wanted: Vec<(Strin
         if shown.as_ref().is_some_and(|shown| shown != &evaluated.check.revision) {
             return Err(format!("{} の内容が、表示した後に変わっています。接続チェックを見直してから承認してください。", evaluated.check.name));
         }
-        accepted.push((id, Acceptance { revision: evaluated.check.revision, manifest: evaluated.check.manifest, accepted_at: Utc::now() }));
+        let had_pdu_entries = !evaluated.check.entries.is_empty();
+        accepted.push((id, Acceptance { revision: evaluated.check.revision, manifest: evaluated.check.manifest, accepted_at: Utc::now(), had_pdu_entries }));
     }
     for (id, acceptance) in accepted {
         if let Some(member) = project.members.iter_mut().find(|member| member.id == id) {
@@ -448,6 +450,31 @@ mod tests {
         let shown: BTreeMap<String, String> = check_project(&project, &library).unwrap().members.iter().map(|m| (m.member_id.clone(), m.revision.clone())).collect();
         accept_shown(&mut project, &library, &shown).unwrap();
         assert!(check_project(&project, &library).unwrap().blocking_reasons().is_empty());
+    }
+
+    /// PDU 設定がなく、監視するファイル（extra_inputs）だけを持つメンバーは、承認しても
+    /// 「変更あり」のまま残らない。
+    #[test]
+    fn extra_inputs_without_pdu_entries_do_not_stay_changed() {
+        let (dir, mut project, mut library) = project("check-extra");
+        std::fs::write(dir.join("script.py"), b"PDU_SIZE = 136").unwrap();
+        let sim = &mut library.get_mut("asset-sim").unwrap().variants[0];
+        sim.config_files = vec!["other.json".to_owned()];
+        sim.extra_inputs = vec!["script.py".to_owned()];
+        accept_all(&mut project, &library).unwrap();
+        let check = check_project(&project, &library).unwrap();
+        assert_eq!(check.members[1].acceptance, AcceptanceState::NoPduConfig);
+        assert!(check.blocking_reasons().is_empty(), "{:?}", check.blocking_reasons());
+    }
+
+    /// 読めない入口を承認した後に、その入口を外しても、変化として止める。
+    #[test]
+    fn removing_an_unreadable_entry_after_acceptance_is_a_change() {
+        let (dir, mut project, mut library) = project("check-unreadable-removed");
+        std::fs::remove_file(dir.join("sim.json")).unwrap();
+        accept_all(&mut project, &library).unwrap();
+        library.get_mut("asset-sim").unwrap().variants[0].config_files = vec!["other.json".to_owned()];
+        assert_eq!(check_project(&project, &library).unwrap().members[1].acceptance, AcceptanceState::Changed);
     }
 
     /// WSL で動くメンバーは確かめず、一括起動は止めない。そのメンバーが登録しうるチャネルの

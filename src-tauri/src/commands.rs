@@ -874,22 +874,37 @@ pub fn check_project(state: State<'_, AppState>) -> Result<crate::check::Project
 /// アクティブでないか、表示した後に内容が変わっていれば拒否する。実行中も拒否する。
 #[tauri::command(async)]
 pub fn accept_member_changes(state: State<'_, AppState>, project_id: String, revisions: BTreeMap<String, String>) -> Result<crate::check::ProjectCheck, String> {
+    const SWITCHED: &str = "表示中のプロジェクトが切り替わっています。接続チェックを見直してから承認してください。";
     if state.lock_store()?.active_project_id() != project_id {
-        return Err("表示中のプロジェクトが切り替わっています。接続チェックを見直してから承認してください。".to_owned());
+        return Err(SWITCHED.to_owned());
     }
-    let _gate = state.ensure_mutable(&project_id)?;
-    let mut store = state.lock_store()?;
-    if store.active_project_id() != project_id {
-        return Err("表示中のプロジェクトが切り替わっています。接続チェックを見直してから承認してください。".to_owned());
+    // ファイルはロックの外で読む。読んでいる間にロックを持つと、画面の更新（ゲートを
+    // 取る get_snapshot）まで待たされる。
+    let (snapshot, library) = check_snapshot(&state, Some(project_id.clone()))?;
+    let mut accepted = snapshot.clone();
+    crate::check::accept_shown(&mut accepted, &library, &revisions)?;
+    {
+        let _gate = state.ensure_mutable(&project_id)?;
+        let mut store = state.lock_store()?;
+        if store.active_project_id() != project_id {
+            return Err(SWITCHED.to_owned());
+        }
+        // 読んでいる間にプロジェクトかそのアセットが変わっていれば、承認しない。
+        let unchanged = store.projects.get(&project_id).is_some_and(|current| serde_json::to_value(current).ok() == serde_json::to_value(&snapshot).ok())
+            && library.iter().all(|(id, asset)| store.library.get(id).is_some_and(|current| serde_json::to_value(current).ok() == serde_json::to_value(asset).ok()));
+        if !unchanged {
+            return Err("承認している間にプロジェクトが変わりました。接続チェックを見直してから承認してください。".to_owned());
+        }
+        let draft = store.draft();
+        store.commit(draft, accepted)?;
     }
-    store.accept_shown(&project_id, &revisions)?;
-    drop(store);
     let (project, library) = check_snapshot(&state, Some(project_id))?;
     crate::check::check_project(&project, &library)
 }
 
 /// ライブラリのアセットをメンバーとして足したら、接続チェックがどうなるかを返す。保存しない。
-#[tauri::command]
+// ファイルを読むので、UI を止めないよう async にする。
+#[tauri::command(async)]
 pub fn preview_add_member(state: State<'_, AppState>, asset_id: String, variant_id: String, member_id: String) -> Result<crate::check::ProjectCheck, String> {
     let (project, mut library) = check_snapshot(&state, None)?;
     if let Some(asset) = state.lock_store()?.library.get(&asset_id) {

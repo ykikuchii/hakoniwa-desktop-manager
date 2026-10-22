@@ -259,12 +259,6 @@ impl Store {
         self.commit(self.draft(), project)
     }
 
-    /// 画面が表示していた revision で承認して保存する。どれかが今の内容と違えば何もしない。
-    pub fn accept_shown(&mut self, project_id: &str, shown: &BTreeMap<String, String>) -> Result<(), String> {
-        let mut project = self.projects.get(project_id).cloned().ok_or_else(|| "そのプロジェクトはありません。".to_owned())?;
-        crate::check::accept_shown(&mut project, &self.library, shown)?;
-        self.commit(self.draft(), project)
-    }
 
     pub fn draft(&self) -> LibraryDraft {
         LibraryDraft { library: self.library.clone(), writes: Vec::new(), superseded: Vec::new() }

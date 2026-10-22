@@ -35,6 +35,9 @@ export default function App() {
   // 接続チェックはファイルを読むので、概要を開いているときだけ確かめる。
   const tabRef = useRef<Tab>("dashboard");
   tabRef.current = tab;
+  // 接続チェックの問い合わせの世代。切り替えのたびに進め、古い問い合わせの結果
+  // （成功も失敗も）は捨てる。同じプロジェクトでも、後から出した問い合わせを優先する。
+  const checkGeneration = useRef(0);
   const [checkError, setCheckError] = useState<string>("");
 
   const refresh = async () => {
@@ -46,9 +49,10 @@ export default function App() {
       // だけを使う（切り替えの前に出した問い合わせの結果は捨てる）。
       if (tabRef.current === "dashboard") {
         const shownProject = next.running_project_id ?? next.active_project_id;
+        const generation = ++checkGeneration.current;
         api.checkProject().then(
-          (result) => { if (result.project_id === shownProject) { setCheck(result); setCheckError(""); } },
-          (reason) => { setCheck(null); setCheckError(messageOf(reason)); },
+          (result) => { if (generation === checkGeneration.current && result.project_id === shownProject) { setCheck(result); setCheckError(""); } },
+          (reason) => { if (generation === checkGeneration.current) { setCheck(null); setCheckError(messageOf(reason)); } },
         );
       }
     } catch (reason) {
@@ -97,6 +101,7 @@ export default function App() {
     setSelectedConnectionId(null);
     setPreview(null);
     setCheck(null);
+    checkGeneration.current++;
     await run(() => api.importV1Workspace(selection, replace), "v1 のワークスペースを取り込みました。");
   }
 
@@ -106,6 +111,7 @@ export default function App() {
     setSelectedConnectionId(null);
     setPreview(null);
     setCheck(null);
+    checkGeneration.current++;
     void run(() => api.selectProject(projectId), "プロジェクトを切り替えました。");
   }
 
@@ -117,6 +123,7 @@ export default function App() {
     setSelectedConnectionId(null);
     setPreview(null);
     setCheck(null);
+    checkGeneration.current++;
     void run(() => api.createProject(name), "プロジェクトを作りました。");
   }
 
