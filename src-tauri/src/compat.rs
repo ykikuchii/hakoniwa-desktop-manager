@@ -80,7 +80,7 @@ pub fn check(members: &[MemberPorts], project_hako_config_path: Option<&str>) ->
         }
         if let Some(project) = project_hako_config_path {
             match member.hako_config_path.as_deref() {
-                Some(own) if own != project => push(
+                Some(own) if !same_path(own, project) => push(
                     Severity::Error,
                     "core_namespace_mismatch",
                     vec![member.member_id.clone()],
@@ -135,36 +135,50 @@ pub fn check(members: &[MemberPorts], project_hako_config_path: Option<&str>) ->
         }
     }
 
-    // 同じ robot の中で、1 つの名前が複数のチャネルを指している。
-    let mut by_name: BTreeMap<(String, String), (BTreeSet<i64>, Vec<&MemberPorts>)> = BTreeMap::new();
-    for (key, decls) in owners.iter().map(|(k, v)| (k, v.iter().map(|(m, d)| (*m, *d)).collect::<Vec<_>>())).chain(users.iter().map(|(k, v)| (k, v.iter().map(|(m, d, _)| (*m, *d)).collect()))) {
-        for (member, decl) in decls {
-            let entry = by_name.entry((key.0.clone(), decl.org_name.clone())).or_default();
-            entry.0.insert(key.1);
-            entry.1.push(member);
+    // 同じ robot の中で、1 つの名前が複数のチャネルを指している。名前の引き当ては
+    // 設定を読むメンバーごとなので、1 つのメンバーの中で起きれば Error、メンバーを
+    // またいで起きるだけなら（それぞれは一意に引ける）Warning にする。
+    let mut by_name: BTreeMap<(String, String), BTreeMap<&str, BTreeSet<i64>>> = BTreeMap::new();
+    for member in members {
+        let decls = member.ports.registrations.iter().chain(member.ports.access.iter().map(|access| &access.channel));
+        for decl in decls {
+            by_name.entry((decl.robot.clone(), decl.org_name.clone())).or_default().entry(member.member_id.as_str()).or_default().insert(decl.channel_id);
         }
     }
-    for ((robot, name), (channels, decl_members)) in &by_name {
-        if channels.len() > 1 {
+    for ((robot, name), per_member) in &by_name {
+        for (member_id, channels) in per_member {
+            if channels.len() > 1 {
+                push(Severity::Error, "ambiguous_name", vec![(*member_id).to_owned()], None, format!("{robot}/{name}: 同じ名前が複数のチャネル（{}）を指しています", join(channels)));
+            }
+        }
+        let channels: BTreeSet<i64> = per_member.values().flatten().copied().collect();
+        if channels.len() > 1 && per_member.values().all(|own| own.len() == 1) {
             push(
-                Severity::Error,
-                "ambiguous_name",
-                member_ids(decl_members.iter().copied()),
+                Severity::Warning,
+                "name_collision",
+                per_member.keys().map(|id| (*id).to_owned()).collect(),
                 None,
-                format!("{robot}/{name}: 同じ名前が複数のチャネル（{}）を指しています", join(channels)),
+                format!("{robot}/{name}: メンバーによって、同じ名前が別のチャネル（{}）を指しています", join(&channels)),
             );
         }
     }
 
     // 所有と利用。
     for (key, uses) in &users {
-        let others: Vec<_> = uses.iter().filter(|(m, _, _)| !owners.get(key).is_some_and(|o| o.iter().any(|(om, _)| om.member_id == m.member_id))).collect();
         let Some(owned) = owners.get(key) else {
             push(Severity::Error, "no_owner", member_ids(uses.iter().map(|(m, _, _)| *m)), Some(key), format!("{}: どのメンバーもこのチャネルを登録していません", label(key)));
             continue;
         };
         let owner_size = owned.iter().map(|(_, d)| d.pdu_size).min().unwrap_or_default();
-        for (member, decl, _) in &others {
+        // 登録しているメンバーが別の設定で読み書きする場合も比べる。ただし登録そのものと
+        // 同じ宣言（compact の所有者など）は、上の owner_size_mismatch で見ている。
+        // 読みと書きの両方に同じ宣言があっても、1 件にまとめる。
+        let mut sized: BTreeSet<(&str, i64)> = BTreeSet::new();
+        for (member, decl, _) in uses {
+            let registered_as_is = owned.iter().any(|(m, d)| m.member_id == member.member_id && d.pdu_size == decl.pdu_size);
+            if registered_as_is || !sized.insert((member.member_id.as_str(), decl.pdu_size)) {
+                continue;
+            }
             if decl.pdu_size > owner_size {
                 push(
                     Severity::Error,
@@ -230,6 +244,32 @@ pub fn check(members: &[MemberPorts], project_hako_config_path: Option<&str>) ->
 
     findings.sort_by(|a, b| a.severity.cmp(&b.severity).then_with(|| a.code.cmp(&b.code)));
     CompatReport { findings, coverage }
+}
+
+/// 2 つのパスが同じファイルを指すか。表記の違い（区切り文字、`.`・`..`、Windows の
+/// 大文字小文字）を吸収して比べる。シンボリックリンクまでは解決しない。
+fn same_path(a: &str, b: &str) -> bool {
+    normalize_path(a) == normalize_path(b)
+}
+
+fn normalize_path(path: &str) -> String {
+    let unified = path.replace('\\', "/");
+    let mut parts: Vec<&str> = Vec::new();
+    for part in unified.split('/') {
+        match part {
+            "" | "." if !parts.is_empty() => {}
+            ".." if parts.last().is_some_and(|last| *last != ".." && !last.ends_with(':') && !last.is_empty()) => {
+                parts.pop();
+            }
+            _ => parts.push(part),
+        }
+    }
+    let joined = parts.join("/");
+    if cfg!(windows) {
+        joined.to_lowercase()
+    } else {
+        joined
+    }
 }
 
 fn member_ids<'a>(members: impl Iterator<Item = &'a MemberPorts>) -> Vec<String> {
@@ -314,13 +354,25 @@ mod tests {
         assert_eq!(codes(&check(&[owner], Some(CONFIG)), Severity::Error), vec!["owner_size_mismatch"]);
     }
 
-    /// 1 つの名前が 2 つのチャネルを指すと Error。
+    /// 1 つのメンバーの中で、1 つの名前が 2 つのチャネルを指すと Error。
     #[test]
-    fn a_name_mapped_to_two_channels_is_an_error() {
+    fn a_name_mapped_to_two_channels_in_one_member_is_an_error() {
         let dir = scratch("compat-name");
-        let owner = member("owner", ActivationTiming::BeforeStart, vec![(compact_owner(&dir, "Rig", &[(0, "cmd", 136), (1, "attitude", 72)]), Usage::Register)]);
-        let sim = member("sim", ActivationTiming::AfterStart, vec![(legacy(&dir, "sim.json", "Rig", &[(1, "cmd", 72)], &[]), Usage::Attach)]);
-        assert!(codes(&check(&[owner, sim], Some(CONFIG)), Severity::Error).contains(&"ambiguous_name".to_owned()));
+        let owner = member("owner", ActivationTiming::BeforeStart, vec![(compact_owner(&dir, "Rig", &[(0, "cmd", 136), (1, "cmd", 136)]), Usage::Register)]);
+        let report = check(&[owner], Some(CONFIG));
+        assert_eq!(codes(&report, Severity::Error), vec!["ambiguous_name"]);
+        assert_eq!(report.findings[0].members, vec!["owner"]);
+    }
+
+    /// メンバーをまたいで名前の指す先が違うだけなら Warning（それぞれは一意に引ける）。
+    #[test]
+    fn a_name_differing_across_members_is_a_warning() {
+        let dir = scratch("compat-name-cross");
+        let owner = member("owner", ActivationTiming::BeforeStart, vec![(compact_owner(&dir, "Rig", &[(0, "cmd", 136), (1, "attitude", 136)]), Usage::Register)]);
+        let sim = member("sim", ActivationTiming::AfterStart, vec![(legacy(&dir, "sim.json", "Rig", &[(1, "cmd", 136)], &[]), Usage::Attach)]);
+        let report = check(&[owner, sim], Some(CONFIG));
+        assert!(!report.has_errors(), "{:#?}", report.findings);
+        assert!(codes(&report, Severity::Warning).contains(&"name_collision".to_owned()));
     }
 
     /// 開始後に起動するメンバーが登録しようとすると Error。
@@ -342,6 +394,28 @@ mod tests {
         let report = check(&[owner], Some(CONFIG));
         assert!(codes(&report, Severity::Error).is_empty());
         assert_eq!(codes(&report, Severity::Warning), vec!["core_namespace_unset"]);
+    }
+
+    /// 表記が違うだけの同じパスは、同じ Core として扱う。
+    #[test]
+    fn equivalent_config_paths_are_the_same_namespace() {
+        assert!(same_path("C:/hako/cpp_core_config.json", "C:\\hako\\.\\sub\\..\\cpp_core_config.json"));
+        assert!(!same_path("C:/hako/cpp_core_config.json", "C:/other/cpp_core_config.json"));
+        assert!(!same_path("../a.json", "a.json"));
+        let dir = scratch("compat-ns-equal");
+        let mut owner = member("owner", ActivationTiming::BeforeStart, vec![(compact_owner(&dir, "Rig", &[(0, "cmd", 136)]), Usage::Register)]);
+        owner.hako_config_path = Some("C:\\hako\\.\\cpp_core_config.json".to_owned());
+        assert!(!check(&[owner], Some(CONFIG)).has_errors());
+    }
+
+    /// 登録するメンバーが、別の設定で登録より大きいサイズを使うのも Error。
+    /// 読みと書きの両方にあっても 1 件にまとめる。
+    #[test]
+    fn a_registrant_attaching_with_a_larger_size_is_an_error_reported_once() {
+        let dir = scratch("compat-self-attach");
+        let both = legacy(&dir, "both.json", "Rig", &[(0, "cmd", 144)], &[(0, "cmd", 144)]);
+        let owner = member("owner", ActivationTiming::BeforeStart, vec![(compact_owner(&dir, "Rig", &[(0, "cmd", 136)]), Usage::Register), (both, Usage::Attach)]);
+        assert_eq!(codes(&check(&[owner], Some(CONFIG)), Severity::Error), vec!["size_exceeds_owner"]);
     }
 
     /// 読めない設定は Error（空のポートとして通さない）。
@@ -389,9 +463,9 @@ mod tests {
         let members = vec![
             member("rig-owner", ActivationTiming::BeforeStart, vec![(f("custom.json"), Usage::Register)]),
             member("drone-mock", ActivationTiming::BeforeStart, vec![(f("drone_mock_custom.json"), Usage::Register)]),
-            member("rig-sim", ActivationTiming::AfterStart, vec![(f("service_rig.json"), Usage::Attach)]),
-            member("viz-foxglove", ActivationTiming::AfterStart, vec![(f("service_viewer_full.json"), Usage::Attach)]),
-            member("pilot", ActivationTiming::AfterStart, vec![(f("service_pilot_full.json"), Usage::Attach)]),
+            member("rig-sim", ActivationTiming::AfterStart, vec![(f("service_rig.json"), Usage::Attach), (f("pdu_config_rig.json"), Usage::Attach)]),
+            member("viz-foxglove", ActivationTiming::AfterStart, vec![(f("service_viewer_full.json"), Usage::Attach), (f("pdu_config_viewer_full.json"), Usage::Attach)]),
+            member("pilot", ActivationTiming::AfterStart, vec![(f("service_pilot_full.json"), Usage::Attach), (f("pdu_config_pilot_full.json"), Usage::Attach)]),
         ];
         let owned: usize = members.iter().map(|m| m.ports.registrations.len()).sum();
         let report = check(&members, Some(CONFIG));
@@ -404,7 +478,7 @@ mod tests {
 
         // viz-mujoco も足しても Error にならない。
         let mut with_mujoco = members;
-        with_mujoco.push(member("viz-mujoco", ActivationTiming::AfterStart, vec![(f("service_viewer_full.json"), Usage::Attach)]));
+        with_mujoco.push(member("viz-mujoco", ActivationTiming::AfterStart, vec![(f("pdu_config_viewer_full.json"), Usage::Attach)]));
         assert!(!check(&with_mujoco, Some(CONFIG)).has_errors());
     }
 }

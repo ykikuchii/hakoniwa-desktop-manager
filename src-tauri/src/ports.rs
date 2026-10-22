@@ -7,9 +7,12 @@
 //! - `access`: そのアセットが読む・書くと宣言しているチャネル。compact 形式
 //!   （`custom.json` + `pdutypes.json`）は向きを持たないので `Unknown` になる。
 //!
-//! 形式の判定は Core と同じで、`paths` キーがあれば compact、なければ legacy
-//! （`robots[].shm_pdu_readers` など）。`pdu_config_path` を持つ service 設定は、
-//! その先の PDU 設定をたどる。読んだファイルはすべて SHA-256 を記録し、
+//! 形式の判定は Core と同じで、`paths` キーがあれば compact、`robots` があれば legacy
+//! （`robots[].shm_pdu_readers` など）。どちらも持たず `pdu_config_path` や `services` を
+//! 持つものは service 設定として扱う。service 設定の `pdu_config_path` はたどらない。
+//! Core はこの値を読まず、Python の `ShmCommon` はプロセスの作業ディレクトリ基準で
+//! 開くので、ファイルの場所からは解決できない。アセットが `PduManager` に渡す
+//! PDU 設定は、入口として明示してもらう。読んだファイルはすべて SHA-256 を記録し、
 //! 設定の変更を検知できるようにする。
 
 // 呼び出し側（プロジェクトの resolve と一括起動前の確認）は次の段階で入る。
@@ -140,7 +143,10 @@ impl Extractor {
     }
 
     /// ファイルを読んで JSON として返す。同じファイルは 1 回だけ記録する。
-    fn load(&mut self, path: &Path) -> Option<Value> {
+    ///
+    /// Python の読み込み（`PduChannelConfig` は `encoding='utf-8'` で開く）は先頭の BOM を
+    /// 受け付けない。C++ の Core は受け付けるので、BOM は `Attach` のときだけ問題にする。
+    fn load(&mut self, path: &Path, usage: Usage) -> Option<Value> {
         let bytes = match std::fs::read(path) {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -151,7 +157,11 @@ impl Extractor {
         if self.seen.insert(path.to_path_buf()) {
             self.files.push(FileDigest { path: path.display().to_string(), sha256: hex::encode(Sha256::digest(&bytes)) });
         }
-        // 先頭の BOM は serde_json が受け付けないので外す。
+        let bom = bytes.starts_with(b"\xef\xbb\xbf");
+        if bom && usage == Usage::Attach {
+            self.problems.push(format!("{} は先頭に BOM があり、Python の PDU 読み込みが失敗します", path.display()));
+            return None;
+        }
         let text = String::from_utf8_lossy(&bytes);
         match serde_json::from_str(text.trim_start_matches('\u{feff}')) {
             Ok(value) => Some(value),
@@ -163,30 +173,25 @@ impl Extractor {
     }
 
     fn entry(&mut self, path: &Path, usage: Usage) {
-        let Some(root) = self.load(path) else { return };
+        let Some(root) = self.load(path, usage) else { return };
         let base = path.parent().unwrap_or_else(|| Path::new("."));
-        if root.get("pdu_config_path").is_some() || root.get("services").is_some() {
-            self.service(path, base, &root, usage);
-        } else if root.get("paths").is_some() {
+        if root.get("paths").is_some() {
             self.compact(path, base, &root, usage);
         } else if root.get("robots").is_some() {
             self.legacy(path, &root, usage);
+        } else if root.get("pdu_config_path").is_some() || root.get("services").is_some() {
+            self.service(&root);
         } else {
             self.problems.push(format!("{} は PDU 設定の形式ではありません（paths・robots・pdu_config_path のいずれもない）", path.display()));
         }
     }
 
-    /// service 設定。PDU の宣言は `pdu_config_path` の先にある。
+    /// service 設定。ポートは持たず、変更の検知のために記録だけする。
     /// `services[]` や `nodes[]` の RPC 定義は検証の対象外なので、カバレッジを下げる。
-    fn service(&mut self, path: &Path, base: &Path, root: &Value, usage: Usage) {
+    fn service(&mut self, root: &Value) {
         let non_empty = |key: &str| root.get(key).and_then(Value::as_array).is_some_and(|items| !items.is_empty());
         if non_empty("services") || non_empty("nodes") {
             self.partial = true;
-        }
-        match root.get("pdu_config_path") {
-            Some(Value::String(target)) => self.entry(&base.join(target), usage),
-            Some(_) => self.problems.push(format!("{} の pdu_config_path が文字列ではありません", path.display())),
-            None => {}
         }
     }
 
@@ -197,10 +202,21 @@ impl Extractor {
             self.problems.push(format!("{source} の paths が配列ではありません"));
             return;
         };
-        let mut types = Vec::new();
+        // Core も Python も、robot が使うかによらず paths[] のファイルをすべて読む。
+        // 使われないファイルが壊れていても初期化に失敗するので、ここでも全部読む。
+        let mut types: Vec<(String, PathBuf, Option<Value>)> = Vec::new();
         for item in paths {
             match (item.get("id").and_then(Value::as_str), item.get("path").and_then(Value::as_str)) {
-                (Some(id), Some(file)) => types.push((id.to_owned(), base.join(file))),
+                (Some(id), Some(file)) => {
+                    // 同じ id が重なると、Core は最初を、Python は最後を使う。どちらとも決められない。
+                    if types.iter().any(|(other, _, _)| other == id) {
+                        self.problems.push(format!("{source} の paths に id {id} が重複しています"));
+                        continue;
+                    }
+                    let types_path = base.join(file);
+                    let loaded = self.load(&types_path, usage);
+                    types.push((id.to_owned(), types_path, loaded));
+                }
                 _ => self.problems.push(format!("{source} の paths に id か path がない要素があります")),
             }
         }
@@ -213,12 +229,13 @@ impl Extractor {
                 self.problems.push(format!("{source} の robots に name か pdutypes_id がない要素があります"));
                 continue;
             };
-            let Some((_, types_path)) = types.iter().find(|(id, _)| id == types_id) else {
+            let Some((_, types_path, loaded)) = types.iter().find(|(id, _, _)| id == types_id) else {
                 self.problems.push(format!("{source} の robot {name} が参照する pdutypes_id {types_id} が paths にありません"));
                 continue;
             };
+            // 読めなかったファイルの問題は、読んだときに記録済み。
+            let Some(channels) = loaded.clone() else { continue };
             let types_path = types_path.clone();
-            let Some(channels) = self.load(&types_path) else { continue };
             let Some(channels) = channels.as_array() else {
                 self.problems.push(format!("{} は pdutypes の配列ではありません", types_path.display()));
                 continue;
@@ -253,7 +270,14 @@ impl Extractor {
                 continue;
             };
             for (list, transport, access) in LISTS {
-                let Some(items) = robot.get(list).and_then(Value::as_array) else { continue };
+                let items = match robot.get(list) {
+                    None => continue,
+                    Some(Value::Array(items)) => items,
+                    Some(_) => {
+                        self.problems.push(format!("{source} の robot {name} の {list} が配列ではありません"));
+                        continue;
+                    }
+                };
                 for item in items {
                     let Some(decl) = self.channel(name, item, "org_name", transport, &source) else { continue };
                     if usage == Usage::Register {
@@ -345,20 +369,64 @@ pub(crate) mod tests {
         assert_eq!(ports.registrations.len(), 2);
     }
 
-    /// service 設定は pdu_config_path をたどり、RPC 定義があればカバレッジを下げる。
+    /// service 設定は pdu_config_path をたどらず、記録だけする。RPC 定義があればカバレッジを下げる。
     #[test]
-    fn service_follows_pdu_config_and_lowers_coverage_for_rpc() {
+    fn service_is_recorded_without_following_and_lowers_coverage_for_rpc() {
         let dir = scratch("service");
         legacy(&dir, "pdu_config.json", "Rig", &[(0, "cmd", 136)], &[]);
-        let empty = write(&dir, "service.json", json!({ "pduMetaDataSize": 24, "pdu_config_path": "pdu_config.json", "services": [] }));
+        let empty = write(&dir, "service.json", json!({ "pduMetaDataSize": 24, "pdu_config_path": "service.json", "services": [] }));
         let ports = extract(&[PduEntry { path: empty, usage: Usage::Attach }]);
         assert!(ports.problems.is_empty(), "{:?}", ports.problems);
-        assert_eq!(ports.access.len(), 1);
-        assert_eq!(ports.files.len(), 2);
+        assert!(ports.access.is_empty(), "自分自身を指していても、たどらない");
+        assert_eq!(ports.files.len(), 1);
         assert_eq!(ports.coverage, Coverage::Complete);
 
         let rpc = write(&dir, "service-rpc.json", json!({ "pdu_config_path": "pdu_config.json", "services": [{ "name": "Service/Add" }] }));
         assert_eq!(extract(&[PduEntry { path: rpc, usage: Usage::Attach }]).coverage, Coverage::Partial);
+    }
+
+    /// paths があれば、ほかのキー（services など）があっても compact として読む。
+    #[test]
+    fn paths_decides_compact_even_with_service_keys() {
+        let dir = scratch("compact-services");
+        compact_owner(&dir, "Rig", &[(0, "cmd", 136)]);
+        let custom = write(&dir, "custom.json", json!({ "paths": [{ "id": "default", "path": "Rig-pdutypes.json" }], "robots": [{ "name": "Rig", "pdutypes_id": "default" }], "services": [] }));
+        assert_eq!(extract(&[PduEntry { path: custom, usage: Usage::Register }]).registrations.len(), 1);
+    }
+
+    /// 使われない paths[] のファイルも読み、壊れていれば問題にする。id の重複も問題にする。
+    #[test]
+    fn compact_checks_every_listed_types_file_and_duplicate_ids() {
+        let dir = scratch("compact-unused");
+        compact_owner(&dir, "Rig", &[(0, "cmd", 136)]);
+        std::fs::write(dir.join("broken-pdutypes.json"), b"[ not json").unwrap();
+        let unused = write(&dir, "unused.json", json!({ "paths": [{ "id": "default", "path": "Rig-pdutypes.json" }, { "id": "spare", "path": "broken-pdutypes.json" }], "robots": [{ "name": "Rig", "pdutypes_id": "default" }] }));
+        assert_eq!(extract(&[PduEntry { path: unused, usage: Usage::Register }]).problems.len(), 1);
+        let duplicate = write(&dir, "duplicate.json", json!({ "paths": [{ "id": "default", "path": "Rig-pdutypes.json" }, { "id": "default", "path": "Rig-pdutypes.json" }], "robots": [{ "name": "Rig", "pdutypes_id": "default" }] }));
+        assert_eq!(extract(&[PduEntry { path: duplicate, usage: Usage::Register }]).problems.len(), 1);
+    }
+
+    /// readers・writers が配列でなければ、空として通さず問題にする。
+    #[test]
+    fn non_array_legacy_lists_are_problems() {
+        let dir = scratch("legacy-list");
+        for list in ["shm_pdu_readers", "shm_pdu_writers", "rpc_pdu_readers", "rpc_pdu_writers"] {
+            let config = write(&dir, "pdu_config.json", json!({ "robots": [{ "name": "Rig", list: "invalid" }] }));
+            assert_eq!(extract(&[PduEntry { path: config, usage: Usage::Attach }]).problems.len(), 1, "{list}");
+        }
+    }
+
+    /// BOM 付きは、Python が読む Attach では問題、Core が読む Register では通す。
+    #[test]
+    fn bom_is_a_problem_only_for_python_consumers() {
+        let dir = scratch("bom");
+        let config = legacy(&dir, "pdu_config.json", "Rig", &[(0, "cmd", 136)], &[]);
+        let mut bytes = b"\xef\xbb\xbf".to_vec();
+        bytes.extend(std::fs::read(&config).unwrap());
+        std::fs::write(&config, bytes).unwrap();
+        assert_eq!(extract(&[PduEntry { path: config.clone(), usage: Usage::Attach }]).problems.len(), 1);
+        let registered = extract(&[PduEntry { path: config, usage: Usage::Register }]);
+        assert!(registered.problems.is_empty() && registered.registrations.len() == 1);
     }
 
     /// ファイルがない、壊れている、形式が違うときは問題として残し、黙って空にしない。
