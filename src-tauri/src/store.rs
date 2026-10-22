@@ -37,8 +37,8 @@ pub struct Store {
     /// v1 の移行が途中で止まった。`app.json` を書くと次の起動で移行をやり直さなくなる
     /// ので、この間は書かない。
     pub migration_pending: bool,
-    /// この起動で移行した v1 のファイルと、そこから作ったプロジェクト。移行で消費した
-    /// ファイルを `--import` で指定されたときに、取り込み直さずにそのプロジェクトを選ぶ。
+    /// この起動で移行した v1 のファイル（[`file_identity`]）と、そこから作ったプロジェクト。
+    /// 移行で消費したファイルを `--import` で指定されたときに、取り込み直さずにそのプロジェクトを選ぶ。
     pub migrated_now: Option<(PathBuf, String)>,
 }
 
@@ -193,7 +193,7 @@ impl Store {
         match result {
             Ok(()) => {
                 self.warnings.push(format!("v1 のワークスペース「{}」を、プロジェクトとライブラリに移行しました。", workspace.name));
-                self.migrated_now = Some((v1_path.to_path_buf(), project.id.clone()));
+                self.migrated_now = file_identity(v1_path).map(|identity| (identity, project.id.clone()));
                 true
             }
             Err(error) => {
@@ -299,10 +299,12 @@ impl Store {
     }
 
     pub fn save_asset(&self, asset: &LibraryAsset) -> Result<(), String> {
+        self.ensure_writable()?;
         write_json(&self.assets_dir().join(format!("{}.json", file_stem(&asset.id)?)), asset)
     }
 
     pub fn save_project(&self, project: &Project) -> Result<(), String> {
+        self.ensure_writable()?;
         write_json(&self.projects_dir().join(format!("{}.json", file_stem(&project.id)?)), project)
     }
 
@@ -312,10 +314,17 @@ impl Store {
 
     /// `app` を `app.json` に書く。メモリ上の値は変えない。呼び出し側は、成功してから差し替える。
     pub fn write_app(&self, app: &AppConfig) -> Result<(), String> {
-        if self.migration_pending {
-            return Err("v1 の移行が途中のため、この設定は保存できません。アプリを再起動して移行をやり直してください。".to_owned());
-        }
+        self.ensure_writable()?;
         write_json(&self.app_path(), app)
+    }
+
+    /// 移行が途中なら、何も書かせない。次の起動の移行のやり直しは v1 からプロジェクトを
+    /// 作り直すので、その間に保存した編集は上書きされて消えるため。
+    fn ensure_writable(&self) -> Result<(), String> {
+        if self.migration_pending {
+            return Err("v1 の移行が途中のため、変更を保存できません。アプリを再起動して移行をやり直してください。".to_owned());
+        }
+        Ok(())
     }
 
     fn backup_v1(&self, path: &Path) -> Result<(), String> {
@@ -355,6 +364,19 @@ impl Store {
             Err(error) => self.warnings.push(format!("{} は使えません（隔離にも失敗: {error}）: {reason}", path.display())),
         }
     }
+}
+
+/// ファイルの同一性を比べるためのパス。親ディレクトリを実体に解決し（相対パスは作業
+/// ディレクトリ基準）、Windows では大文字小文字を揃える。ファイル自体が消えていても
+/// （移行で退避した後でも）求められるよう、ファイル名は解決しない。
+pub fn file_identity(path: &Path) -> Option<PathBuf> {
+    let name = path.file_name()?;
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    let resolved = fs::canonicalize(parent).ok()?.join(name);
+    Some(if cfg!(windows) { PathBuf::from(resolved.to_string_lossy().to_lowercase()) } else { resolved })
 }
 
 /// 更新時刻を除いて、同じ内容か。
@@ -628,12 +650,31 @@ mod tests {
         assert!(!dir.join("app.json").exists());
         assert!(dir.join(V1_WORKSPACE_FILE).exists(), "退避前に止まったので v1 は残る");
         assert!(store.write_app(&store.app).is_err());
+        assert!(store.save_project(&Project::empty("x".to_owned(), "x".to_owned())).is_err(), "移行が途中の間は編集も保存しない");
 
         fs::remove_file(dir.join("projects")).unwrap();
         let reopened = Store::open(&dir);
         assert!(!reopened.migration_pending);
         assert!(dir.join("app.json").exists());
         assert_eq!(resolved_active(&reopened), serde_json::to_value(v1_demo()).unwrap());
+    }
+
+    /// 同じファイルは、`..` を含む表記でも大文字小文字が違っても同じとみなす。消えた後でも求められる。
+    #[test]
+    fn file_identity_ignores_spelling() {
+        let dir = scratch("identity");
+        let file = dir.join("workspace.json");
+        fs::write(&file, b"{}").unwrap();
+        let absolute = file_identity(&file).unwrap();
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        assert_eq!(file_identity(&dir.join("sub").join("..").join("workspace.json")).as_ref(), Some(&absolute));
+        fs::remove_file(&file).unwrap();
+        assert_eq!(file_identity(&file).as_ref(), Some(&absolute), "ファイルが消えた後でも同じ");
+        if cfg!(windows) {
+            let upper = PathBuf::from(file.to_string_lossy().to_uppercase());
+            assert_eq!(file_identity(&upper).as_ref(), Some(&absolute));
+        }
+        assert_ne!(file_identity(&dir.join("other.json")).as_ref(), Some(&absolute));
     }
 
     /// 区切り文字を含む id は、別の場所に書かないよう拒否する。

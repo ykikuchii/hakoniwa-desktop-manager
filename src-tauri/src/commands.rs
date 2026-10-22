@@ -73,8 +73,12 @@ fn edit_active_workspace(state: &AppState, edit: impl FnOnce(&mut Workspace) -> 
 #[tauri::command]
 pub fn save_workspace(state: State<'_, AppState>, workspace: Workspace) -> Result<Workspace, String> {
     edit_active_workspace(&state, |current| {
-        // 画面が古い id のワークスペースを送ってきても、アクティブなプロジェクトに書く。
-        *current = Workspace { id: current.id.clone(), schema_version: current.schema_version, ..workspace };
+        // 画面が切り替え前のプロジェクトを送ってきたら拒否する。書くと、前のプロジェクトの
+        // 内容で今のプロジェクトを上書きしてしまう。
+        if workspace.id != current.id {
+            return Err("表示中のプロジェクトが切り替わっています。画面が更新されてから、もう一度保存してください。".to_owned());
+        }
+        *current = Workspace { schema_version: current.schema_version, ..workspace };
         Ok(())
     })
 }
@@ -156,7 +160,8 @@ pub fn import_v1(state: &AppState, path: &Path, replace: bool) -> Result<String,
         let mut store = state.lock_store()?;
         // この起動の移行で、同じファイルを既に取り込んで退避している。取り込み直さず、
         // 移行で作ったプロジェクトを使う。
-        let migrated = store.migrated_now.as_ref().filter(|(migrated, _)| migrated == path && !path.exists()).map(|(_, id)| id.clone());
+        let requested = crate::store::file_identity(path);
+        let migrated = store.migrated_now.as_ref().filter(|(migrated, _)| requested.as_ref() == Some(migrated) && !path.exists()).map(|(_, id)| id.clone());
         match migrated {
             Some(id) => id,
             None => store.import_v1(path, replace, consume)?.project_id,
@@ -906,12 +911,13 @@ fn monitor_targets<'a>(
     assets: &[AssetDefinition],
     connections: &'a [crate::types::ConnectionDefinition],
 ) -> Vec<&'a crate::types::ConnectionDefinition> {
-    let unique_name = assets.iter().filter(|candidate| candidate.name == asset.name).count() == 1;
+    // linking と同じく、前後の空白を除いた名前で一意かを見る。
+    let unique_name = assets.iter().filter(|candidate| candidate.name.trim() == asset.name.trim()).count() == 1;
     connections
         .iter()
         .filter(|connection| {
             connection.owner_asset_id.as_deref() == Some(asset.id.as_str())
-                || (unique_name && connection.details.get("bridge").map(|bridge| bridge == &asset.name).unwrap_or(false))
+                || (unique_name && connection.owner_asset_id.is_none() && connection.details.get("bridge").map(|bridge| bridge.trim() == asset.name.trim()).unwrap_or(false))
         })
         .collect()
 }
@@ -1120,7 +1126,7 @@ mod tests {
     #[test]
     fn monitor_targets_skip_the_bridge_name_when_ambiguous() {
         let first = asset("pdu-bridge", vec![]);
-        let mut second = asset("pdu-bridge", vec![]);
+        let mut second = asset(" pdu-bridge ", vec![]);
         second.id = "second-bridge".to_owned();
         let mut legacy = connection("legacy");
         legacy.details.insert("bridge".to_owned(), "pdu-bridge".to_owned());
