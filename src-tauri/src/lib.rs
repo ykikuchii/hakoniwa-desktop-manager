@@ -9,6 +9,7 @@ mod ports;
 mod process;
 mod resolve;
 mod state;
+mod store;
 mod types;
 
 use state::AppState;

@@ -265,9 +265,11 @@ impl AppConfig {
     }
 }
 
-/// v1 のワークスペースから作るライブラリのアセットの id。同じ v1 から作り直すと同じになる。
-pub fn v1_library_asset_id(workspace_id: &str, asset_id: &str) -> String {
-    Uuid::new_v5(&Uuid::NAMESPACE_URL, format!("hakoniwa-desktop-manager:v1-asset:{workspace_id}:{asset_id}").as_bytes()).to_string()
+/// v1 のワークスペースから作るライブラリのアセットの id。出所（[`v1_origin`]）と
+/// v1 のアセット id で決まる。生成スクリプトはワークスペース id を毎回新しく振るので、
+/// それを使うと取り込み直すたびにライブラリが増える。
+pub fn v1_library_asset_id(origin: &str, asset_id: &str) -> String {
+    Uuid::new_v5(&Uuid::NAMESPACE_URL, format!("hakoniwa-desktop-manager:v1-asset:{origin}:{asset_id}").as_bytes()).to_string()
 }
 
 /// v1 のワークスペースの出所。`source_directory` と名前で、同じ生成元かを見分ける。
@@ -322,10 +324,11 @@ pub fn member_from_definition(asset: &AssetDefinition, library_asset_id: String)
 /// プロジェクトの id は v1 のワークスペースの id を、メンバー id は v1 のアセット id を
 /// 引き継ぐ。解決すると元のワークスペースと同じものに戻る。
 pub fn split_v1_workspace(workspace: &Workspace) -> (Vec<LibraryAsset>, Project) {
+    let origin = v1_origin(workspace);
     let mut assets = Vec::new();
     let mut members = Vec::new();
     for definition in &workspace.assets {
-        let id = v1_library_asset_id(&workspace.id, &definition.id);
+        let id = v1_library_asset_id(&origin, &definition.id);
         assets.push(library_asset_from_definition(id.clone(), definition));
         members.push(member_from_definition(definition, id));
     }
@@ -333,7 +336,7 @@ pub fn split_v1_workspace(workspace: &Workspace) -> (Vec<LibraryAsset>, Project)
         schema_version: STORE_SCHEMA_VERSION,
         id: workspace.id.clone(),
         name: workspace.name.clone(),
-        origin: Some(v1_origin(workspace)),
+        origin: Some(origin),
         source_directory: workspace.source_directory.clone(),
         core_release: workspace.core_release.clone(),
         core_controller: workspace.core_controller.clone(),
