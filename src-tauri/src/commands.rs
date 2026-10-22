@@ -128,22 +128,23 @@ pub fn stop_asset(state: State<'_, AppState>, asset_id: String) -> Result<Vec<cr
     let workspace = state.workspace.lock().map_err(|_| "ワークスペースをロックできません。".to_owned())?.clone();
     if !running_owner_names(&state, &workspace).is_empty() {
         let health = core_lock_health(&state);
-        // 確認している間に一括停止などで残りが止まっていれば、警告はもう当てはまらない。
-        if !running_owner_names(&state, &workspace).is_empty() {
-            let name = report.stopped.first().map(|snapshot| snapshot.owner_name.clone()).unwrap_or_default();
-            match health {
-                CoreLockHealth::Aborted { reason, owner_pid } => {
-                    return Err(format!(
-                        "{name} を停止しました。Core は master ロックの持ち主（pid {owner_pid}）が終了したことを検出し、停止状態（ABORT）になっています（{reason}）。すべて停止し、hako-cmd recover を実行してから一括起動し直してください。"
-                    ));
-                }
-                CoreLockHealth::Stuck(detail) => {
-                    return Err(format!(
-                        "{name} を停止しました。ただし Core が固まっている可能性があります（{detail}）。停止したプロセスが Core のロックを持ったまま終了した可能性があります。すべて停止してから一括起動し直してください。"
-                    ));
-                }
-                CoreLockHealth::Free | CoreLockHealth::Unknown => {}
+        let name = report.stopped.first().map(|snapshot| snapshot.owner_name.clone()).unwrap_or_default();
+        match health {
+            // ABORT は Core のファイルに残り、すべて止めても `hako-cmd recover` を実行する
+            // まで解けない。確認の間に残りが止まっていても知らせる。
+            CoreLockHealth::Aborted { reason, owner_pid } => {
+                return Err(format!(
+                    "{name} を停止しました。Core は master ロックの持ち主（pid {owner_pid}）が終了したことを検出し、停止状態（ABORT）になっています（{reason}）。すべて停止し、hako-cmd recover を実行してから一括起動し直してください。"
+                ));
             }
+            // 疑いの段階の警告は、確認している間に一括停止などで残りが止まっていれば、
+            // もう当てはまらない。
+            CoreLockHealth::Stuck(detail) if !running_owner_names(&state, &workspace).is_empty() => {
+                return Err(format!(
+                    "{name} を停止しました。ただし Core が固まっている可能性があります（{detail}）。停止したプロセスが Core のロックを持ったまま終了した可能性があります。すべて停止してから一括起動し直してください。"
+                ));
+            }
+            CoreLockHealth::Stuck(_) | CoreLockHealth::Free | CoreLockHealth::Unknown => {}
         }
     }
     Ok(report.stopped)
@@ -196,10 +197,18 @@ fn core_lock_health(state: &State<'_, AppState>) -> CoreLockHealth {
     // 新しい Core（toppers/hakoniwa-core-cpp#62 の修正以降）は `hako-cmd check` で、
     // ロックの持ち主が生きているかまで調べて答える。答えが出ればそれに従う。
     // UNKNOWN、`check` を知らない古い hako-cmd、時間切れのときは、下の直接観測に戻る。
-    let check = ProgramSpec { program: selection.hako_cmd_path.clone(), args: vec!["check".to_owned()], cwd: Some(selection.install_directory.clone()), env: env.clone(), target: crate::types::ExecutionTarget::Native };
-    if let Ok((_, stdout, _)) = run_oneshot(&check, CORE_CHECK_TIMEOUT) {
-        if let Some(health) = parse_core_check(&stdout) {
-            return health;
+    //
+    // `check` を知らない古い hako-cmd に投げると、共有メモリに接続してログを書いて
+    // から未知のコマンドと判定する。そのログ書き込みで master ロックを取るので、
+    // 固まった Core では止まり、時間切れで kill するとロックを持ったまま終わりうる。
+    // そこで先に、共有メモリに触れずに返る `--help` で `check` があるかを確かめる。
+    let spec = |args: &[&str]| ProgramSpec { program: selection.hako_cmd_path.clone(), args: args.iter().map(|arg| (*arg).to_owned()).collect(), cwd: Some(selection.install_directory.clone()), env: env.clone(), target: crate::types::ExecutionTarget::Native };
+    let supports_check = matches!(run_oneshot(&spec(&["--help"]), CORE_CHECK_TIMEOUT), Ok((_, stdout, _)) if help_lists_check(&stdout));
+    if supports_check {
+        if let Ok((_, stdout, _)) = run_oneshot(&spec(&["check"]), CORE_CHECK_TIMEOUT) {
+            if let Some(health) = parse_core_check(&stdout) {
+                return health;
+            }
         }
     }
     let base = Path::new(&selection.install_directory);
@@ -229,9 +238,10 @@ fn core_lock_health(state: &State<'_, AppState>) -> CoreLockHealth {
 
 /// `hako-cmd check` の出力（1 行の JSON）を解釈する。
 ///
-/// OK は `Free`、ABORT は `Aborted`。UNKNOWN や、JSON でない出力（`check` を知らない
-/// 古い hako-cmd のヘルプなど）、知らない `schema_version` は `None` で、呼び出し側は
-/// 別の手段に戻る。
+/// ABORT は `Aborted`。OK は、master ロックが UNLOCKED でカウンタが 1 以上のときだけ
+/// `Free` とする。持ち主が生きていればロックを握ったまま止まっていても OK になるので、
+/// LOCKED などの OK は判断せず、呼び出し側の直接観測に任せる。UNKNOWN、JSON でない
+/// 出力、知らない `schema_version` も `None`。
 fn parse_core_check(stdout: &str) -> Option<CoreLockHealth> {
     let value: serde_json::Value = stdout
         .lines()
@@ -242,20 +252,28 @@ fn parse_core_check(stdout: &str) -> Option<CoreLockHealth> {
         return None;
     }
     let reason = value.get("reason").and_then(|reason| reason.as_str()).unwrap_or_default().to_owned();
+    let master_lock = value
+        .get("checks")
+        .and_then(|checks| checks.as_array())
+        .and_then(|checks| checks.iter().find(|check| check.get("name").and_then(|name| name.as_str()) == Some("master_lock")));
     match value.get("status")?.as_str()? {
-        "OK" => Some(CoreLockHealth::Free),
+        "OK" => {
+            let lock = master_lock?;
+            let unlocked = lock.get("state").and_then(|state| state.as_str()) == Some("UNLOCKED");
+            let counter = lock.get("counter").and_then(|counter| counter.as_i64()).unwrap_or_default();
+            (unlocked && counter >= 1).then_some(CoreLockHealth::Free)
+        }
         "ABORT" => {
-            let owner_pid = value
-                .get("checks")
-                .and_then(|checks| checks.as_array())
-                .and_then(|checks| checks.iter().find(|check| check.get("name").and_then(|name| name.as_str()) == Some("master_lock")))
-                .and_then(|check| check.get("owner_pid"))
-                .and_then(|pid| pid.as_i64())
-                .unwrap_or_default();
+            let owner_pid = master_lock.and_then(|lock| lock.get("owner_pid")).and_then(|pid| pid.as_i64()).unwrap_or_default();
             Some(CoreLockHealth::Aborted { reason, owner_pid })
         }
         _ => None,
     }
+}
+
+/// `hako-cmd --help` の出力に `check` コマンドの行があるか。
+fn help_lists_check(help: &str) -> bool {
+    help.lines().any(|line| line.trim_start().split_whitespace().next() == Some("check") && line.starts_with(' '))
 }
 
 /// Core の設定（`HAKO_CONFIG_PATH`）から、mmap 構成の `flock.bin` の場所を求める。
@@ -1028,6 +1046,25 @@ mod tests {
 ")),
             Some(CoreLockHealth::Aborted { reason: "master lock owner process is no longer alive".to_owned(), owner_pid: 54416 })
         );
+    }
+
+    /// 持ち主が生きたままロックを握っている OK（LOCKED、カウンタ 0）は空きとみなさない。
+    #[test]
+    fn core_check_does_not_treat_a_held_lock_as_free() {
+        let held = CHECK_OK
+            .replace(r#""state":"UNLOCKED","counter":1,"owner_pid":0"#, r#""state":"LOCKED","counter":0,"owner_pid":4242"#)
+            .replace("master lock is unlocked", "master lock owner is alive");
+        assert!(held.contains("LOCKED") && held.contains("4242"));
+        assert_eq!(parse_core_check(&held), None);
+    }
+
+    /// `--help` に `check` の行があるかで、対応している hako-cmd かを見分ける。
+    #[test]
+    fn help_detects_the_check_command() {
+        let fixed = "Usage: hako-cmd [OPTION...]\n      --force-wait           Allow check to wait for the OS file lock up to\n  start          Start simulation\n  check          Inspect runtime integrity as JSON\n  recover        Explicitly remove stopped runtime files\n";
+        let legacy = "Usage: hako-cmd [OPTION...]\n  start          Start simulation\n  stop           Stop simulation\n";
+        assert!(help_lists_check(fixed));
+        assert!(!help_lists_check(legacy));
     }
 
     /// UNKNOWN、JSON でない出力、知らない版は判断せず、ほかの手段に任せる。
