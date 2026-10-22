@@ -57,6 +57,17 @@ pub fn resolve_links(assets: &[AssetDefinition], connections: &mut [ConnectionDe
     warnings
 }
 
+/// 候補が 1 つのアセットに絞れるキーだけを残す。
+fn unambiguous(candidates: BTreeMap<String, Vec<String>>) -> BTreeMap<String, String> {
+    candidates
+        .into_iter()
+        .filter_map(|(key, owners)| {
+            let first = owners.first()?.clone();
+            owners.iter().all(|owner| owner == &first).then_some((key, first))
+        })
+        .collect()
+}
+
 /// 相手がアセットではないことを示す固定値かどうか。
 pub fn looks_non_asset(value: &str) -> bool {
     let candidate = value.trim();
@@ -104,15 +115,15 @@ struct AssetIndex {
 
 impl AssetIndex {
     fn build(assets: &[AssetDefinition]) -> Self {
-        let mut by_exact_name = BTreeMap::new();
-        let mut by_normalized_name = BTreeMap::new();
+        let mut exact_candidates: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut normalized_candidates: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let mut config_candidates: BTreeMap<String, Vec<String>> = BTreeMap::new();
 
         for asset in assets {
-            by_exact_name.entry(asset.name.trim().to_owned()).or_insert_with(|| asset.id.clone());
+            exact_candidates.entry(asset.name.trim().to_owned()).or_default().push(asset.id.clone());
             let normalized = normalize_name(&asset.name);
             if !normalized.is_empty() {
-                by_normalized_name.entry(normalized).or_insert_with(|| asset.id.clone());
+                normalized_candidates.entry(normalized).or_default().push(asset.id.clone());
             }
             // アセットが受け取る設定ファイルは、名前規約に依存しない突合材料になる。
             let sources = asset
@@ -127,15 +138,9 @@ impl AssetIndex {
             }
         }
 
-        let by_config_token = config_candidates
-            .into_iter()
-            .filter_map(|(token, owners)| {
-                let first = owners.first()?.clone();
-                owners.iter().all(|owner| owner == &first).then_some((token, first))
-            })
-            .collect();
-
-        Self { by_exact_name, by_normalized_name, by_config_token }
+        // 同じ名前のアセットが複数ある（同じアセットを 2 回使うなど）と、どちらとも
+        // 決められない。設定ファイルの断片と同じく、キーごと捨てて誤結合を避ける。
+        Self { by_exact_name: unambiguous(exact_candidates), by_normalized_name: unambiguous(normalized_candidates), by_config_token: unambiguous(config_candidates) }
     }
 
     fn resolve_endpoint(&self, value: &str) -> Option<String> {
@@ -337,5 +342,18 @@ mod tests {
         assets.pop();
         resolve_links(&assets, &mut connections);
         assert!(connections[0].destination_asset_id.is_none(), "消えたアセットへの参照が残っています。");
+    }
+
+    /// 同じ名前のアセットが 2 つあると、どちらとも決めずに結び付けない（最初の 1 つに寄せない）。
+    #[test]
+    fn duplicate_names_are_left_unlinked() {
+        let mut first = asset("viewer", vec![]);
+        first.id = "viewer-1".to_owned();
+        let mut second = asset("viewer", vec![]);
+        second.id = "viewer-2".to_owned();
+        let mut connections = vec![connection("viewer", "external-host")];
+        let warnings = resolve_links(&[first, second], &mut connections);
+        assert!(connections[0].source_asset_id.is_none());
+        assert!(!warnings.is_empty());
     }
 }

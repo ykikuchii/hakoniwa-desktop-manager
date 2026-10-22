@@ -1,7 +1,5 @@
 //! プロジェクトとライブラリから、実行層と画面が使う `Workspace` を組み立てる。
 
-// 呼び出し側（AppState の置き換え）は次のコミットで入る。
-#![cfg_attr(not(test), allow(dead_code))]
 
 use crate::model::{Library, Project};
 use crate::types::{AssetDefinition, Workspace, WORKSPACE_SCHEMA_VERSION};

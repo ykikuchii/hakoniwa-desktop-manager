@@ -1,6 +1,7 @@
 mod commands;
 mod compat;
 mod core;
+mod edit;
 mod importer;
 mod linking;
 mod model;
@@ -67,6 +68,10 @@ pub fn run() {
             commands::install_approved_core,
             commands::ingest_bridge_monitor_line,
             commands::record_manual_communication_event,
+            commands::select_project,
+            commands::create_project,
+            commands::import_v1_workspace,
+            commands::clear_store_warnings,
         ])
         .run(tauri::generate_context!())
         .expect("Hakoniwa Desktop Managerを起動できませんでした。");

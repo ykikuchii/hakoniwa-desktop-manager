@@ -17,6 +17,12 @@ pub struct CommunicationMonitor {
 }
 
 impl CommunicationMonitor {
+    /// 記録した通信イベントをすべて消す。
+    pub fn reset(&self) {
+        self.events.lock().expect("monitor event lock poisoned").clear();
+        self.seen_log_entries.lock().expect("monitor dedup lock poisoned").clear();
+    }
+
     pub fn record(&self, mut event: CommunicationEvent) {
         if event.id.is_empty() {
             event.id = Uuid::new_v4().to_string();

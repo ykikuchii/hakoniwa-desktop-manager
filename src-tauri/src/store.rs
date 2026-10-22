@@ -12,10 +12,8 @@
 //! ライブラリ → プロジェクト → `app.json` の順に書くので、途中で落ちても残るのは
 //! どこからも参照されないアセットだけになる。
 
-// 呼び出し側（AppState の置き換え）は次のコミットで入る。
-#![cfg_attr(not(test), allow(dead_code))]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -225,11 +223,6 @@ impl Store {
         let id = asset.id.clone();
         self.library.insert(id.clone(), asset);
         Ok(id)
-    }
-
-    /// アセットを使っているプロジェクトの id。
-    pub fn projects_using(&self, asset_id: &str) -> BTreeSet<String> {
-        self.projects.values().filter(|project| project.members.iter().any(|member| member.asset_id == asset_id)).map(|project| project.id.clone()).collect()
     }
 
     pub fn save_asset(&self, asset: &LibraryAsset) -> Result<(), String> {

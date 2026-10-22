@@ -3,8 +3,6 @@
 //! 実行層と画面は従来の `Workspace` / `AssetDefinition` を使い続ける。プロジェクトは
 //! `resolve::resolve` でライブラリと合わせて `Workspace` に解決してから渡す。
 
-// 呼び出し側（保存と AppState の置き換え）は次のコミットで入る。
-#![cfg_attr(not(test), allow(dead_code))]
 
 use std::collections::{BTreeMap, BTreeSet};
 

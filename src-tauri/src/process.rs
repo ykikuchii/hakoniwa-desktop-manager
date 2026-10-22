@@ -223,6 +223,15 @@ impl ProcessManager {
         Ok(managed.snapshot.clone())
     }
 
+    /// 終了したプロセスの記録を消す。動いているものは残す。
+    pub fn forget_finished(&self) {
+        let mut processes = self.lock_processes();
+        for managed in processes.values_mut() {
+            refresh(managed);
+        }
+        processes.retain(|_, managed| matches!(managed.snapshot.status, ProcessStatus::Starting | ProcessStatus::Running | ProcessStatus::Stopping));
+    }
+
     pub fn stop_owner(&self, owner_id: &str) -> StopReport {
         let process_ids: Vec<String> = self.lock_processes()
             .iter()
