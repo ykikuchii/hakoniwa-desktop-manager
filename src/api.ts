@@ -40,6 +40,7 @@ export function newAsset(): AssetDefinition {
     role: "other",
     command: { program: "", args: [], cwd: null, env: {}, target: "native" },
     depends_on: ["core"],
+    optional_depends_on: [],
     activation_timing: "manual",
     config_files: [],
     enabled: true,

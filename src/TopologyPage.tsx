@@ -38,6 +38,8 @@ function statusFor(process: ProcessSnapshot | undefined, connections: Connection
   if (process?.status === "starting") return "starting";
   if (process?.status === "running" && connections.some((connection) => connection.state === "connected")) return "connected";
   if (process?.status === "running") return "running";
+  // 利用者が止めたものは、接続履歴が切断を示していても「停止」と表示する。
+  if (process?.status === "exited") return "stopped";
   if (connections.some((connection) => connection.state === "disconnected")) return "disconnected";
   // 一括起動の対象外は「単独で起動するもの」で、止まっていても異常ではない。
   return "stopped";

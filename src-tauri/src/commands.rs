@@ -85,7 +85,10 @@ pub fn delete_asset(state: State<'_, AppState>, asset_id: String) -> Result<Work
     let before = workspace.assets.len();
     workspace.assets.retain(|asset| asset.id != asset_id);
     if before == workspace.assets.len() { return Err("削除対象のアセットが見つかりません。".to_owned()); }
-    for asset in &mut workspace.assets { asset.depends_on.retain(|dependency| dependency != &asset_id); }
+    for asset in &mut workspace.assets {
+        asset.depends_on.retain(|dependency| dependency != &asset_id);
+        asset.optional_depends_on.retain(|dependency| dependency != &asset_id);
+    }
     let response = workspace.clone();
     drop(workspace);
     state.persist_workspace()?;
@@ -98,6 +101,11 @@ pub fn start_asset(state: State<'_, AppState>, asset_id: String) -> Result<crate
         .assets.iter().find(|candidate| candidate.id == asset_id).cloned().ok_or_else(|| "起動対象のアセットが見つかりません。".to_owned())?;
     // `enabled` は一括起動の対象かどうかだけを表す。外したアセットも単独では起動できる。
     // 一括起動と切り離して、実行中に後から足したり差し替えたりするアセットのため。
+    // ただし一括起動・一括停止の最中は断る。一括停止が通り過ぎた後に起動して止めた
+    // はずのものが残ったり、一括起動と二重に起動したりするため。
+    if state.start_all_running.load(Ordering::Acquire) || state.stop_all_running.load(Ordering::Acquire) {
+        return Err("一括起動または一括停止の実行中は、アセットを単独で起動できません。".to_owned());
+    }
     state.processes.start(asset.id, asset.name, ProcessKind::Asset, asset.command).map_err(|error| error.to_string())
 }
 
@@ -690,14 +698,34 @@ fn monitor_targets<'a>(
 
 fn topological_order(assets: &[AssetDefinition]) -> Result<Vec<AssetDefinition>, String> {
     let enabled: BTreeMap<String, AssetDefinition> = assets.iter().filter(|asset| asset.enabled).map(|asset| (asset.id.clone(), asset.clone())).collect();
-    // 一括起動の対象から外したアセットへの依存は、順序の制約にしない。外したものは
-    // 一括起動では起動されないので、待っても来ない。ワークスペースに無い ID への
-    // 依存は従来どおり未解決参照として扱う。
+    let names: BTreeMap<&str, &str> = assets.iter().map(|asset| (asset.id.as_str(), asset.name.as_str())).collect();
+    // 必須の依存先を一括起動の対象から外していれば、黙って進めずに拒否する。外した
+    // ものは一括起動では起動されないので待っても来ず、依存元は前提が無いまま動き出す。
+    // 待たなくてよい依存は `optional_depends_on` に書く。
+    for asset in enabled.values() {
+        let excluded_required: Vec<&str> = asset.depends_on.iter()
+            .filter(|dependency| dependency.as_str() != "core" && !enabled.contains_key(dependency.as_str()))
+            .filter_map(|dependency| names.get(dependency.as_str()).copied())
+            .collect();
+        if !excluded_required.is_empty() {
+            return Err(format!(
+                "「{}」の必須の依存先（{}）が一括起動の対象から外れています。依存先を一括起動の対象に含めるか、任意の依存先に移してください。",
+                asset.name,
+                excluded_required.join("、")
+            ));
+        }
+    }
+    // 任意の依存先は、対象外なら順序の制約にしない。ワークスペースに無い ID への
+    // 依存は、必須・任意とも未解決参照として扱う。
     let excluded: BTreeSet<&str> = assets.iter().filter(|asset| !asset.enabled).map(|asset| asset.id.as_str()).collect();
     let mut ordered = Vec::new();
     let mut completed = BTreeSet::new();
     while completed.len() < enabled.len() {
-        let ready: Vec<AssetDefinition> = enabled.values().filter(|asset| !completed.contains(&asset.id) && asset.depends_on.iter().all(|dependency| dependency == "core" || excluded.contains(dependency.as_str()) || completed.contains(dependency))).cloned().collect();
+        let ready: Vec<AssetDefinition> = enabled.values().filter(|asset| {
+            !completed.contains(&asset.id)
+                && asset.depends_on.iter().all(|dependency| dependency == "core" || completed.contains(dependency))
+                && asset.optional_depends_on.iter().all(|dependency| dependency == "core" || excluded.contains(dependency.as_str()) || completed.contains(dependency))
+        }).cloned().collect();
         if ready.is_empty() {
             return Err("アセットの依存関係に循環または未解決参照があります。".to_owned());
         }
@@ -712,7 +740,7 @@ mod tests {
     use crate::types::{AssetRole, ExecutionTarget, ProgramSpec};
 
     fn asset(id: &str, depends_on: Vec<&str>) -> AssetDefinition {
-        AssetDefinition { id: id.to_owned(), name: id.to_owned(), role: AssetRole::Other, command: ProgramSpec { program: "echo".to_owned(), args: vec![], cwd: None, env: BTreeMap::new(), target: ExecutionTarget::Native }, depends_on: depends_on.into_iter().map(str::to_owned).collect(), activation_timing: ActivationTiming::Manual, config_files: vec![], enabled: true, readiness: ReadinessCheck::default() }
+        AssetDefinition { id: id.to_owned(), name: id.to_owned(), role: AssetRole::Other, command: ProgramSpec { program: "echo".to_owned(), args: vec![], cwd: None, env: BTreeMap::new(), target: ExecutionTarget::Native }, depends_on: depends_on.into_iter().map(str::to_owned).collect(), optional_depends_on: vec![], activation_timing: ActivationTiming::Manual, config_files: vec![], enabled: true, readiness: ReadinessCheck::default() }
     }
 
     #[test]
@@ -731,15 +759,34 @@ mod tests {
         assert_eq!(ids, vec!["owner", "viewer-a"]);
     }
 
-    /// 対象外のアセットへの依存は無視し、ワークスペースに無い ID への依存は拒否する。
+    /// 任意の依存先は、対象なら待ち、対象外なら待たない。
     #[test]
-    fn start_all_order_ignores_edges_to_excluded_assets() {
+    fn start_all_order_waits_for_included_optional_dependencies_only() {
         let mut excluded = asset("viewer-b", vec![]);
         excluded.enabled = false;
-        let order = topological_order(&[asset("pilot", vec!["viewer-a", "viewer-b"]), asset("viewer-a", vec![]), excluded]).unwrap();
+        let mut pilot = asset("pilot", vec!["sim"]);
+        pilot.optional_depends_on = vec!["viewer-a".to_owned(), "viewer-b".to_owned()];
+        let order = topological_order(&[pilot, asset("viewer-a", vec!["sim"]), asset("sim", vec![]), excluded]).unwrap();
         let ids: Vec<&str> = order.iter().map(|asset| asset.id.as_str()).collect();
-        assert_eq!(ids, vec!["viewer-a", "pilot"]);
+        assert_eq!(ids, vec!["sim", "viewer-a", "pilot"]);
+    }
+
+    /// 必須の依存先が対象外なら、理由を示して拒否する。
+    #[test]
+    fn start_all_order_rejects_excluded_required_dependency() {
+        let mut excluded = asset("viewer-b", vec![]);
+        excluded.enabled = false;
+        let error = topological_order(&[asset("pilot", vec!["viewer-b"]), excluded]).unwrap_err();
+        assert!(error.contains("pilot") && error.contains("viewer-b"), "{error}");
+    }
+
+    /// ワークスペースに無い ID への依存は、必須・任意とも拒否する。
+    #[test]
+    fn start_all_order_rejects_unknown_dependencies() {
         assert!(topological_order(&[asset("pilot", vec!["missing"])]).is_err());
+        let mut pilot = asset("pilot", vec![]);
+        pilot.optional_depends_on = vec!["missing".to_owned()];
+        assert!(topological_order(&[pilot]).is_err());
     }
 
     fn connection(id: &str) -> crate::types::ConnectionDefinition {
