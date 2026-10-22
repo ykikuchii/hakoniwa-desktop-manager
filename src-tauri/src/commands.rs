@@ -736,6 +736,8 @@ fn topological_order(assets: &[AssetDefinition]) -> Result<Vec<AssetDefinition>,
     };
     for asset in enabled.values() {
         for dependency in asset.depends_on.iter().chain(asset.optional_depends_on.iter()) {
+            // `core` は Core 本体を表す予約語。同じ ID のアセットがあっても段階の比較はしない。
+            if dependency == "core" { continue; }
             let Some(target) = enabled.get(dependency.as_str()) else { continue };
             let (own_rank, own_label) = phase(&asset.activation_timing);
             let (target_rank, target_label) = phase(&target.activation_timing);
@@ -832,6 +834,16 @@ mod tests {
         let order = topological_order(&[after, early]).unwrap();
         let ids: Vec<&str> = order.iter().map(|asset| asset.id.as_str()).collect();
         assert_eq!(ids, vec!["early", "after"]);
+    }
+
+    /// 予約語の `core` への依存は、同じ ID のアセットが後の段階にあっても拒否しない。
+    #[test]
+    fn start_all_order_does_not_phase_check_the_core_sentinel() {
+        let mut core_asset = asset("core", vec![]);
+        core_asset.activation_timing = ActivationTiming::AfterStart;
+        let mut manual = asset("manual", vec!["core"]);
+        manual.activation_timing = ActivationTiming::Manual;
+        assert!(topological_order(&[manual, core_asset]).is_ok());
     }
 
     /// ワークスペースに無い ID への依存は、必須・任意とも拒否する。
