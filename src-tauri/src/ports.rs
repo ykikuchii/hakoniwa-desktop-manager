@@ -175,19 +175,22 @@ impl Extractor {
     fn entry(&mut self, path: &Path, usage: Usage) {
         let Some(root) = self.load(path, usage) else { return };
         let base = path.parent().unwrap_or_else(|| Path::new("."));
+        // RPC の定義（services・nodes）は、PDU の形式によらず検証の対象外。PDU の宣言と同じ
+        // ファイルにあっても、カバレッジを下げる。
+        self.service(&root);
         if root.get("paths").is_some() {
             self.compact(path, base, &root, usage);
         } else if root.get("robots").is_some() {
             self.legacy(path, &root, usage);
         } else if root.get("pdu_config_path").is_some() || root.get("services").is_some() {
-            self.service(&root);
+            // service 設定だけのファイル。上で記録済み。
         } else {
             self.problems.push(format!("{} は PDU 設定の形式ではありません（paths・robots・pdu_config_path のいずれもない）", path.display()));
         }
     }
 
-    /// service 設定。ポートは持たず、変更の検知のために記録だけする。
-    /// `services[]` や `nodes[]` の RPC 定義は検証の対象外なので、カバレッジを下げる。
+    /// service 設定の部分。ポートは持たない。`services[]` や `nodes[]` の RPC 定義は検証の
+    /// 対象外なので、空でなければカバレッジを下げる。
     fn service(&mut self, root: &Value) {
         let non_empty = |key: &str| root.get(key).and_then(Value::as_array).is_some_and(|items| !items.is_empty());
         if non_empty("services") || non_empty("nodes") {
@@ -208,13 +211,14 @@ impl Extractor {
         for item in paths {
             match (item.get("id").and_then(Value::as_str), item.get("path").and_then(Value::as_str)) {
                 (Some(id), Some(file)) => {
+                    let types_path = base.join(file);
+                    // 重複した id のファイルも、Core と Python はどちらも開くので読んで記録する。
+                    let loaded = self.load(&types_path, usage);
                     // 同じ id が重なると、Core は最初を、Python は最後を使う。どちらとも決められない。
                     if types.iter().any(|(other, _, _)| other == id) {
                         self.problems.push(format!("{source} の paths に id {id} が重複しています"));
                         continue;
                     }
-                    let types_path = base.join(file);
-                    let loaded = self.load(&types_path, usage);
                     types.push((id.to_owned(), types_path, loaded));
                 }
                 _ => self.problems.push(format!("{source} の paths に id か path がない要素があります")),
@@ -386,12 +390,21 @@ pub(crate) mod tests {
     }
 
     /// paths があれば、ほかのキー（services など）があっても compact として読む。
+    /// 同じファイルに RPC の定義があれば、カバレッジは下げる。
     #[test]
     fn paths_decides_compact_even_with_service_keys() {
         let dir = scratch("compact-services");
         compact_owner(&dir, "Rig", &[(0, "cmd", 136)]);
         let custom = write(&dir, "custom.json", json!({ "paths": [{ "id": "default", "path": "Rig-pdutypes.json" }], "robots": [{ "name": "Rig", "pdutypes_id": "default" }], "services": [] }));
-        assert_eq!(extract(&[PduEntry { path: custom, usage: Usage::Register }]).registrations.len(), 1);
+        let ports = extract(&[PduEntry { path: custom, usage: Usage::Register }]);
+        assert_eq!(ports.registrations.len(), 1);
+        assert_eq!(ports.coverage, Coverage::Complete);
+        let mixed = write(&dir, "mixed.json", json!({ "paths": [{ "id": "default", "path": "Rig-pdutypes.json" }], "robots": [{ "name": "Rig", "pdutypes_id": "default" }], "services": [{ "name": "Service/Add" }] }));
+        let ports = extract(&[PduEntry { path: mixed, usage: Usage::Register }]);
+        assert_eq!(ports.registrations.len(), 1);
+        assert_eq!(ports.coverage, Coverage::Partial);
+        let legacy_mixed = write(&dir, "legacy-mixed.json", json!({ "robots": [], "nodes": [{ "name": "n" }] }));
+        assert_eq!(extract(&[PduEntry { path: legacy_mixed, usage: Usage::Attach }]).coverage, Coverage::Partial);
     }
 
     /// 使われない paths[] のファイルも読み、壊れていれば問題にする。id の重複も問題にする。
@@ -402,8 +415,11 @@ pub(crate) mod tests {
         std::fs::write(dir.join("broken-pdutypes.json"), b"[ not json").unwrap();
         let unused = write(&dir, "unused.json", json!({ "paths": [{ "id": "default", "path": "Rig-pdutypes.json" }, { "id": "spare", "path": "broken-pdutypes.json" }], "robots": [{ "name": "Rig", "pdutypes_id": "default" }] }));
         assert_eq!(extract(&[PduEntry { path: unused, usage: Usage::Register }]).problems.len(), 1);
-        let duplicate = write(&dir, "duplicate.json", json!({ "paths": [{ "id": "default", "path": "Rig-pdutypes.json" }, { "id": "default", "path": "Rig-pdutypes.json" }], "robots": [{ "name": "Rig", "pdutypes_id": "default" }] }));
-        assert_eq!(extract(&[PduEntry { path: duplicate, usage: Usage::Register }]).problems.len(), 1);
+        write(&dir, "other-pdutypes.json", json!([]));
+        let duplicate = write(&dir, "duplicate.json", json!({ "paths": [{ "id": "default", "path": "Rig-pdutypes.json" }, { "id": "default", "path": "other-pdutypes.json" }], "robots": [{ "name": "Rig", "pdutypes_id": "default" }] }));
+        let ports = extract(&[PduEntry { path: duplicate, usage: Usage::Register }]);
+        assert_eq!(ports.problems.len(), 1);
+        assert_eq!(ports.files.len(), 3, "重複した id のファイルも記録する");
     }
 
     /// readers・writers が配列でなければ、空として通さず問題にする。

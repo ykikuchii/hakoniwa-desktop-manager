@@ -248,23 +248,39 @@ pub fn check(members: &[MemberPorts], project_hako_config_path: Option<&str>) ->
 
 /// 2 つのパスが同じファイルを指すか。表記の違い（区切り文字、`.`・`..`、Windows の
 /// 大文字小文字）を吸収して比べる。シンボリックリンクまでは解決しない。
+///
+/// ドライブ・ルート・UNC の `\\server\share` は `Path::components` の Prefix と RootDir と
+/// して保ち、`..` で消さない。末尾が区切り文字のものはファイルを指さないので、元の表記の
+/// まま比べる（正規化で別の表記と等しくしない）。
 fn same_path(a: &str, b: &str) -> bool {
     normalize_path(a) == normalize_path(b)
 }
 
 fn normalize_path(path: &str) -> String {
-    let unified = path.replace('\\', "/");
-    let mut parts: Vec<&str> = Vec::new();
-    for part in unified.split('/') {
-        match part {
-            "" | "." if !parts.is_empty() => {}
-            ".." if parts.last().is_some_and(|last| *last != ".." && !last.ends_with(':') && !last.is_empty()) => {
-                parts.pop();
+    use std::path::{Component, Path};
+    if path.ends_with('/') || path.ends_with('\\') {
+        return format!("raw:{path}");
+    }
+    let mut anchor = String::new();
+    let mut parts: Vec<String> = Vec::new();
+    for component in Path::new(path).components() {
+        match component {
+            Component::Prefix(prefix) => anchor.push_str(&prefix.as_os_str().to_string_lossy().replace('\\', "/")),
+            Component::RootDir => anchor.push('/'),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if parts.last().is_some_and(|last| last != "..") {
+                    parts.pop();
+                } else if !anchor.ends_with('/') {
+                    // 相対パスやドライブ相対（`C:..`）の先頭の `..` は、消さずに残す。
+                    parts.push("..".to_owned());
+                }
+                // ルートより上は無い（`C:/..` は `C:/`）。
             }
-            _ => parts.push(part),
+            Component::Normal(name) => parts.push(name.to_string_lossy().into_owned()),
         }
     }
-    let joined = parts.join("/");
+    let joined = format!("{anchor}{}", parts.join("/"));
     if cfg!(windows) {
         joined.to_lowercase()
     } else {
@@ -394,6 +410,26 @@ mod tests {
         let report = check(&[owner], Some(CONFIG));
         assert!(codes(&report, Severity::Error).is_empty());
         assert_eq!(codes(&report, Severity::Warning), vec!["core_namespace_unset"]);
+    }
+
+    /// Windows のドライブ・UNC・ドライブ相対の区別を、正規化で消さない。
+    #[cfg(windows)]
+    #[test]
+    fn windows_path_prefixes_are_kept() {
+        assert!(!same_path("\\\\server\\share\\config.json", "\\server\\share\\config.json"));
+        assert!(same_path("\\\\server\\share\\a\\..\\config.json", "//server/share/config.json"));
+        assert!(!same_path("C:sub/../config.json", "config.json"));
+        assert!(!same_path("C:config.json", "C:/config.json"));
+        assert!(!same_path("D:/hako/config.json", "C:/hako/config.json"));
+        assert!(same_path("C:/../hako/config.json", "C:/hako/config.json"));
+    }
+
+    /// 先頭の `./` は同じ、末尾の区切り文字は別のものとして扱う。
+    #[test]
+    fn leading_dot_and_trailing_separator() {
+        assert!(same_path("./config.json", "config.json"));
+        assert!(!same_path("C:/hako/config.json/", "C:/hako/config.json"));
+        assert!(same_path("../a/./b.json", "../a/b.json"));
     }
 
     /// 表記が違うだけの同じパスは、同じ Core として扱う。
