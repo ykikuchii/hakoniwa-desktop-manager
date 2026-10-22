@@ -127,13 +127,22 @@ pub fn stop_asset(state: State<'_, AppState>, asset_id: String) -> Result<Vec<cr
     // ほかに何も動いていなければ master も無く、確かめても誤検知になるだけなので省く。
     let workspace = state.workspace.lock().map_err(|_| "ワークスペースをロックできません。".to_owned())?.clone();
     if !running_owner_names(&state, &workspace).is_empty() {
-        if let CoreLockHealth::Stuck(detail) = core_lock_health(&state) {
-            // 確認している間に一括停止などで残りが止まっていれば、警告はもう当てはまらない。
-            if !running_owner_names(&state, &workspace).is_empty() {
-                let name = report.stopped.first().map(|snapshot| snapshot.owner_name.clone()).unwrap_or_default();
-                return Err(format!(
-                    "{name} を停止しました。ただし Core が固まっている可能性があります（{detail}）。停止したプロセスが Core のロックを持ったまま終了した可能性があります。すべて停止してから一括起動し直してください。"
-                ));
+        let health = core_lock_health(&state);
+        // 確認している間に一括停止などで残りが止まっていれば、警告はもう当てはまらない。
+        if !running_owner_names(&state, &workspace).is_empty() {
+            let name = report.stopped.first().map(|snapshot| snapshot.owner_name.clone()).unwrap_or_default();
+            match health {
+                CoreLockHealth::Aborted { reason, owner_pid } => {
+                    return Err(format!(
+                        "{name} を停止しました。Core は master ロックの持ち主（pid {owner_pid}）が終了したことを検出し、停止状態（ABORT）になっています（{reason}）。すべて停止し、hako-cmd recover を実行してから一括起動し直してください。"
+                    ));
+                }
+                CoreLockHealth::Stuck(detail) => {
+                    return Err(format!(
+                        "{name} を停止しました。ただし Core が固まっている可能性があります（{detail}）。停止したプロセスが Core のロックを持ったまま終了した可能性があります。すべて停止してから一括起動し直してください。"
+                    ));
+                }
+                CoreLockHealth::Free | CoreLockHealth::Unknown => {}
             }
         }
     }
@@ -150,11 +159,18 @@ const LOCK_SAMPLE_INTERVAL: Duration = Duration::from_millis(10);
 /// `hako-cmd status` で確かめるときの上限。正常なら 1 秒もかからない。
 const CORE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// `hako-cmd check` の上限。読み取り専用で、既定ではロックを待たないので速い。
+/// `check` を知らない古い hako-cmd は、Core が固まっていると返らないことがある。
+const CORE_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Core の master ロックの状態。
 #[derive(Debug, PartialEq, Eq)]
 enum CoreLockHealth {
-    /// 空きを観測した。
+    /// 空きを観測した。または `hako-cmd check` が OK を返した。
     Free,
+    /// `hako-cmd check` が、ロックの持ち主の終了を確認した（ABORT）。
+    /// 新しい Core はこの状態で参加者を止め、`hako-cmd recover` を求める。
+    Aborted { reason: String, owner_pid: i64 },
     /// 固まっている兆候があった。中身はその根拠。
     Stuck(String),
     /// 確かめられなかった。正常とも固まっているとも言えない。
@@ -177,6 +193,15 @@ fn core_lock_health(state: &State<'_, AppState>) -> CoreLockHealth {
     }) else {
         return CoreLockHealth::Unknown;
     };
+    // 新しい Core（toppers/hakoniwa-core-cpp#62 の修正以降）は `hako-cmd check` で、
+    // ロックの持ち主が生きているかまで調べて答える。答えが出ればそれに従う。
+    // UNKNOWN、`check` を知らない古い hako-cmd、時間切れのときは、下の直接観測に戻る。
+    let check = ProgramSpec { program: selection.hako_cmd_path.clone(), args: vec!["check".to_owned()], cwd: Some(selection.install_directory.clone()), env: env.clone(), target: crate::types::ExecutionTarget::Native };
+    if let Ok((_, stdout, _)) = run_oneshot(&check, CORE_CHECK_TIMEOUT) {
+        if let Some(health) = parse_core_check(&stdout) {
+            return health;
+        }
+    }
     let base = Path::new(&selection.install_directory);
     if let Some(flock) = core_flock_path(&env, base) {
         match master_lock_free_seen(&flock, LOCK_FREE_WINDOW) {
@@ -199,6 +224,37 @@ fn core_lock_health(state: &State<'_, AppState>) -> CoreLockHealth {
             .find(|line| line.contains("file-lock wait timed out"))
             .map_or(CoreLockHealth::Unknown, |line| CoreLockHealth::Stuck(line.trim().to_owned())),
         Err(_) => CoreLockHealth::Unknown,
+    }
+}
+
+/// `hako-cmd check` の出力（1 行の JSON）を解釈する。
+///
+/// OK は `Free`、ABORT は `Aborted`。UNKNOWN や、JSON でない出力（`check` を知らない
+/// 古い hako-cmd のヘルプなど）、知らない `schema_version` は `None` で、呼び出し側は
+/// 別の手段に戻る。
+fn parse_core_check(stdout: &str) -> Option<CoreLockHealth> {
+    let value: serde_json::Value = stdout
+        .lines()
+        .rev()
+        .find(|line| line.trim_start().starts_with('{'))
+        .and_then(|line| serde_json::from_str(line).ok())?;
+    if value.get("schema_version")?.as_i64()? != 1 {
+        return None;
+    }
+    let reason = value.get("reason").and_then(|reason| reason.as_str()).unwrap_or_default().to_owned();
+    match value.get("status")?.as_str()? {
+        "OK" => Some(CoreLockHealth::Free),
+        "ABORT" => {
+            let owner_pid = value
+                .get("checks")
+                .and_then(|checks| checks.as_array())
+                .and_then(|checks| checks.iter().find(|check| check.get("name").and_then(|name| name.as_str()) == Some("master_lock")))
+                .and_then(|check| check.get("owner_pid"))
+                .and_then(|pid| pid.as_i64())
+                .unwrap_or_default();
+            Some(CoreLockHealth::Aborted { reason, owner_pid })
+        }
+        _ => None,
     }
 }
 
@@ -955,6 +1011,34 @@ mod tests {
         std::fs::write(&config, r#"{"shm_type":"shm"}"#).expect("rewrite config");
         assert_eq!(core_flock_path(&env, Path::new("unrelated-base")), None);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // 以下の JSON は、修正後の Core（core-pro 56019b3 / core-cpp 3def26c）の
+    // `hako-cmd check` が Windows で実際に出力したもの（pid などはその時の値）。
+    const CHECK_OK: &str = r#"{"schema_version":1,"status":"OK","reason":"master lock is unlocked","checks":[{"name":"master_lock","status":"OK","reason":"master lock is unlocked","state":"UNLOCKED","counter":1,"owner_pid":0,"owner_start_token":0,"generation":23}]}"#;
+    const CHECK_ABORT: &str = r#"{"schema_version":1,"status":"ABORT","reason":"master lock owner process is no longer alive","checks":[{"name":"master_lock","status":"ABORT","reason":"master lock owner process is no longer alive","state":"LOCKED","counter":0,"owner_pid":54416,"owner_start_token":134368578255130917,"generation":23}]}"#;
+
+    /// OK は空き、ABORT は持ち主の pid と理由を持つ停止状態として読む。
+    #[test]
+    fn core_check_reads_ok_and_abort() {
+        assert_eq!(parse_core_check(CHECK_OK), Some(CoreLockHealth::Free));
+        assert_eq!(
+            parse_core_check(&format!("INFO: something before
+{CHECK_ABORT}
+")),
+            Some(CoreLockHealth::Aborted { reason: "master lock owner process is no longer alive".to_owned(), owner_pid: 54416 })
+        );
+    }
+
+    /// UNKNOWN、JSON でない出力、知らない版は判断せず、ほかの手段に任せる。
+    #[test]
+    fn core_check_leaves_unknown_and_foreign_output_undecided() {
+        let unknown = CHECK_OK.replace(r#""status":"OK","reason":"master lock is unlocked","checks""#, r#""status":"UNKNOWN","reason":"master lock owner metadata is missing (legacy flock.bin)","checks""#);
+        assert_eq!(parse_core_check(&unknown), None);
+        assert_eq!(parse_core_check("Unknown command: check
+Usage: hako-cmd ..."), None);
+        assert_eq!(parse_core_check(""), None);
+        assert_eq!(parse_core_check(&CHECK_OK.replace(r#""schema_version":1"#, r#""schema_version":2"#)), None);
     }
 
     /// ファイルが無ければ判断できない（警告しない）。
