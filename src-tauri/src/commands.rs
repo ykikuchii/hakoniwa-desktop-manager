@@ -155,12 +155,14 @@ pub fn import_v1(state: &AppState, path: &Path, replace: bool) -> Result<String,
         return Err("実行中は取り込めません。すべて停止してから取り込んでください。".to_owned());
     }
     // 保存場所に置かれた v1 は、取り込んだら退避する。残すと毎回警告が出る。
-    let consume = path == state.data_directory.join(crate::store::V1_WORKSPACE_FILE);
+    // 同じファイルかは、表記ではなくファイルの同一性で比べる。
+    let requested = crate::store::file_identity(path);
+    let data_dir_v1 = crate::store::file_identity(&state.data_directory.join(crate::store::V1_WORKSPACE_FILE));
+    let consume = requested.is_some() && requested == data_dir_v1;
     let project_id = {
         let mut store = state.lock_store()?;
         // この起動の移行で、同じファイルを既に取り込んで退避している。取り込み直さず、
         // 移行で作ったプロジェクトを使う。
-        let requested = crate::store::file_identity(path);
         let migrated = store.migrated_now.as_ref().filter(|(migrated, _)| requested.as_ref() == Some(migrated) && !path.exists()).map(|(_, id)| id.clone());
         match migrated {
             Some(id) => id,
