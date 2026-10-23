@@ -1,9 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { api, newAsset } from "./api";
-import type { AssetDefinition, ConnectionSnapshot, CoreCatalog, ImportPreview, ProjectCheck, Workspace, WorkspaceSnapshot } from "./types";
+import { api } from "./api";
+import type { CoreCatalog, ImportPreview, ProjectCheck, Workspace, WorkspaceSnapshot } from "./types";
 import { CheckPanel } from "./CheckPanel";
 import { ChecksPage } from "./ChecksPage";
+import { LibraryPage } from "./LibraryPage";
+import { ProjectPage } from "./ProjectPage";
+import { Empty, Field, messageOf } from "./ui";
 import { TopologyPage } from "./TopologyPage";
 import { selectAssetProcess, selectCoreProcess } from "./selectors";
 import "./topology-visualization.css";
@@ -11,7 +14,8 @@ import "./topology-alerts.css";
 
 const tabs = [
   ["dashboard", "概要"],
-  ["assets", "アセット"],
+  ["project", "プロジェクト"],
+  ["library", "ライブラリ"],
   ["checks", "接続チェック"],
   ["topology", "接続・通信"],
   ["core", "Core管理"],
@@ -30,7 +34,7 @@ export default function App() {
   const [error, setError] = useState<string>("");
   const [busy, setBusy] = useState(false);
   const [selectedAssetId, setSelectedAssetId] = useState<string | null>(null);
-  const [draftAsset, setDraftAsset] = useState<AssetDefinition | null>(null);
+  const [libraryFocus, setLibraryFocus] = useState<string | null>(null);
   const [preview, setPreview] = useState<ImportPreview | null>(null);
   const [selectedConnectionId, setSelectedConnectionId] = useState<string | null>(null);
   const [check, setCheck] = useState<ProjectCheck | null>(null);
@@ -69,8 +73,6 @@ export default function App() {
   }, []);
 
   const workspace = snapshot?.workspace;
-  const storedAsset = workspace?.assets.find((asset) => asset.id === selectedAssetId) ?? null;
-  const selectedAsset = storedAsset ?? (draftAsset && draftAsset.id === selectedAssetId ? draftAsset : null);
   const selectedConnection = snapshot?.connections.find((connection) => connection.definition.id === selectedConnectionId) ?? null;
   const activeCore = snapshot ? selectCoreProcess(snapshot.processes) : undefined;
 
@@ -99,7 +101,7 @@ export default function App() {
     if (typeof selection !== "string") return;
     const replace = window.confirm("同じ出所から取り込んだプロジェクトがあれば、置き換えますか？\n［キャンセル］を選ぶと、新しいプロジェクトとして取り込みます。");
     setSelectedAssetId(null);
-    setDraftAsset(null);
+    setLibraryFocus(null);
     setSelectedConnectionId(null);
     setPreview(null);
     setCheck(null);
@@ -109,7 +111,7 @@ export default function App() {
 
   function switchProject(projectId: string) {
     setSelectedAssetId(null);
-    setDraftAsset(null);
+    setLibraryFocus(null);
     setSelectedConnectionId(null);
     setPreview(null);
     setCheck(null);
@@ -121,42 +123,12 @@ export default function App() {
     const name = window.prompt("新しいプロジェクトの名前");
     if (!name?.trim()) return;
     setSelectedAssetId(null);
-    setDraftAsset(null);
+    setLibraryFocus(null);
     setSelectedConnectionId(null);
     setPreview(null);
     setCheck(null);
     checkGeneration.current++;
     void run(() => api.createProject(name), "プロジェクトを作りました。");
-  }
-
-  async function upsertAsset(asset: AssetDefinition) {
-    await run(async () => {
-      if (workspace?.assets.some((candidate) => candidate.id === asset.id)) await api.updateAsset(asset);
-      else await api.createAsset(asset);
-      setSelectedAssetId(asset.id);
-      setDraftAsset((current) => (current?.id === asset.id ? null : current));
-    }, "アセットを保存しました。");
-  }
-
-  function selectAsset(id: string) {
-    setSelectedAssetId(id);
-    setDraftAsset((current) => (current?.id === id ? current : null));
-  }
-
-  function createDraftAsset() {
-    const asset = newAsset();
-    setDraftAsset(asset);
-    setSelectedAssetId(asset.id);
-  }
-
-  function removeAsset(id: string) {
-    if (draftAsset?.id === id) {
-      setDraftAsset(null);
-      setSelectedAssetId(null);
-      setNotice("未保存のアセットを破棄しました。");
-      return;
-    }
-    void run(() => api.deleteAsset(id), "アセットを削除しました。");
   }
 
   if (!snapshot || !workspace) {
@@ -189,13 +161,14 @@ export default function App() {
         </header>
         {snapshot.store_warnings.length > 0 && <div className="banner error"><div>{snapshot.store_warnings.map((warning, index) => <p key={index}>{warning}</p>)}</div><button onClick={() => void run(() => api.clearStoreWarnings(), "")}>閉じる</button></div>}
         {(notice || error) && <div className={error ? "banner error" : "banner"}><span>{error || notice}</span><button onClick={() => { setError(""); setNotice(""); }}>閉じる</button></div>}
-        {tab === "dashboard" && <CheckPanel check={check && check.project_id === (snapshot.running_project_id ?? snapshot.active_project_id) ? check : null} error={checkError} disabled={busy || !!snapshot.running_project_id} onAccept={(projectId, revisions) => void run(() => api.acceptMemberChanges(projectId, revisions), "変更を承認しました。")} />}
-        {tab === "dashboard" && <Dashboard snapshot={snapshot} activeCore={activeCore?.status ?? "unknown"} onStartCore={() => void run(api.startCore, "Coreコントローラーを起動しました。")} onStopCore={() => void run(api.stopCore, "Coreコントローラーを停止しました。")} onLifecycle={(command) => void run(async () => { const result = await api.runLifecycle(command); if (result.status === "failed") throw new Error(result.stderr || "hako-cmdが失敗しました。"); }, `hako-cmd ${command} を実行しました。`)} onAssetClick={(id) => { setSelectedAssetId(id); setTab("assets"); }} onConnectionClick={(id) => { setSelectedConnectionId(id); setTab("topology"); }} />}
-        {tab === "assets" && <AssetsPage key={workspace.id} workspace={workspace} processes={snapshot.processes} selected={selectedAsset} draft={draftAsset} busy={busy} onSelect={selectAsset} onSave={upsertAsset} onDelete={removeAsset} onStart={(id) => void run(() => api.startAsset(id), "アセットを起動しました。")} onStop={(id) => void run(() => api.stopAsset(id), "アセットを停止しました。")} onCreate={createDraftAsset} />}
+        {tab === "dashboard" && <CheckPanel check={check && check.project_id === (snapshot.running_project_id ?? snapshot.active_project_id) ? check : null} error={checkError} onReview={() => setTab("checks")} />}
+        {tab === "dashboard" && <Dashboard snapshot={snapshot} activeCore={activeCore?.status ?? "unknown"} onStartCore={() => void run(api.startCore, "Coreコントローラーを起動しました。")} onStopCore={() => void run(api.stopCore, "Coreコントローラーを停止しました。")} onLifecycle={(command) => void run(async () => { const result = await api.runLifecycle(command); if (result.status === "failed") throw new Error(result.stderr || "hako-cmdが失敗しました。"); }, `hako-cmd ${command} を実行しました。`)} onAssetClick={(id) => { setSelectedAssetId(id); setTab("project"); }} onConnectionClick={(id) => { setSelectedConnectionId(id); setTab("topology"); }} />}
+        {tab === "project" && <ProjectPage key={workspace.id} snapshot={snapshot} busy={busy} selectedId={selectedAssetId} onSelect={setSelectedAssetId} onRun={run} onOpenInLibrary={(assetId) => { setLibraryFocus(assetId); setTab("library"); }} />}
+        {tab === "library" && <LibraryPage key={workspace.id} projectId={snapshot.active_project_id} members={snapshot.members} running={snapshot.running_project_id === snapshot.active_project_id} busy={busy} focusAssetId={libraryFocus} onRun={run} />}
         {tab === "checks" && <ChecksPage check={check && check.project_id === (snapshot.running_project_id ?? snapshot.active_project_id) ? check : null} error={checkError} disabled={busy || !!snapshot.running_project_id} onAccept={(projectId, revisions) => void run(() => api.acceptMemberChanges(projectId, revisions), "変更を承認しました。")} />}
         {tab === "topology" && <TopologyPage snapshot={snapshot} selected={selectedConnection} onSelect={setSelectedConnectionId} onHeartbeat={(id) => void run(() => api.recordHeartbeat(id, "ユーザー操作による確認イベント"), "通信確認イベントを記録しました。")} />}
-        {tab === "core" && <CorePage key={workspace.id} workspace={workspace} catalog={catalog} activeCore={activeCore?.status ?? "unknown"} busy={busy} onSaveWorkspace={(next) => void run(() => api.saveWorkspace(next), "Core設定を保存しました。")} onInstall={(version) => void run(() => api.installCore(version), "Coreを検証して導入しました。")} onStart={() => void run(api.startCore, "Coreコントローラーを起動しました。")} onStop={() => void run(api.stopCore, "Coreコントローラーを停止しました。")} />}
-        {tab === "workspace" && <WorkspacePage key={workspace.id} workspace={workspace} busy={busy} preview={preview} onChoose={() => void chooseDirectory()} onImportV1={() => void importV1()} onApply={() => preview && void run(() => api.applyPreview(preview), "インポート結果をワークスペースへ適用しました。")} onSave={(next) => void run(() => api.saveWorkspace(next), "ワークスペースを保存しました。")} />}
+        {tab === "core" && <CorePage key={workspace.id} workspace={workspace} catalog={catalog} activeCore={activeCore?.status ?? "unknown"} busy={busy} onSaveController={(controller) => void run(() => api.setCoreController(snapshot.active_project_id, controller), "Core設定を保存しました。")} onInstall={(version) => void run(() => api.installCore(version), "Coreを検証して導入しました。")} onStart={() => void run(api.startCore, "Coreコントローラーを起動しました。")} onStop={() => void run(api.stopCore, "Coreコントローラーを停止しました。")} />}
+        {tab === "workspace" && <WorkspacePage key={workspace.id} workspace={workspace} busy={busy} preview={preview} onChoose={() => void chooseDirectory()} onImportV1={() => void importV1()} onApply={() => preview && void run(() => api.applyPreview(preview), "インポート結果をワークスペースへ適用しました。")} onRename={(name) => void run(() => api.renameProject(snapshot.active_project_id, name), "プロジェクト名を保存しました。")} />}
       </main>
     </div>
   );
@@ -215,34 +188,18 @@ function Dashboard({ snapshot, activeCore, onStartCore, onStopCore, onLifecycle,
   </section>;
 }
 
-function AssetsPage({ workspace, processes, selected, draft, busy, onSelect, onSave, onDelete, onStart, onStop, onCreate }: { workspace: Workspace; processes: WorkspaceSnapshot["processes"]; selected: AssetDefinition | null; draft: AssetDefinition | null; busy: boolean; onSelect: (id: string) => void; onSave: (asset: AssetDefinition) => void; onDelete: (id: string) => void; onStart: (id: string) => void; onStop: (id: string) => void; onCreate: () => void }) {
-  const unsaved = draft && !workspace.assets.some((asset) => asset.id === draft.id) ? draft : null;
-  return <section className="split-page"><div className="panel asset-list-panel"><div className="panel-heading"><div><p className="eyebrow">ASSET CATALOG</p><h2>個別アセット</h2></div><button className="button primary small" disabled={busy} onClick={onCreate}>追加</button></div><p className="muted">コマンド、引数、作業ディレクトリ、環境変数、起動順序を明示的に管理します。</p><div className="asset-cards">{workspace.assets.map((asset) => { const process = selectAssetProcess(processes, asset.id); return <button key={asset.id} className={selected?.id === asset.id ? "asset-card selected" : "asset-card"} onClick={() => onSelect(asset.id)}><span className="dot" data-state={process?.status ?? "unknown"} /><strong>{asset.name}</strong><small>{asset.role} · {asset.command.target === "native" ? "ローカル" : "WSL"}</small></button>; })}{unsaved && <button key={unsaved.id} className={selected?.id === unsaved.id ? "asset-card selected" : "asset-card"} onClick={() => onSelect(unsaved.id)}><span className="dot" data-state="unknown" /><strong>{unsaved.name}</strong><small>未保存 · 実行ファイルを入力して保存してください</small></button>}{workspace.assets.length === 0 && !unsaved && <Empty label="アセットがありません。" />}</div></div><div className="panel editor-panel">{selected ? <AssetEditor key={selected.id} asset={selected} allAssets={workspace.assets} busy={busy} persisted={selected.id !== unsaved?.id} onSave={onSave} onDelete={() => onDelete(selected.id)} onStart={() => onStart(selected.id)} onStop={() => onStop(selected.id)} /> : <Empty label="左側からアセットを選択してください。" />}</div></section>;
-}
-
-function AssetEditor({ asset, allAssets, busy, persisted, onSave, onDelete, onStart, onStop }: { asset: AssetDefinition; allAssets: AssetDefinition[]; busy: boolean; persisted: boolean; onSave: (asset: AssetDefinition) => void; onDelete: () => void; onStart: () => void; onStop: () => void }) {
-  const [draft, setDraft] = useState(asset);
-  const patch = <K extends keyof AssetDefinition>(key: K, value: AssetDefinition[K]) => setDraft((current) => ({ ...current, [key]: value }));
-  const patchCommand = (key: keyof AssetDefinition["command"], value: unknown) => setDraft((current) => ({ ...current, command: { ...current.command, [key]: value } }));
-  return <><div className="panel-heading"><div><p className="eyebrow">ASSET EDITOR</p><h2>{draft.name}</h2></div><div className="button-row"><button className="button subtle" disabled={busy || !persisted} onClick={onStart}>起動</button><button className="button subtle" disabled={busy || !persisted} onClick={onStop}>停止</button></div></div>{!persisted && <p className="muted">未保存のアセットです。実行ファイルを入力して保存すると、起動・停止できるようになります。</p>}<div className="form-grid"><Field label="表示名"><input value={draft.name} onChange={(event) => patch("name", event.target.value)} /></Field><Field label="役割"><select value={draft.role} onChange={(event) => patch("role", event.target.value as AssetDefinition["role"])}>{["simulator","controller","visualizer","bridge","service","external_client","monitor","other"].map((role) => <option key={role}>{role}</option>)}</select></Field><Field label="実行ファイル / コマンド" wide><input value={draft.command.program} placeholder="例: python3.12" onChange={(event) => patchCommand("program", event.target.value)} /><small>シェル文字列ではなく実行ファイルを指定し、引数は下欄で分離します。</small></Field><Field label="引数（1行に1個）" wide><textarea value={draft.command.args.join("\n")} onChange={(event) => patchCommand("args", event.target.value.split("\n").map((value) => value.trim()).filter(Boolean))} /></Field><Field label="作業ディレクトリ" wide><input value={draft.command.cwd ?? ""} onChange={(event) => patchCommand("cwd", event.target.value || null)} /></Field><Field label="実行環境"><select value={draft.command.target === "native" ? "native" : "wsl"} onChange={(event) => patchCommand("target", event.target.value === "native" ? "native" : { wsl: { distribution: "Ubuntu" } })}><option value="native">ローカルOS</option><option value="wsl">WSL2</option></select></Field>{draft.command.target !== "native" && <Field label="WSLディストリビューション"><input value={draft.command.target.wsl.distribution} onChange={(event) => patchCommand("target", { wsl: { distribution: event.target.value } })} /></Field>}<Field label="起動タイミング"><select value={draft.activation_timing} onChange={(event) => patch("activation_timing", event.target.value as AssetDefinition["activation_timing"])}><option value="before_start">before_start</option><option value="manual">manual</option><option value="after_start">after_start</option></select></Field><Field label="必須の依存先"><select multiple value={draft.depends_on} onChange={(event) => patch("depends_on", Array.from(event.target.selectedOptions).map((option) => option.value))}><option value="core">core</option>{allAssets.filter((candidate) => candidate.id !== draft.id).map((candidate) => <option key={candidate.id} value={candidate.id}>{candidate.name}</option>)}</select><small>一括起動はこれらの準備完了を待ちます。一括起動の対象外のものを選ぶと、一括起動は拒否されます。</small></Field><Field label="任意の依存先"><select multiple value={draft.optional_depends_on ?? []} onChange={(event) => patch("optional_depends_on", Array.from(event.target.selectedOptions).map((option) => option.value))}>{allAssets.filter((candidate) => candidate.id !== draft.id).map((candidate) => <option key={candidate.id} value={candidate.id}>{candidate.name}</option>)}</select><small>一括起動の対象なら待ち、対象外なら待たずに進みます。</small></Field><Field label="環境変数（KEY=VALUE、1行に1個）" wide><textarea value={Object.entries(draft.command.env).map(([key, value]) => `${key}=${value}`).join("\n")} onChange={(event) => patchCommand("env", parseEnv(event.target.value))} /></Field><label className="toggle"><input type="checkbox" checked={draft.enabled} onChange={(event) => patch("enabled", event.target.checked)} />一括起動の対象に含める（外しても単独では起動できます）</label></div><div className="form-actions"><button className="button danger" disabled={busy} onClick={onDelete}>{persisted ? "削除" : "破棄"}</button><button className="button primary" disabled={busy || draft.command.program.trim() === "" || draft.name.trim() === ""} onClick={() => onSave(draft)}>保存</button></div></>;
-}
-
-function CorePage({ workspace, catalog, activeCore, busy, onSaveWorkspace, onInstall, onStart, onStop }: { workspace: Workspace; catalog: CoreCatalog | null; activeCore: string; busy: boolean; onSaveWorkspace: (workspace: Workspace) => void; onInstall: (version: string) => void; onStart: () => void; onStop: () => void }) {
+function CorePage({ workspace, catalog, activeCore, busy, onSaveController, onInstall, onStart, onStop }: { workspace: Workspace; catalog: CoreCatalog | null; activeCore: string; busy: boolean; onSaveController: (controller: NonNullable<Workspace["core_controller"]>) => void; onInstall: (version: string) => void; onStart: () => void; onStop: () => void }) {
   const [controller, setController] = useState(workspace.core_controller ?? { id: crypto.randomUUID(), name: "Hakoniwa Core Controller", command: { program: "", args: [], cwd: null, env: {}, target: "native" as const }, readiness: { kind: "manual" as const } });
   const currentVersion = workspace.core_release?.version;
-  return <section className="core-page"><div className="panel"><div className="panel-heading"><div><p className="eyebrow">APPROVED CORE RELEASES</p><h2>Coreの導入と切替</h2></div><StatusBadge value={activeCore} /></div>{catalog && catalog.releases.length > 0 ? <div className="release-list">{catalog.releases.map((release) => <div className="release" key={release.version}><div><strong>hakoniwa-core-pro {release.version}</strong><small>revision: {release.source_revision} · 承認済みアーティファクト {release.artifacts.length}件</small></div><div>{currentVersion === release.version ? <span className="installed">選択中</span> : <button className="button primary small" disabled={busy} onClick={() => onInstall(release.version)}>検証して導入</button>}</div></div>)}</div> : <div className="empty-state"><strong>承認済みのOS別バイナリが未登録です。</strong><p>公式リリースには現時点でOS別バイナリ配布の整合性情報が揃っていません。リリースCIで生成した署名・SHA-256付きのアーティファクトを、管理者が承認カタログへ追加してください。</p></div>}<p className="security-note">導入時はHTTPS取得、SHA-256照合、zip-slip防止、アトミック配置を行います。検証に失敗した実行ファイルは利用しません。</p></div><div className="panel"><div className="panel-heading"><div><p className="eyebrow">CORE CONTROLLER</p><h2>実行コントローラー</h2></div><div className="button-row"><button className="button subtle" onClick={onStart}>起動</button><button className="button subtle" onClick={onStop}>停止</button></div></div><p className="muted">例: Conductor所有アセットやLauncherを指定します。<code>hako-cmd start</code>は別途ライフサイクル制御として実行されます。</p><div className="form-grid"><Field label="名称"><input value={controller.name} onChange={(event) => setController({ ...controller, name: event.target.value })} /></Field><Field label="実行ファイル / コマンド" wide><input value={controller.command.program} placeholder="例: /path/to/hako-conductor または python3.12" onChange={(event) => setController({ ...controller, command: { ...controller.command, program: event.target.value } })} /></Field><Field label="引数（1行に1個）" wide><textarea value={controller.command.args.join("\n")} onChange={(event) => setController({ ...controller, command: { ...controller.command, args: event.target.value.split("\n").map((value) => value.trim()).filter(Boolean) } })} /></Field><Field label="作業ディレクトリ" wide><input value={controller.command.cwd ?? ""} onChange={(event) => setController({ ...controller, command: { ...controller.command, cwd: event.target.value || null } })} /></Field></div><div className="form-actions"><button className="button primary" disabled={busy} onClick={() => onSaveWorkspace({ ...workspace, core_controller: controller })}>コントローラー設定を保存</button></div></div></section>;
+  return <section className="core-page"><div className="panel"><div className="panel-heading"><div><p className="eyebrow">APPROVED CORE RELEASES</p><h2>Coreの導入と切替</h2></div><StatusBadge value={activeCore} /></div>{catalog && catalog.releases.length > 0 ? <div className="release-list">{catalog.releases.map((release) => <div className="release" key={release.version}><div><strong>hakoniwa-core-pro {release.version}</strong><small>revision: {release.source_revision} · 承認済みアーティファクト {release.artifacts.length}件</small></div><div>{currentVersion === release.version ? <span className="installed">選択中</span> : <button className="button primary small" disabled={busy} onClick={() => onInstall(release.version)}>検証して導入</button>}</div></div>)}</div> : <div className="empty-state"><strong>承認済みのOS別バイナリが未登録です。</strong><p>公式リリースには現時点でOS別バイナリ配布の整合性情報が揃っていません。リリースCIで生成した署名・SHA-256付きのアーティファクトを、管理者が承認カタログへ追加してください。</p></div>}<p className="security-note">導入時はHTTPS取得、SHA-256照合、zip-slip防止、アトミック配置を行います。検証に失敗した実行ファイルは利用しません。</p></div><div className="panel"><div className="panel-heading"><div><p className="eyebrow">CORE CONTROLLER</p><h2>実行コントローラー</h2></div><div className="button-row"><button className="button subtle" onClick={onStart}>起動</button><button className="button subtle" onClick={onStop}>停止</button></div></div><p className="muted">例: Conductor所有アセットやLauncherを指定します。<code>hako-cmd start</code>は別途ライフサイクル制御として実行されます。</p><div className="form-grid"><Field label="名称"><input value={controller.name} onChange={(event) => setController({ ...controller, name: event.target.value })} /></Field><Field label="実行ファイル / コマンド" wide><input value={controller.command.program} placeholder="例: /path/to/hako-conductor または python3.12" onChange={(event) => setController({ ...controller, command: { ...controller.command, program: event.target.value } })} /></Field><Field label="引数（1行に1個）" wide><textarea value={controller.command.args.join("\n")} onChange={(event) => setController({ ...controller, command: { ...controller.command, args: event.target.value.split("\n").map((value) => value.trim()).filter(Boolean) } })} /></Field><Field label="作業ディレクトリ" wide><input value={controller.command.cwd ?? ""} onChange={(event) => setController({ ...controller, command: { ...controller.command, cwd: event.target.value || null } })} /></Field></div><div className="form-actions"><button className="button primary" disabled={busy} onClick={() => onSaveController(controller)}>コントローラー設定を保存</button></div></div></section>;
 }
 
-function WorkspacePage({ workspace, busy, preview, onChoose, onImportV1, onApply, onSave }: { workspace: Workspace; busy: boolean; preview: ImportPreview | null; onChoose: () => void; onImportV1: () => void; onApply: () => void; onSave: (workspace: Workspace) => void }) {
+function WorkspacePage({ workspace, busy, preview, onChoose, onImportV1, onApply, onRename }: { workspace: Workspace; busy: boolean; preview: ImportPreview | null; onChoose: () => void; onImportV1: () => void; onApply: () => void; onRename: (name: string) => void }) {
   const [name, setName] = useState(workspace.name);
-  return <section className="workspace-page"><div className="panel"><div className="panel-heading"><div><p className="eyebrow">BUSINESS PACK IMPORT</p><h2>設定ディレクトリを取り込む</h2></div><button className="button primary" onClick={onChoose}>ディレクトリを選択</button></div><p className="muted">Launcherのassets、Endpointのtransport、Bridgeの経路を読み取り、ワークスペースへ反映します。元ファイルは変更しません。</p>{preview && <div className="import-preview"><div className="metric-row"><Metric label="検出ファイル" value={preview.discovered_files.length} hint="JSON設定" /><Metric label="アセット" value={preview.assets.length} hint="Launcher assets[]" /><Metric label="接続" value={preview.connections.length} hint="Endpoint / Bridge" /><Metric label="注意" value={preview.warnings.length} hint="確認が必要" /></div><div className="warning-list">{preview.warnings.map((warning) => <p key={warning}>{warning}</p>)}</div><div className="form-actions"><button className="button primary" onClick={onApply}>この結果を適用</button></div></div>}</div><div className="panel"><div className="panel-heading"><div><p className="eyebrow">V1 WORKSPACE</p><h2>v1 の workspace.json を取り込む</h2></div><button className="button secondary" onClick={onImportV1}>ファイルを選択</button></div><p className="muted">以前の形式（workspace.json）の構成を、プロジェクトとして取り込みます。同じ出所のプロジェクトは置き換えるか、新しいプロジェクトとして足すかを選べます。</p></div><div className="panel"><div className="panel-heading"><div><p className="eyebrow">PROJECT</p><h2>プロジェクトの設定</h2></div></div><div className="form-grid"><Field label="プロジェクト名" wide><input value={name} onChange={(event) => setName(event.target.value)} /></Field><Field label="取込元ディレクトリ" wide><input value={workspace.source_directory ?? "未設定"} disabled /></Field></div><div className="form-actions"><button className="button primary" disabled={busy} onClick={() => onSave({ ...workspace, name })}>保存</button></div></div></section>;
+  return <section className="workspace-page"><div className="panel"><div className="panel-heading"><div><p className="eyebrow">BUSINESS PACK IMPORT</p><h2>設定ディレクトリを取り込む</h2></div><button className="button primary" onClick={onChoose}>ディレクトリを選択</button></div><p className="muted">Launcherのassets、Endpointのtransport、Bridgeの経路を読み取り、ワークスペースへ反映します。元ファイルは変更しません。</p>{preview && <div className="import-preview"><div className="metric-row"><Metric label="検出ファイル" value={preview.discovered_files.length} hint="JSON設定" /><Metric label="アセット" value={preview.assets.length} hint="Launcher assets[]" /><Metric label="接続" value={preview.connections.length} hint="Endpoint / Bridge" /><Metric label="注意" value={preview.warnings.length} hint="確認が必要" /></div><div className="warning-list">{preview.warnings.map((warning) => <p key={warning}>{warning}</p>)}</div><div className="form-actions"><button className="button primary" onClick={onApply}>この結果を適用</button></div></div>}</div><div className="panel"><div className="panel-heading"><div><p className="eyebrow">V1 WORKSPACE</p><h2>v1 の workspace.json を取り込む</h2></div><button className="button secondary" onClick={onImportV1}>ファイルを選択</button></div><p className="muted">以前の形式（workspace.json）の構成を、プロジェクトとして取り込みます。同じ出所のプロジェクトは置き換えるか、新しいプロジェクトとして足すかを選べます。</p></div><div className="panel"><div className="panel-heading"><div><p className="eyebrow">PROJECT</p><h2>プロジェクトの設定</h2></div></div><div className="form-grid"><Field label="プロジェクト名" wide><input value={name} onChange={(event) => setName(event.target.value)} /></Field><Field label="取込元ディレクトリ" wide><input value={workspace.source_directory ?? "未設定"} disabled /></Field></div><div className="form-actions"><button className="button primary" disabled={busy} onClick={() => onRename(name)}>保存</button></div></div></section>;
 }
 
 function Metric({ label, value, hint }: { label: string; value: string | number; hint: string }) { return <div className="metric"><span>{label}</span><strong>{value}</strong><small>{hint}</small></div>; }
 function StatusBadge({ value }: { value: string }) { return <span className="status-badge" data-state={value}>{labelFor(value)}</span>; }
-function Field({ label, wide, children }: { label: string; wide?: boolean; children: React.ReactNode }) { return <label className={wide ? "field wide" : "field"}><span>{label}</span>{children}</label>; }
-function Empty({ label }: { label: string }) { return <div className="empty-state">{label}</div>; }
 function EventTable({ events }: { events: WorkspaceSnapshot["recent_events"] }) { return <div className="events-table"><h3>通信タイムライン</h3>{events.length === 0 ? <Empty label="この経路のイベントはまだありません。" /> : events.slice(0, 50).map((event) => <div className="event" key={event.id}><span className="event-time">{fmt.format(new Date(event.observed_at))}</span><span className="event-type">{event.event_type}</span><span>{event.direction}</span><code>{event.pdu_name ?? "—"}</code><span>{event.byte_count ?? "—"}</span><span>{event.message}</span></div>)}</div>; }
-function parseEnv(value: string) { return Object.fromEntries(value.split("\n").map((line) => line.trim()).filter(Boolean).map((line) => { const separator = line.indexOf("="); return separator < 0 ? [line, ""] : [line.slice(0, separator).trim(), line.slice(separator + 1)]; })); }
-function messageOf(reason: unknown) { return reason instanceof Error ? reason.message : String(reason); }
 function labelFor(value: string) { return ({ running: "稼働中", starting: "起動中", stopping: "停止中", exited: "終了", failed: "失敗", connected: "通信中", idle: "待機", disconnected: "切断", unknown: "未確認" } as Record<string, string>)[value] ?? value; }
