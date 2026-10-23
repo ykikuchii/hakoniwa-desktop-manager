@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::model::{Acceptance, LibraryAsset, Member, Project, STORE_SCHEMA_VERSION};
 use crate::store::Store;
-use crate::types::{ActivationTiming, CoreController, ReadinessCheck};
+use crate::types::{ActivationTiming, AssetDefinition, ConnectionDefinition, CoreController, ReadinessCheck};
 
 /// 画面から受け取るメンバーの設定。承認（`accepted`）は持たない。承認は、表示した
 /// revision と照合する操作でだけ付ける。
@@ -210,6 +210,43 @@ pub fn set_core_controller(store: &mut Store, project_id: &str, expected: Option
     store.commit(store.draft(), project)
 }
 
+/// 取り込んだ定義を既存のプロジェクトに足すために、`taken` と重なる id を振り直す（`-2`、`-3` …）。
+/// 取り込んだ定義どうしの依存と、接続の端点・観測者も、振り直した id に合わせる。振り直した後の
+/// id を、取り込んだ順に返す。
+pub fn renumber_imported(taken: &std::collections::BTreeSet<String>, assets: &mut [AssetDefinition], connections: &mut [ConnectionDefinition]) -> Vec<String> {
+    let mut used = taken.clone();
+    used.insert(crate::model::CORE_SENTINEL.to_owned());
+    let mut map = BTreeMap::new();
+    for asset in assets.iter_mut() {
+        let mut id = asset.id.clone();
+        let mut n = 2;
+        while used.contains(&id) {
+            id = format!("{}-{n}", asset.id);
+            n += 1;
+        }
+        used.insert(id.clone());
+        map.insert(asset.id.clone(), id.clone());
+        asset.id = id;
+    }
+    let follow = |id: &mut String| {
+        if let Some(new) = map.get(id) {
+            *id = new.clone();
+        }
+    };
+    for asset in assets.iter_mut() {
+        asset.depends_on.iter_mut().for_each(follow);
+        asset.optional_depends_on.iter_mut().for_each(follow);
+    }
+    for connection in connections.iter_mut() {
+        for slot in [&mut connection.source_asset_id, &mut connection.destination_asset_id, &mut connection.owner_asset_id] {
+            if let Some(id) = slot.as_mut() {
+                follow(id);
+            }
+        }
+    }
+    assets.iter().map(|asset| asset.id.clone()).collect()
+}
+
 fn project_of(store: &Store, project_id: &str) -> Result<Project, String> {
     store.projects.get(project_id).cloned().ok_or_else(|| "そのプロジェクトはありません。".to_owned())
 }
@@ -325,6 +362,22 @@ mod tests {
         assert!(store.remove_asset(&member_asset(&store, &id, "pilot")).is_err());
         store.remove_asset(&mujoco.asset_id).unwrap();
         assert!(!store.library.contains_key(&mujoco.asset_id));
+    }
+
+    /// 既存のプロジェクトに足すときは、重なる id を振り直し、依存と接続もそれに合わせる。
+    #[test]
+    fn renumbering_imported_definitions() {
+        let workspace = v1_demo();
+        let taken: std::collections::BTreeSet<String> = workspace.assets.iter().map(|asset| asset.id.clone()).collect();
+        let mut assets = workspace.assets.clone();
+        let mut connections = vec![ConnectionDefinition { id: "c".to_owned(), source: "s".to_owned(), destination: "d".to_owned(), label: String::new(), transport: crate::types::TransportKind::Unknown, pdu_names: Vec::new(), endpoint_config: None, details: Default::default(), source_asset_id: Some("pilot".to_owned()), destination_asset_id: Some("rig-sim".to_owned()), owner_asset_id: None }];
+        let ids = renumber_imported(&taken, &mut assets, &mut connections);
+        assert!(ids.iter().all(|id| !taken.contains(id) && id != "core"), "{ids:?}");
+        let pilot = assets.iter().find(|asset| asset.id == "pilot-2").unwrap();
+        assert!(pilot.depends_on.contains(&"rig-sim-2".to_owned()), "{:?}", pilot.depends_on);
+        assert!(pilot.depends_on.iter().all(|dependency| dependency != "rig-sim"));
+        assert_eq!(connections[0].source_asset_id.as_deref(), Some("pilot-2"));
+        assert_eq!(connections[0].destination_asset_id.as_deref(), Some("rig-sim-2"));
     }
 
     /// アセットの選び直しは、表示したときのアセットと違えば拒否する。

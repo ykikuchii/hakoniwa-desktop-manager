@@ -252,6 +252,46 @@ impl Store {
         Ok(ImportOutcome { project_id: project.id, replaced })
     }
 
+    /// `.hakoproj.json` を取り込む。アセットは元の id から決めた id で置き、同じ内容のものが
+    /// ライブラリにあれば使い回す（違う内容なら新しい id になり、ライブラリの既存のものは変えない）。
+    /// `replace` のとき、同じ出所のプロジェクトがあればその id のまま置き換える。
+    /// 承認は付けない。`accept` のときだけ、読み込んだ内容で全員を承認する。
+    pub fn import_bundle(&mut self, loaded: &crate::bundle::Loaded, replace: bool, accept: bool) -> Result<ImportOutcome, String> {
+        let bundle = &loaded.bundle;
+        let origin = crate::bundle::origin(bundle);
+        let existing = replace.then(|| self.projects.values().find(|candidate| candidate.origin.as_deref() == Some(origin.as_str())).map(|candidate| candidate.id.clone())).flatten();
+        let replaced = existing.is_some();
+        let mut project = bundle.project.clone();
+        project.id = existing.unwrap_or_else(|| Uuid::new_v4().to_string());
+        // 複製として足すときは、出所を引き継がない。次の置き換えの相手が曖昧になる。
+        project.origin = (replaced || !self.projects.values().any(|candidate| candidate.origin.as_deref() == Some(origin.as_str()))).then(|| origin.clone());
+        project.last_opened_at = Some(Utc::now());
+        let mut draft = self.draft();
+        let mut ids = BTreeMap::new();
+        for asset in &bundle.assets {
+            let mut asset = asset.clone();
+            let original = asset.id.clone();
+            asset.id = crate::bundle::imported_asset_id(&original);
+            ids.insert(original, Self::stage_asset(&mut draft, asset));
+        }
+        for member in project.members.iter_mut() {
+            member.asset_id = ids.get(&member.asset_id).cloned().ok_or_else(|| format!("メンバー「{}」のアセットがファイルにありません。", member.id))?;
+            member.accepted = None;
+        }
+        if accept {
+            crate::check::accept_all(&mut project, &draft.library)?;
+        }
+        let project_id = project.id.clone();
+        self.commit(draft, project)?;
+        Ok(ImportOutcome { project_id, replaced })
+    }
+
+    /// 読み込むファイルのアセットを、ライブラリの同じ内容のもので使い回せるか。
+    pub fn reuses(&self, asset: &LibraryAsset) -> bool {
+        let id = crate::bundle::imported_asset_id(&asset.id);
+        self.library.get(&id).is_some_and(|existing| same_content(existing, &LibraryAsset { id, ..asset.clone() }))
+    }
+
     /// プロジェクトのメンバーを、今の内容で承認して保存する（全員）。
     pub fn accept(&mut self, project_id: &str) -> Result<(), String> {
         let mut project = self.projects.get(project_id).cloned().ok_or_else(|| "そのプロジェクトはありません。".to_owned())?;
@@ -492,7 +532,7 @@ fn file_stem(id: &str) -> Result<&str, String> {
     }
 }
 
-fn write_json<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), String> {
+pub(crate) fn write_json<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), String> {
     let content = serde_json::to_vec_pretty(value).map_err(|error| error.to_string())?;
     let temporary = path.with_extension("json.tmp");
     fs::write(&temporary, content).map_err(|error| format!("{} に書けません: {error}", temporary.display()))?;
