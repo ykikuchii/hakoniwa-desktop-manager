@@ -59,9 +59,17 @@ function positionFor(index: number, total: number): Position {
   };
 }
 
+/** 二次ベジェ（p0, c, p2）の t の点。 */
+function bezierAt(p0: Position, c: Position, p2: Position, t: number): Position {
+  const u = 1 - t;
+  return { x: u * u * p0.x + 2 * u * t * c.x + t * t * p2.x, y: u * u * p0.y + 2 * u * t * c.y + t * t * p2.y };
+}
+
+const FLOW_SAMPLES = 64;
+
 /**
- * 2 点（画素）を結ぶ曲線。中央の Core と重ならないよう、線の中ほどが中心から `clearance` 以上
- * 離れる側へ膨らませる。ラベルは曲線の中ほどに置く。
+ * 2 点（画素）を結ぶ曲線。中央の Core と重ならないよう、曲線のどの点も中心から `clearance` 以上
+ * 離れるまで、中心から離れる側へ膨らませる。両端はカードの縁で切り、ラベルは切った曲線の中ほどに置く。
  */
 // node はカード（114×74 px）の半分の大きさに、矢印の分の余白を足したもの。
 function flowPath(from: Position, to: Position, center: Position, clearance: number, node = { halfWidth: 61, halfHeight: 41 }) {
@@ -74,21 +82,42 @@ function flowPath(from: Position, to: Position, center: Position, clearance: num
   let ny = dx / length;
   // 中心から離れる側へ曲げる。
   if ((mx - center.x) * nx + (my - center.y) * ny < 0) { nx = -nx; ny = -ny; }
-  const distance = Math.hypot(mx - center.x, my - center.y);
-  // 二次ベジェの中ほどは、直線の中点から制御点の方向へ半分だけ進んだ所。
-  const bend = Math.max(length * 0.12, 2 * Math.max(0, clearance - distance));
-  const cx = mx + nx * bend;
-  const cy = my + ny * bend;
-  // 両端はノードの中心ではなく、カード（長方形）の縁で止める（矢印がカードに隠れないように）。
-  const trim = (point: Position) => {
-    const ux = cx - point.x;
-    const uy = cy - point.y;
-    const scale = Math.min(ux ? node.halfWidth / Math.abs(ux) : Infinity, uy ? node.halfHeight / Math.abs(uy) : Infinity, 1);
-    return { x: point.x + ux * scale, y: point.y + uy * scale };
+  const closest = (c: Position) => {
+    let min = Infinity;
+    for (let i = 0; i <= FLOW_SAMPLES; i++) {
+      const p = bezierAt(from, c, to, i / FLOW_SAMPLES);
+      min = Math.min(min, Math.hypot(p.x - center.x, p.y - center.y));
+    }
+    return min;
   };
-  const start = trim(from);
-  const end = trim(to);
-  return { d: `M ${start.x} ${start.y} Q ${cx} ${cy} ${end.x} ${end.y}`, label: { x: (mx + cx) / 2, y: (my + cy) / 2 } };
+  let bend = length * 0.12;
+  let control = { x: mx + nx * bend, y: my + ny * bend };
+  for (let i = 0; i < 24 && closest(control) < clearance; i++) {
+    bend = bend * 1.25 + 4;
+    control = { x: mx + nx * bend, y: my + ny * bend };
+  }
+  // 両端はノードの中心ではなく、カード（長方形）の縁で止める（矢印がカードに隠れないように）。
+  // 曲線がカードの外へ出る t を求め、その区間を切り出す。外へ出なければ（カードが重なるほど近い）切らない。
+  const inside = (p: Position, nodeCenter: Position) => Math.abs(p.x - nodeCenter.x) <= node.halfWidth && Math.abs(p.y - nodeCenter.y) <= node.halfHeight;
+  let t0 = 0;
+  let t1 = 1;
+  for (let i = 0; i <= FLOW_SAMPLES; i++) {
+    const t = i / FLOW_SAMPLES;
+    if (!inside(bezierAt(from, control, to, t), from)) { t0 = t; break; }
+  }
+  for (let i = FLOW_SAMPLES; i >= 0; i--) {
+    const t = i / FLOW_SAMPLES;
+    if (!inside(bezierAt(from, control, to, t), to)) { t1 = t; break; }
+  }
+  if (t1 - t0 < 1 / FLOW_SAMPLES) { t0 = 0; t1 = 1; }
+  // [t0, t1] の区間も二次ベジェで、制御点は blossom (t0, t1)。
+  const start = bezierAt(from, control, to, t0);
+  const end = bezierAt(from, control, to, t1);
+  const w0 = (1 - t0) * (1 - t1);
+  const w1 = (1 - t0) * t1 + t0 * (1 - t1);
+  const w2 = t0 * t1;
+  const c = { x: w0 * from.x + w1 * control.x + w2 * to.x, y: w0 * from.y + w1 * control.y + w2 * to.y };
+  return { d: `M ${start.x} ${start.y} Q ${c.x} ${c.y} ${end.x} ${end.y}`, label: bezierAt(start, c, end, 0.5) };
 }
 
 function flowKey(flow: PduFlow) {
@@ -161,7 +190,8 @@ export function TopologyPage({
   useEffect(() => { if (selectedFlowKey && !selectedFlow) setSelectedFlowKey(null); }, [selectedFlowKey, selectedFlow]);
   const toPixels = (position: Position) => ({ x: (position.x / 100) * stageSize.width, y: (position.y / 100) * stageSize.height });
   const center = toPixels({ x: 50, y: 50 });
-  const clearance = Math.min(stageSize.width, stageSize.height) * 0.16;
+  // Core（直径 142 px）の半径に余白を足したものを下限にする。
+  const clearance = Math.max(Math.min(stageSize.width, stageSize.height) * 0.16, 83);
   const drawn = flows.map((flow) => {
     const directions = new Set(flow.channels.map((channel) => channel.direction));
     return {
