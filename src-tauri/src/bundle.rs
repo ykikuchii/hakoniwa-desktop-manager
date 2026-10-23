@@ -415,6 +415,36 @@ mod tests {
         assert!(store.projects[&third.project_id].origin.is_none(), "複製は出所を持たない");
     }
 
+    /// 生成スクリプトが書いた `.hakoproj.json` を読み込むと、同じスクリプトが書いた v1 と同じ構成になり、
+    /// 承認すれば一括起動を止める理由がない。`HDM_GIMBAL_BUNDLE` と `HDM_GIMBAL_WORKSPACE` を渡したときだけ実行する。
+    #[test]
+    fn gimbal_drone_demo_bundle_matches_the_v1_workspace() {
+        let (Ok(bundle_path), Ok(v1_path)) = (std::env::var("HDM_GIMBAL_BUNDLE"), std::env::var("HDM_GIMBAL_WORKSPACE")) else { return };
+        let loaded = load(Path::new(&bundle_path), None).unwrap();
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+        let mut project = loaded.bundle.project.clone();
+        let library: Library = loaded.bundle.assets.iter().map(|asset| (asset.id.clone(), asset.clone())).collect();
+        let resolved = crate::resolve::resolve(&project, &library).unwrap();
+        let v1: crate::types::Workspace = serde_json::from_slice(&std::fs::read(&v1_path).unwrap()).unwrap();
+        let key = |path: &Option<String>| path.as_deref().map(|path| fold(&clean(path)));
+        for (a, b) in resolved.assets.iter().zip(&v1.assets) {
+            assert_eq!(a.id, b.id);
+            assert_eq!(key(&a.command.cwd), key(&b.command.cwd), "{}", a.id);
+            assert_eq!(a.command.args, b.command.args, "{}", a.id);
+            assert_eq!(a.config_files, b.config_files, "{}", a.id);
+            assert_eq!(a.depends_on, b.depends_on, "{}", a.id);
+            assert_eq!(a.optional_depends_on, b.optional_depends_on, "{}", a.id);
+            assert_eq!(a.enabled, b.enabled, "{}", a.id);
+            let env = |env: &std::collections::BTreeMap<String, String>| env.iter().map(|(k, v)| (k.clone(), fold(&clean(v)))).collect::<Vec<_>>();
+            assert_eq!(env(&a.command.env), env(&b.command.env), "{}", a.id);
+        }
+        assert_eq!(resolved.assets.len(), v1.assets.len());
+        assert!(project.core_release.is_some());
+        crate::check::accept_all(&mut project, &library).unwrap();
+        let check = crate::check::check_project(&project, &library).unwrap();
+        assert!(check.blocking_reasons().is_empty(), "{:?}", check.blocking_reasons());
+    }
+
     #[test]
     fn unknown_formats_are_refused() {
         let dir = std::env::temp_dir().join(format!("hdm-bundle-bad-{}", std::process::id()));
