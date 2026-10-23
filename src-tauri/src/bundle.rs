@@ -445,6 +445,23 @@ mod tests {
         assert!(check.blocking_reasons().is_empty(), "{:?}", check.blocking_reasons());
     }
 
+    /// `HDM_EXTRA_BUNDLES`（`;` 区切り）に渡した `.hakoproj.json` が、警告なしに読み込めて解決でき、
+    /// 承認すれば一括起動を止める理由がない。渡したときだけ実行する。
+    #[test]
+    fn extra_bundles_load_cleanly() {
+        let Ok(files) = std::env::var("HDM_EXTRA_BUNDLES") else { return };
+        for file in files.split(';').filter(|file| !file.is_empty()) {
+            let loaded = load(Path::new(file), None).unwrap_or_else(|error| panic!("{file}: {error}"));
+            assert!(loaded.warnings.is_empty(), "{file}: {:?}", loaded.warnings);
+            let mut project = loaded.bundle.project.clone();
+            let library: Library = loaded.bundle.assets.iter().map(|asset| (asset.id.clone(), asset.clone())).collect();
+            crate::resolve::resolve(&project, &library).unwrap();
+            crate::check::accept_all(&mut project, &library).unwrap();
+            let check = crate::check::check_project(&project, &library).unwrap();
+            assert!(check.blocking_reasons().is_empty(), "{file}: {:?}", check.blocking_reasons());
+        }
+    }
+
     #[test]
     fn unknown_formats_are_refused() {
         let dir = std::env::temp_dir().join(format!("hdm-bundle-bad-{}", std::process::id()));
