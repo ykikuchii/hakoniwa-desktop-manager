@@ -133,7 +133,61 @@ function flowPath(from: Position, to: Position, center: Position, clearance: num
   const w1 = (1 - t0) * t1 + t0 * (1 - t1);
   const w2 = t0 * t1;
   const c = { x: w0 * from.x + w1 * control.x + w2 * to.x, y: w0 * from.y + w1 * control.y + w2 * to.y };
-  return { d: `M ${start.x} ${start.y} Q ${c.x} ${c.y} ${end.x} ${end.y}`, label: bezierAt(start, c, end, 0.5) };
+  return { d: `M ${start.x} ${start.y} Q ${c.x} ${c.y} ${end.x} ${end.y}`, curve: { start, c, end }, label: bezierAt(start, c, end, 0.5) };
+}
+
+function distanceToSegment(p: Position, a: Position, b: Position) {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const t = dx || dy ? Math.min(Math.max(((p.x - a.x) * dx + (p.y - a.y) * dy) / (dx * dx + dy * dy), 0), 1) : 0;
+  return Math.hypot(p.x - (a.x + dx * t), p.y - (a.y + dy * t));
+}
+
+/** 点から、中心 `center`・半分の大きさ（halfWidth, halfHeight）の長方形までの距離（内側なら 0）。 */
+function distanceToRect(p: Position, center: Position, halfWidth: number, halfHeight: number) {
+  return Math.hypot(Math.max(Math.abs(p.x - center.x) - halfWidth, 0), Math.max(Math.abs(p.y - center.y) - halfHeight, 0));
+}
+
+// ラベル（直径 20 px）を、ほかの線やラベルから離れたとみなす距離。
+const LABEL_CLEARANCE = 22;
+const LABEL_CANDIDATES = 24;
+const CURVE_SAMPLES = 32;
+
+type Curve = { start: Position; c: Position; end: Position };
+
+/**
+ * 各曲線のラベルを、ほかのものから離れた位置に置く。避けるのは、Core から各ノードへの線、ノードのカード、
+ * ほかの流れの曲線、先に置いたラベル。曲線の中ほど（t = 0.2〜0.8）から、近くのものとの距離が十分な点のうち、
+ * 前回置いた t（なければ中央）に近い点を選ぶ。キーの順に置くので、流れの並び順によらない。
+ */
+function placeLabels(items: { key: string; curve: Curve }[], spokes: [Position, Position][], cards: Position[], previous: Map<string, number>) {
+  const samples = new Map(items.map(({ key, curve }) => [key, Array.from({ length: CURVE_SAMPLES + 1 }, (_, i) => bezierAt(curve.start, curve.c, curve.end, i / CURVE_SAMPLES))]));
+  const placed: Position[] = [];
+  const result = new Map<string, { point: Position; t: number }>();
+  for (const { key, curve } of [...items].sort((x, y) => (x.key < y.key ? -1 : x.key > y.key ? 1 : 0))) {
+    const anchor = previous.get(key) ?? 0.5;
+    let best = { point: bezierAt(curve.start, curve.c, curve.end, anchor), t: anchor };
+    let bestScore = -Infinity;
+    for (let i = 0; i <= LABEL_CANDIDATES; i++) {
+      const t = 0.2 + (i / LABEL_CANDIDATES) * 0.6;
+      const p = bezierAt(curve.start, curve.c, curve.end, t);
+      let near = Infinity;
+      for (const [a, b] of spokes) near = Math.min(near, distanceToSegment(p, a, b));
+      // カードは 114×74 px。
+      for (const card of cards) near = Math.min(near, distanceToRect(p, card, 57, 37));
+      for (const [other, points] of samples) {
+        if (other === key) continue;
+        for (let j = 1; j < points.length; j++) near = Math.min(near, distanceToSegment(p, points[j - 1], points[j]));
+      }
+      for (const q of placed) near = Math.min(near, Math.hypot(p.x - q.x, p.y - q.y));
+      // 十分離れていれば、それ以上は区別せず前回の位置（なければ中央）に近い点を選ぶ。
+      const score = Math.min(near, LABEL_CLEARANCE) - Math.abs(t - anchor) * 4;
+      if (score > bestScore) { bestScore = score; best = { point: p, t }; }
+    }
+    placed.push(best.point);
+    result.set(key, best);
+  }
+  return result;
 }
 
 function flowKey(flow: PduFlow) {
@@ -204,6 +258,7 @@ export function TopologyPage({
   const selectedFlow = flows.find((flow) => flowKey(flow) === selectedFlowKey) ?? null;
   // 選んでいた流れがなくなったら、選択を外す。
   useEffect(() => { if (selectedFlowKey && !selectedFlow) setSelectedFlowKey(null); }, [selectedFlowKey, selectedFlow]);
+  const labelTs = useRef(new Map<string, number>());
   // 線は表示していて、枠の大きさが分かっているときだけ求める。
   const drawn = useMemo(() => {
     if (!showFlows || stageSize.width <= 0 || stageSize.height <= 0) return [];
@@ -211,17 +266,27 @@ export function TopologyPage({
     const center = toPixels({ x: 50, y: 50 });
     // Core（直径 142 px）の半径に余白を足したものを下限にする。
     const clearance = Math.max(Math.min(stageSize.width, stageSize.height) * 0.16, 83);
-    return flows.map((flow) => {
+    const paths = flows.map((flow) => flowPath(toPixels(positions.get(flow.a)!), toPixels(positions.get(flow.b)!), center, clearance, stageSize));
+    // Core から各ノードへの線（接続の線）にラベルが乗らないようにする。
+    const spokes = [...positions.values()].map((position): [Position, Position] => [center, toPixels(position)]);
+    const cards = [...positions.values()].map(toPixels);
+    const labels = placeLabels(flows.map((flow, index) => ({ key: flowKey(flow), curve: paths[index].curve })), spokes, cards, labelTs.current);
+    return flows.map((flow, index) => {
       const directions = new Set(flow.channels.map((channel) => channel.direction));
       return {
         flow,
         key: flowKey(flow),
-        path: flowPath(toPixels(positions.get(flow.a)!), toPixels(positions.get(flow.b)!), center, clearance, stageSize),
+        path: { ...paths[index], label: labels.get(flowKey(flow))!.point },
+        labelT: labels.get(flowKey(flow))!.t,
         toB: directions.has("a_to_b") || directions.has("both"),
         toA: directions.has("b_to_a") || directions.has("both"),
       };
     });
   }, [flows, positions, showFlows, stageSize]);
+  // 次に置き直すとき（枠の大きさが変わったときなど）にラベルが跳ばないよう、置いた位置を覚えておく。
+  useEffect(() => {
+    if (drawn.length > 0) labelTs.current = new Map(drawn.map((item) => [item.key, item.labelT]));
+  }, [drawn]);
   const nameOf = (id: string) => assets.find((asset) => asset.id === id)?.name ?? id;
   const selectedConnection = selected ?? null;
   const activeNode = assets.find((asset) => asset.id === activeNodeId) ?? null;
