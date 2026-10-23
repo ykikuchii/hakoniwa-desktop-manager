@@ -36,10 +36,14 @@ export function LibraryPage({ projectId, members, running, busy, focusAssetId, o
 
   const selected = entries?.find((entry) => entry.asset.id === selectedId) ?? null;
   const save = (asset: LibraryAsset, baseId: string | null, applyMemberIds: string[]) => onRun(async () => {
-    const id = await api.saveLibraryAsset(asset, baseId, applyMemberIds.length > 0 ? projectId : null, applyMemberIds);
-    setCreating(false);
-    setSelectedId(id);
-    await load();
+    try {
+      const id = await api.saveLibraryAsset(asset, baseId, applyMemberIds.length > 0 ? projectId : null, applyMemberIds);
+      setCreating(false);
+      setSelectedId(id);
+    } finally {
+      // 失敗しても読み直す。アセットだけ書けてプロジェクトの保存に失敗したとき、そのアセットを一覧に出すため。
+      await load();
+    }
   }, applyMemberIds.length > 0 ? "アセットを保存し、選んだメンバーに反映しました。" : "アセットをライブラリに保存しました。");
   const remove = (id: string) => onRun(async () => { await api.deleteLibraryAsset(id); setSelectedId(null); await load(); }, "アセットをライブラリから消しました。");
 

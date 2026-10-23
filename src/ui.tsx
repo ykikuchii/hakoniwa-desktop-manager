@@ -35,7 +35,9 @@ export function ContractView({ contract }: { contract: LaunchContract }) {
   const { launch } = contract;
   const env = Object.entries(launch.env);
   return <dl className="definition">
-    <dt>コマンド</dt><dd><code>{[launch.program, ...launch.args].join(" ")}</code></dd>
+    <dt>実行ファイル</dt><dd><code>{launch.program}</code></dd>
+    {/* 引数は区切りが分かるよう 1 つずつ、空白も見える形（JSON の文字列）で出す。 */}
+    <dt>引数</dt><dd>{launch.args.length === 0 ? "—" : launch.args.map((arg, index) => <code key={index} className="arg">{JSON.stringify(arg)}</code>)}</dd>
     <dt>作業ディレクトリ</dt><dd>{launch.cwd ?? "—"}</dd>
     <dt>実行環境</dt><dd>{launch.target === "native" ? "ローカル" : `WSL（${launch.target.wsl.distribution}）`}</dd>
     <dt>環境変数</dt><dd>{env.length === 0 ? "—" : env.map(([key, value]) => <code key={key} className="env-line">{key}={value}</code>)}</dd>
