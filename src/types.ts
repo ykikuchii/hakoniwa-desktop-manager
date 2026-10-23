@@ -29,11 +29,69 @@ export interface AssetDefinition {
   enabled: boolean;
 }
 
+export type ReadinessCheck = { kind: "manual" } | { kind: "log_contains"; text: string } | { kind: "tcp_port"; host: string; port: number };
+
 export interface CoreController {
   id: string;
   name: string;
   command: ProgramSpec;
-  readiness: { kind: "manual" } | { kind: "log_contains"; text: string } | { kind: "tcp_port"; host: string; port: number };
+  readiness: ReadinessCheck;
+}
+
+export type Usage = "register" | "attach";
+export type Access = "read" | "write" | "unknown";
+
+export interface PduEntrySpec { path: string; usage: Usage; usage_inferred: boolean }
+export interface ManualAccess { robot: string; channel_id: number; access: Access }
+
+export interface Variant {
+  id: string;
+  label: string;
+  launch: ProgramSpec;
+  activation_timing: ActivationTiming;
+  readiness: ReadinessCheck;
+  config_files: string[];
+  pdu_entries: PduEntrySpec[];
+  extra_inputs: string[];
+  manual_access: ManualAccess[];
+}
+
+export interface LibraryAsset {
+  schema_version: number;
+  id: string;
+  name: string;
+  role: AssetRole;
+  description: string;
+  root_dir?: string | null;
+  variants: Variant[];
+  updated_at: string;
+}
+
+export interface LibraryEntry {
+  asset: LibraryAsset;
+  used_by: { project_id: string; project_name: string; member_ids: string[] }[];
+}
+
+/** プロジェクトのメンバーの設定。承認は含まない。 */
+export interface MemberSettings {
+  id: string;
+  asset_id: string;
+  variant_id: string;
+  name?: string | null;
+  enabled: boolean;
+  depends_on: string[];
+  optional_depends_on: string[];
+  activation_timing?: ActivationTiming | null;
+  readiness?: ReadinessCheck | null;
+  env_overrides: Record<string, string>;
+}
+
+export interface VariantPorts {
+  entries: PduEntrySpec[];
+  inferred: boolean;
+  channels: ChannelUse[];
+  problems: string[];
+  coverage: "complete" | "partial";
 }
 
 export interface InstalledCoreSelection {
@@ -125,6 +183,8 @@ export interface WorkspaceSnapshot {
   /** 実行中のプロジェクト。実行中は切り替えも変更もできない。 */
   running_project_id?: string | null;
   store_warnings: string[];
+  /** アクティブなプロジェクトのメンバーの設定。 */
+  members: MemberSettings[];
 }
 
 export type Severity = "error" | "warning" | "info";
@@ -138,6 +198,24 @@ export interface Finding {
   message: string;
 }
 
+export interface LaunchContract {
+  launch: ProgramSpec;
+  activation_timing: ActivationTiming;
+  readiness: ReadinessCheck;
+  depends_on: string[];
+  optional_depends_on: string[];
+}
+
+export interface ChannelUse {
+  robot: string;
+  channel_id: number;
+  org_name: string;
+  type_name: string;
+  pdu_size: number;
+  registers: boolean;
+  access: Access[];
+}
+
 export interface MemberCheck {
   member_id: string;
   name: string;
@@ -147,6 +225,10 @@ export interface MemberCheck {
   revision: string;
   acceptance: "no_pdu_config" | "accepted" | "changed" | "not_accepted" | "unverified";
   changes: string[];
+  contract: LaunchContract;
+  files_checked: boolean;
+  channels: ChannelUse[];
+  port_changes: string[];
 }
 
 export interface ProjectCheck {

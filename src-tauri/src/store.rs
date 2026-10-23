@@ -295,22 +295,75 @@ impl Store {
             asset.validate()?;
         }
         project.validate(&draft.library)?;
+        let mut written = Vec::new();
+        let saved = draft.writes.iter().try_for_each(|asset| self.save_asset(asset).map(|()| written.push(asset.clone()))).and_then(|()| self.save_project(&project));
+        if let Err(error) = saved {
+            // 書けたアセットはディスクに残り、次の起動で読み込まれる。今の一覧にも出しておく
+            // （どこからも参照されていないアセットとして見え、消せる）。
+            for asset in written {
+                self.library.insert(asset.id.clone(), asset);
+            }
+            return Err(error);
+        }
+        self.library = draft.library;
+        self.projects.insert(project.id.clone(), project);
+        self.remove_unreferenced(&draft.superseded);
+        Ok(())
+    }
+
+    /// プロジェクトを変えずに、ライブラリへの書き込みだけを反映する。
+    pub fn commit_library(&mut self, draft: LibraryDraft) -> Result<(), String> {
+        for asset in &draft.writes {
+            asset.validate()?;
+        }
         for asset in &draft.writes {
             self.save_asset(asset)?;
         }
-        self.save_project(&project)?;
         self.library = draft.library;
-        self.projects.insert(project.id.clone(), project);
-        for id in draft.superseded {
-            let referenced = self.projects.values().any(|candidate| candidate.members.iter().any(|member| member.asset_id == id));
-            if !referenced {
-                self.library.remove(&id);
-                if let Ok(stem) = file_stem(&id) {
-                    let _ = fs::remove_file(self.assets_dir().join(format!("{stem}.json")));
+        self.remove_unreferenced(&draft.superseded);
+        Ok(())
+    }
+
+    /// どのプロジェクトも使っていないアセットを消す。使われていれば、使っているプロジェクトを挙げて拒否する。
+    pub fn remove_asset(&mut self, id: &str) -> Result<(), String> {
+        let users: Vec<&str> = self.projects.values().filter(|project| project.members.iter().any(|member| member.asset_id == id)).map(|project| project.name.as_str()).collect();
+        if !users.is_empty() {
+            return Err(format!("このアセットは、プロジェクト {} が使っているので消せません。", users.join("、")));
+        }
+        if !self.library.contains_key(id) {
+            return Err("そのアセットはライブラリにありません。".to_owned());
+        }
+        self.ensure_writable()?;
+        let path = self.assets_dir().join(format!("{}.json", file_stem(id)?));
+        fs::remove_file(&path).map_err(|error| format!("{} を消せません: {error}", path.display()))?;
+        self.library.remove(id);
+        Ok(())
+    }
+
+    /// 置き換えられたアセットのうち、どこからも参照されていないものを片付ける。
+    /// ファイルを消せなかったものは一覧に残し、警告に出す（消したことにすると、次の起動で
+    /// 読み込まれて一覧と食い違う）。
+    fn remove_unreferenced(&mut self, superseded: &[String]) {
+        for id in superseded {
+            let referenced = self.projects.values().any(|candidate| candidate.members.iter().any(|member| &member.asset_id == id));
+            if referenced {
+                continue;
+            }
+            let removed = file_stem(id).and_then(|stem| {
+                let path = self.assets_dir().join(format!("{stem}.json"));
+                match fs::remove_file(&path) {
+                    Ok(()) => Ok(()),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(error) => Err(format!("使われなくなったアセット {} を消せませんでした（ライブラリから消してください）: {error}", path.display())),
                 }
+            });
+            match removed {
+                Ok(()) => {
+                    self.library.remove(id);
+                }
+                Err(warning) => self.warnings.push(warning),
             }
         }
-        Ok(())
     }
 
     pub fn save_asset(&self, asset: &LibraryAsset) -> Result<(), String> {

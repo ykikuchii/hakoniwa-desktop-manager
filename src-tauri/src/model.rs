@@ -142,6 +142,23 @@ pub struct Acceptance {
     /// manifest（ほかの監視ファイルも含む）から推し量らずに判断するため。
     #[serde(default)]
     pub had_pdu_entries: bool,
+    /// 承認したときのチャネル。画面で差分を見せるためのもので、照合には使わない。
+    #[serde(default)]
+    pub channels: Vec<ChannelUse>,
+}
+
+/// メンバー 1 つが、チャネル 1 つをどう使うか。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChannelUse {
+    pub robot: String,
+    pub channel_id: i64,
+    pub org_name: String,
+    pub type_name: String,
+    pub pdu_size: i64,
+    /// このメンバーがチャネルを作る（`asset_register` に渡す）。
+    pub registers: bool,
+    /// 宣言された向き（重複なし、順序つき）。
+    pub access: Vec<Access>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

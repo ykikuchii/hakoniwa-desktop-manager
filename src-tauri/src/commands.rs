@@ -38,12 +38,13 @@ pub fn get_snapshot(state: State<'_, AppState>) -> Result<WorkspaceSnapshot, Str
     let _ = crate::linking::resolve_links(&workspace.assets, &mut workspace.imported_connections);
     let processes = state.processes.snapshots();
     harvest_monitor_logs(&state, &workspace, &processes);
-    let (projects, active_project_id) = {
+    let (projects, active_project_id, members) = {
         let store = state.lock_store()?;
         store_warnings.splice(0..0, store.warnings.iter().cloned());
         let mut projects: Vec<ProjectSummary> = store.projects.values().map(|project| ProjectSummary { id: project.id.clone(), name: project.name.clone() }).collect();
         projects.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
-        (projects, store.active_project_id().to_owned())
+        let members = store.projects.get(store.active_project_id()).map(|project| project.members.iter().map(crate::manage::MemberSettings::of).collect()).unwrap_or_default();
+        (projects, store.active_project_id().to_owned(), members)
     };
     Ok(WorkspaceSnapshot {
         workspace: workspace.clone(),
@@ -56,6 +57,7 @@ pub fn get_snapshot(state: State<'_, AppState>) -> Result<WorkspaceSnapshot, Str
         active_project_id,
         running_project_id: state.running_project_id(),
         store_warnings,
+        members,
     })
 }
 
@@ -68,55 +70,6 @@ fn edit_active_workspace(state: &AppState, edit: impl FnOnce(&mut Workspace) -> 
     edit(&mut workspace)?;
     crate::edit::apply_workspace(&mut *state.lock_store()?, &project_id, &workspace)?;
     state.active_workspace()
-}
-
-#[tauri::command]
-pub fn save_workspace(state: State<'_, AppState>, workspace: Workspace) -> Result<Workspace, String> {
-    edit_active_workspace(&state, |current| {
-        // 画面が切り替え前のプロジェクトを送ってきたら拒否する。書くと、前のプロジェクトの
-        // 内容で今のプロジェクトを上書きしてしまう。
-        if workspace.id != current.id {
-            return Err("表示中のプロジェクトが切り替わっています。画面が更新されてから、もう一度保存してください。".to_owned());
-        }
-        *current = Workspace { schema_version: current.schema_version, ..workspace };
-        Ok(())
-    })
-}
-
-#[tauri::command]
-pub fn create_asset(state: State<'_, AppState>, asset: AssetDefinition) -> Result<Workspace, String> {
-    asset.command.validate()?;
-    edit_active_workspace(&state, |workspace| {
-        if workspace.assets.iter().any(|candidate| candidate.id == asset.id) {
-            return Err("同じアセットIDが既に存在します。".to_owned());
-        }
-        workspace.assets.push(asset);
-        Ok(())
-    })
-}
-
-#[tauri::command]
-pub fn update_asset(state: State<'_, AppState>, asset: AssetDefinition) -> Result<Workspace, String> {
-    asset.command.validate()?;
-    edit_active_workspace(&state, |workspace| {
-        let existing = workspace.assets.iter_mut().find(|candidate| candidate.id == asset.id).ok_or_else(|| "更新対象のアセットが見つかりません。".to_owned())?;
-        *existing = asset;
-        Ok(())
-    })
-}
-
-#[tauri::command]
-pub fn delete_asset(state: State<'_, AppState>, asset_id: String) -> Result<Workspace, String> {
-    edit_active_workspace(&state, |workspace| {
-        let before = workspace.assets.len();
-        workspace.assets.retain(|asset| asset.id != asset_id);
-        if before == workspace.assets.len() { return Err("削除対象のアセットが見つかりません。".to_owned()); }
-        for asset in &mut workspace.assets {
-            asset.depends_on.retain(|dependency| dependency != &asset_id);
-            asset.optional_depends_on.retain(|dependency| dependency != &asset_id);
-        }
-        Ok(())
-    })
 }
 
 #[tauri::command]
@@ -905,25 +858,10 @@ pub fn accept_member_changes(state: State<'_, AppState>, project_id: String, rev
 /// ライブラリのアセットをメンバーとして足したら、接続チェックがどうなるかを返す。保存しない。
 // ファイルを読むので、UI を止めないよう async にする。
 #[tauri::command(async)]
-pub fn preview_add_member(state: State<'_, AppState>, asset_id: String, variant_id: String, member_id: String) -> Result<crate::check::ProjectCheck, String> {
-    let (project, mut library) = check_snapshot(&state, None)?;
-    if let Some(asset) = state.lock_store()?.library.get(&asset_id) {
-        library.insert(asset.id.clone(), asset.clone());
-    }
-    let member = crate::model::Member {
-        id: member_id,
-        asset_id,
-        variant_id,
-        name: None,
-        enabled: true,
-        depends_on: Vec::new(),
-        optional_depends_on: Vec::new(),
-        activation_timing: None,
-        readiness: None,
-        env_overrides: Default::default(),
-        accepted: None,
-    };
-    crate::check::preview_add(&project, &library, member)
+pub fn preview_add_member(state: State<'_, AppState>, project_id: String, member: crate::manage::MemberSettings) -> Result<crate::check::ProjectCheck, String> {
+    let (project, library) = add_member_snapshot(&state, &project_id, &member.asset_id)?;
+    let candidate = crate::manage::with_new_member(&project, member)?;
+    crate::check::check_project(&candidate, &library)
 }
 
 #[tauri::command]
@@ -1329,4 +1267,116 @@ Usage: hako-cmd ..."), None);
         let path = std::env::temp_dir().join(format!("hdm-test-missing-{}.bin", std::process::id()));
         assert_eq!(master_lock_free_seen(&path, Duration::from_millis(200)), None);
     }
+}
+
+const SWITCHED: &str = "表示中のプロジェクトが切り替わっています。画面を読み直してから操作してください。";
+
+/// アクティブで実行中でないプロジェクト `project_id` を、ゲートとストアのロックの下で編集する。
+fn edit_project<T>(state: &AppState, project_id: &str, edit: impl FnOnce(&mut crate::store::Store) -> Result<T, String>) -> Result<T, String> {
+    let _gate = state.ensure_mutable(project_id)?;
+    let mut store = state.lock_store()?;
+    if store.active_project_id() != project_id {
+        return Err(SWITCHED.to_owned());
+    }
+    edit(&mut store)
+}
+
+/// 複製を取った後で、プロジェクトとそのアセットが変わっていないか。
+fn snapshot_unchanged(store: &crate::store::Store, project: &crate::model::Project, library: &crate::model::Library) -> bool {
+    store.projects.get(&project.id).is_some_and(|current| serde_json::to_value(current).ok() == serde_json::to_value(project).ok())
+        && library.iter().all(|(id, asset)| store.library.get(id).is_some_and(|current| serde_json::to_value(current).ok() == serde_json::to_value(asset).ok()))
+}
+
+#[tauri::command]
+pub fn get_library(state: State<'_, AppState>) -> Result<Vec<crate::manage::LibraryEntry>, String> {
+    Ok(crate::manage::library_view(&*state.lock_store()?))
+}
+
+/// ライブラリのアセットを保存する。`apply_member_ids` が空でなければ、プロジェクト `project_id` の
+/// それらのメンバー（`base_id` を使っているもの）を、保存した版に付け替える。
+#[tauri::command]
+pub fn save_library_asset(state: State<'_, AppState>, asset: crate::model::LibraryAsset, base_id: Option<String>, project_id: Option<String>, apply_member_ids: Vec<String>) -> Result<String, String> {
+    match project_id.filter(|_| !apply_member_ids.is_empty()) {
+        Some(project_id) => edit_project(&state, &project_id, |store| crate::manage::save_library_asset(store, asset, base_id.as_deref(), Some(crate::manage::Apply { project_id: &project_id, member_ids: &apply_member_ids }))),
+        // プロジェクトを書き換えないので、実行中でも保存できる（実行中の構成は凍結済み）。
+        None => crate::manage::save_library_asset(&mut *state.lock_store()?, asset, base_id.as_deref(), None),
+    }
+}
+
+#[tauri::command]
+pub fn delete_library_asset(state: State<'_, AppState>, asset_id: String) -> Result<(), String> {
+    state.lock_store()?.remove_asset(&asset_id)
+}
+
+/// バリエーションの PDU 設定から読んだポート。保存しない（編集中の内容でも見られる）。
+#[derive(serde::Serialize)]
+pub struct VariantPorts {
+    entries: Vec<crate::model::PduEntrySpec>,
+    inferred: bool,
+    channels: Vec<crate::model::ChannelUse>,
+    problems: Vec<String>,
+    coverage: crate::ports::Coverage,
+}
+
+// ファイルを読むので、UI を止めないよう async にする。
+#[tauri::command(async)]
+pub fn inspect_variant(variant: crate::model::Variant) -> Result<VariantPorts, String> {
+    let (entries, inferred) = crate::check::effective_entries(&variant, &variant.activation_timing);
+    let ports = crate::check::member_ports(&variant, &entries);
+    Ok(VariantPorts { entries, inferred, channels: crate::check::channel_uses(&ports), problems: ports.problems, coverage: ports.coverage })
+}
+
+#[tauri::command]
+pub fn update_member(state: State<'_, AppState>, project_id: String, expected: crate::manage::MemberSettings, member: crate::manage::MemberSettings) -> Result<(), String> {
+    edit_project(&state, &project_id, |store| crate::manage::update_member(store, &project_id, &expected, member))
+}
+
+#[tauri::command]
+pub fn set_member_asset(state: State<'_, AppState>, project_id: String, member_id: String, expected_asset_id: String, expected_variant_id: String, asset_id: String, variant_id: String) -> Result<(), String> {
+    edit_project(&state, &project_id, |store| crate::manage::set_member_asset(store, &project_id, &member_id, &expected_asset_id, &expected_variant_id, &asset_id, &variant_id))
+}
+
+#[tauri::command]
+pub fn remove_member(state: State<'_, AppState>, project_id: String, expected: crate::manage::MemberSettings) -> Result<(), String> {
+    edit_project(&state, &project_id, |store| crate::manage::remove_member(store, &project_id, &expected))
+}
+
+/// メンバーを足す。`shown_revision` が、プレビューで表示したそのメンバーの revision と一致すれば
+/// 承認済みで足す（利用者は所見とポートを見てから足している）。一致しなければ拒否する。
+// ファイルを読むので、UI を止めないよう async にする。
+#[tauri::command(async)]
+pub fn add_member(state: State<'_, AppState>, project_id: String, member: crate::manage::MemberSettings, shown_revision: Option<String>) -> Result<(), String> {
+    let (snapshot, library) = add_member_snapshot(&state, &project_id, &member.asset_id)?;
+    let member_id = member.id.clone();
+    let mut candidate = crate::manage::with_new_member(&snapshot, member)?;
+    if let Some(revision) = shown_revision {
+        crate::check::accept_shown(&mut candidate, &library, &BTreeMap::from([(member_id, revision)]))?;
+    }
+    edit_project(&state, &project_id, |store| {
+        if !snapshot_unchanged(store, &snapshot, &library) {
+            return Err("追加している間にプロジェクトかアセットが変わりました。プレビューを見直してから追加してください。".to_owned());
+        }
+        store.commit(store.draft(), candidate)
+    })
+}
+
+/// プロジェクトとライブラリの複製に、足すアセットを加えたもの。
+fn add_member_snapshot(state: &AppState, project_id: &str, asset_id: &str) -> Result<(crate::model::Project, crate::model::Library), String> {
+    if state.lock_store()?.active_project_id() != project_id {
+        return Err(SWITCHED.to_owned());
+    }
+    let (project, mut library) = check_snapshot(state, Some(project_id.to_owned()))?;
+    let asset = state.lock_store()?.library.get(asset_id).cloned().ok_or_else(|| "そのアセットはライブラリにありません。".to_owned())?;
+    library.insert(asset.id.clone(), asset);
+    Ok((project, library))
+}
+
+#[tauri::command]
+pub fn rename_project(state: State<'_, AppState>, project_id: String, expected: String, name: String) -> Result<(), String> {
+    edit_project(&state, &project_id, |store| crate::manage::rename_project(store, &project_id, &expected, &name))
+}
+
+#[tauri::command]
+pub fn set_core_controller(state: State<'_, AppState>, project_id: String, expected: Option<crate::types::CoreController>, controller: Option<crate::types::CoreController>) -> Result<(), String> {
+    edit_project(&state, &project_id, |store| crate::manage::set_core_controller(store, &project_id, expected.as_ref(), controller))
 }

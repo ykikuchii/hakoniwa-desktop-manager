@@ -5,6 +5,7 @@ mod core;
 mod edit;
 mod importer;
 mod linking;
+mod manage;
 mod model;
 mod monitor;
 mod ports;
@@ -116,10 +117,6 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_snapshot,
-            commands::save_workspace,
-            commands::create_asset,
-            commands::update_asset,
-            commands::delete_asset,
             commands::start_asset,
             commands::stop_asset,
             commands::start_core_controller,
@@ -141,6 +138,16 @@ pub fn run() {
             commands::check_project,
             commands::accept_member_changes,
             commands::preview_add_member,
+            commands::get_library,
+            commands::save_library_asset,
+            commands::delete_library_asset,
+            commands::inspect_variant,
+            commands::update_member,
+            commands::set_member_asset,
+            commands::remove_member,
+            commands::add_member,
+            commands::rename_project,
+            commands::set_core_controller,
         ])
         .run(tauri::generate_context!())
         .expect("Hakoniwa Desktop Managerを起動できませんでした。");

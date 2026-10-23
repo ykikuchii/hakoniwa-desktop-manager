@@ -484,6 +484,9 @@ pub struct WorkspaceSnapshot {
     pub running_project_id: Option<String>,
     /// 保存データの読み込み・移行で起きたこと、開けなかった理由など。
     pub store_warnings: Vec<String>,
+    /// アクティブなプロジェクトのメンバーの設定（保存されている形）。
+    #[serde(default)]
+    pub members: Vec<crate::manage::MemberSettings>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
