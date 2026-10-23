@@ -72,7 +72,7 @@ const FLOW_SAMPLES = 64;
  * 離れるまで、中心から離れる側へ膨らませる。両端はカードの縁で切り、ラベルは切った曲線の中ほどに置く。
  */
 // node はカード（114×74 px）の半分の大きさに、矢印の分の余白を足したもの。
-function flowPath(from: Position, to: Position, center: Position, clearance: number, node = { halfWidth: 61, halfHeight: 41 }) {
+function flowPath(from: Position, to: Position, center: Position, clearance: number, bounds: { width: number; height: number }, node = { halfWidth: 61, halfHeight: 41 }) {
   const mx = (from.x + to.x) / 2;
   const my = (from.y + to.y) / 2;
   const dx = to.x - from.x;
@@ -90,24 +90,40 @@ function flowPath(from: Position, to: Position, center: Position, clearance: num
     }
     return min;
   };
+  // 制御点は枠の中に収める（曲線は両端と制御点の作る三角形の中にあるので、枠からはみ出さない）。
+  const controlFor = (bend: number) => ({
+    x: Math.min(Math.max(mx + nx * bend, 0), bounds.width),
+    y: Math.min(Math.max(my + ny * bend, 0), bounds.height),
+  });
   let bend = length * 0.12;
-  let control = { x: mx + nx * bend, y: my + ny * bend };
+  let control = controlFor(bend);
   for (let i = 0; i < 24 && closest(control) < clearance; i++) {
     bend = bend * 1.25 + 4;
-    control = { x: mx + nx * bend, y: my + ny * bend };
+    const next = controlFor(bend);
+    // 枠の端に当たってそれ以上曲げられなければ、そこで止める。
+    if (next.x === control.x && next.y === control.y) break;
+    control = next;
   }
   // 両端はノードの中心ではなく、カード（長方形）の縁で止める（矢印がカードに隠れないように）。
   // 曲線がカードの外へ出る t を求め、その区間を切り出す。外へ出なければ（カードが重なるほど近い）切らない。
   const inside = (p: Position, nodeCenter: Position) => Math.abs(p.x - nodeCenter.x) <= node.halfWidth && Math.abs(p.y - nodeCenter.y) <= node.halfHeight;
+  // 内側の t と外側の t の間を二分探索して、縁の位置を詰める。
+  const boundary = (tIn: number, tOut: number, nodeCenter: Position) => {
+    for (let i = 0; i < 20; i++) {
+      const t = (tIn + tOut) / 2;
+      if (inside(bezierAt(from, control, to, t), nodeCenter)) tIn = t; else tOut = t;
+    }
+    return tOut;
+  };
   let t0 = 0;
   let t1 = 1;
   for (let i = 0; i <= FLOW_SAMPLES; i++) {
     const t = i / FLOW_SAMPLES;
-    if (!inside(bezierAt(from, control, to, t), from)) { t0 = t; break; }
+    if (!inside(bezierAt(from, control, to, t), from)) { t0 = i === 0 ? 0 : boundary((i - 1) / FLOW_SAMPLES, t, from); break; }
   }
   for (let i = FLOW_SAMPLES; i >= 0; i--) {
     const t = i / FLOW_SAMPLES;
-    if (!inside(bezierAt(from, control, to, t), to)) { t1 = t; break; }
+    if (!inside(bezierAt(from, control, to, t), to)) { t1 = i === FLOW_SAMPLES ? 1 : boundary((i + 1) / FLOW_SAMPLES, t, to); break; }
   }
   if (t1 - t0 < 1 / FLOW_SAMPLES) { t0 = 0; t1 = 1; }
   // [t0, t1] の区間も二次ベジェで、制御点は blossom (t0, t1)。
@@ -188,20 +204,24 @@ export function TopologyPage({
   const selectedFlow = flows.find((flow) => flowKey(flow) === selectedFlowKey) ?? null;
   // 選んでいた流れがなくなったら、選択を外す。
   useEffect(() => { if (selectedFlowKey && !selectedFlow) setSelectedFlowKey(null); }, [selectedFlowKey, selectedFlow]);
-  const toPixels = (position: Position) => ({ x: (position.x / 100) * stageSize.width, y: (position.y / 100) * stageSize.height });
-  const center = toPixels({ x: 50, y: 50 });
-  // Core（直径 142 px）の半径に余白を足したものを下限にする。
-  const clearance = Math.max(Math.min(stageSize.width, stageSize.height) * 0.16, 83);
-  const drawn = flows.map((flow) => {
-    const directions = new Set(flow.channels.map((channel) => channel.direction));
-    return {
-      flow,
-      key: flowKey(flow),
-      path: flowPath(toPixels(positions.get(flow.a)!), toPixels(positions.get(flow.b)!), center, clearance),
-      toB: directions.has("a_to_b") || directions.has("both"),
-      toA: directions.has("b_to_a") || directions.has("both"),
-    };
-  });
+  // 線は表示していて、枠の大きさが分かっているときだけ求める。
+  const drawn = useMemo(() => {
+    if (!showFlows || stageSize.width <= 0 || stageSize.height <= 0) return [];
+    const toPixels = (position: Position) => ({ x: (position.x / 100) * stageSize.width, y: (position.y / 100) * stageSize.height });
+    const center = toPixels({ x: 50, y: 50 });
+    // Core（直径 142 px）の半径に余白を足したものを下限にする。
+    const clearance = Math.max(Math.min(stageSize.width, stageSize.height) * 0.16, 83);
+    return flows.map((flow) => {
+      const directions = new Set(flow.channels.map((channel) => channel.direction));
+      return {
+        flow,
+        key: flowKey(flow),
+        path: flowPath(toPixels(positions.get(flow.a)!), toPixels(positions.get(flow.b)!), center, clearance, stageSize),
+        toB: directions.has("a_to_b") || directions.has("both"),
+        toA: directions.has("b_to_a") || directions.has("both"),
+      };
+    });
+  }, [flows, positions, showFlows, stageSize]);
   const nameOf = (id: string) => assets.find((asset) => asset.id === id)?.name ?? id;
   const selectedConnection = selected ?? null;
   const activeNode = assets.find((asset) => asset.id === activeNodeId) ?? null;
