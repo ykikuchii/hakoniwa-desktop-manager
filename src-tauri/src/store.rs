@@ -276,10 +276,15 @@ impl Store {
             // 新しい id で足す。取り込みは、利用者のライブラリにあるものを消さない。
             let id = match draft.library.get(&asset.id) {
                 Some(existing) if same_content(existing, &asset) => asset.id.clone(),
-                Some(_) => {
-                    asset.id = Uuid::new_v4().to_string();
-                    Self::stage_asset(&mut draft, asset)
-                }
+                // 前に同じように取り込んで別の id で足したもの（同じ内容）があれば、それを使う。
+                // 取り込み直すたびにアセットが増えないようにするため。
+                Some(_) => match draft.library.values().find(|candidate| same_content(candidate, &LibraryAsset { id: candidate.id.clone(), ..asset.clone() })) {
+                    Some(previous) => previous.id.clone(),
+                    None => {
+                        asset.id = Uuid::new_v4().to_string();
+                        Self::stage_asset(&mut draft, asset)
+                    }
+                },
                 None => Self::stage_asset(&mut draft, asset),
             };
             ids.insert(original, id);

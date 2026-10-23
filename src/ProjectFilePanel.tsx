@@ -57,12 +57,13 @@ export function ProjectFilePanel({ projectId, projectName, sourceDirectory, busy
     <div className="sub-editor">
       <div className="panel-heading"><h3>読み込む</h3><button className="button secondary small" disabled={busy || running} title={running ? "実行中は読み込めません。" : undefined} onClick={() => void chooseFile()}>ファイルを選ぶ</button></div>
       {error && <p className="error">{error}</p>}
+      {/* ファイルを選んでいれば、プレビューに失敗しても基準ルートを直してやり直せる。 */}
+      {path && <div className="inline-fields"><span className="muted">別の基準ルート</span><input value={importRoot} placeholder={preview?.result.root ?? "ファイルに記録された位置"} onChange={(event) => setImportRoot(event.target.value)} /><button className="button subtle small" disabled={busy} onClick={() => void inspect(path, importRoot)}>この基準でプレビューし直す</button></div>}
       {path && preview && preview.path === path && <>
         <p><strong>{preview.result.project_name}</strong>（{preview.path}）</p>
         <p className="muted">メンバー：{preview.result.members.join("、")}</p>
         <p className="muted">アセット：{preview.result.assets.map((asset) => `${asset.name}（${asset.reused ? "ライブラリのものを使う" : "ライブラリに足す"}）`).join("、")}</p>
         <p className="muted">基準ルート：{preview.result.root}</p>
-        <div className="inline-fields"><span className="muted">別の基準ルート</span><input value={importRoot} placeholder={preview.result.root} onChange={(event) => setImportRoot(event.target.value)} /><button className="button subtle small" disabled={busy} onClick={() => void inspect(path, importRoot)}>この基準でプレビューし直す</button></div>
         {importRoot.trim() !== preview.root && <p className="muted">基準ルートを変えたら、プレビューし直してから読み込んでください。</p>}
         {preview.result.warnings.length > 0 && <div className="warning-list">{preview.result.warnings.map((warning) => <p key={warning}>{warning}</p>)}</div>}
         {preview.result.replaces && <label className="toggle"><input type="checkbox" checked={replace} onChange={(event) => setReplace(event.target.checked)} />同じファイルから読み込んだプロジェクト「{preview.result.replaces}」を置き換える（外すと新しいプロジェクトとして足します）</label>}

@@ -229,7 +229,7 @@ pub fn export(project: &Project, library: &Library, file: &Path, root: &Path) ->
     walk(&mut project, &mut assets, &mut |value: &mut String| {
         if value.contains(';') {
             // パスの並びは、先頭だけを書き換えると残りが元の場所を指したままになるので、書き換えない。
-            if is_absolute(value) || fold(&slashes(value)).contains(&root_key) {
+            if value.split(';').any(|part| is_absolute(part.trim())) || fold(&slashes(value)).contains(&root_key) {
                 warnings.push(format!("パスの並び（; 区切り）は書き換えていません（別の PC では見つからないかもしれません）: {value}"));
             }
         } else if let Some(portable) = to_portable(value, &root) {
@@ -499,6 +499,10 @@ mod tests {
         let exported = bundle.assets.iter().find(|asset| asset.id == first).unwrap();
         assert_eq!(exported.variants[0].launch.env["PATH"], "C:/demo/bin;C:/demo/tools");
         assert!(warnings.iter().any(|warning| warning.contains("パスの並び")), "{warnings:?}");
+        // 先頭が相対でも、後ろに絶対パスがあれば警告する。
+        library.get_mut(&first).unwrap().variants[0].launch.env.insert("PATH".to_owned(), "bin;D:/shared/tools".to_owned());
+        let (_, warnings) = export(&project, &library, &file, Path::new("C:/demo")).unwrap();
+        assert!(warnings.iter().any(|warning| warning.contains("bin;D:/shared/tools")), "{warnings:?}");
         assert_eq!(bundle.project.members[1].env_overrides["DATA"], "C:/demo/data", "WSL のメンバーは書き換えない");
     }
 
@@ -523,6 +527,11 @@ mod tests {
         store.library.insert(id.clone(), kept);
         store.import_bundle(&loaded, true, false).unwrap();
         assert_eq!(store.library[&id].description, "kept in the library");
+        // 同じファイルを取り込み直しても、別の id で足したアセットは増えない。
+        let count = store.library.len();
+        store.import_bundle(&loaded, true, false).unwrap();
+        store.import_bundle(&loaded, true, false).unwrap();
+        assert_eq!(store.library.len(), count);
         assert!(dir.join("data").join("library").join("assets").join(format!("{id}.json")).is_file());
     }
 
