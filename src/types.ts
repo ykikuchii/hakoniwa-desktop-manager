@@ -242,6 +242,16 @@ export interface ProjectSummary {
   name: string;
 }
 
+export interface BundlePreview {
+  project_name: string;
+  members: string[];
+  assets: { name: string; reused: boolean }[];
+  replaces?: string | null;
+  warnings: string[];
+  sha256: string;
+  root: string;
+}
+
 export interface ImportPreview {
   source_directory: string;
   discovered_files: string[];

@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  BundlePreview,
   AssetDefinition,
   ConnectionDefinition,
   CoreCatalog,
@@ -28,7 +29,10 @@ export const api = {
   startAll: () => invoke<ProcessSnapshot[]>("start_all"),
   stopAll: () => invoke<ProcessSnapshot[]>("stop_all"),
   inspectDirectory: (path: string) => invoke<ImportPreview>("inspect_business_pack_directory", { path }),
-  applyPreview: (preview: ImportPreview) => invoke<Workspace>("apply_import_preview", { preview }),
+  applyPreview: (preview: ImportPreview, mode: "new_project" | "add_to_project") => invoke<string>("apply_import_preview", { preview, mode }),
+  inspectBundle: (path: string, root: string | null) => invoke<BundlePreview>("inspect_project_bundle", { path, root }),
+  importBundle: (path: string, root: string | null, sha256: string, replace: boolean) => invoke<string>("import_project_bundle", { path, root, sha256, replace }),
+  exportProject: (projectId: string, path: string, root: string | null) => invoke<string[]>("export_project", { projectId, path, root }),
   catalog: () => invoke<CoreCatalog>("get_core_catalog"),
   saveCatalog: (catalog: CoreCatalog) => invoke<CoreCatalog>("save_core_catalog", { catalog }),
   installCore: (version: string) => invoke<CoreInstallResult>("install_approved_core", { version }),

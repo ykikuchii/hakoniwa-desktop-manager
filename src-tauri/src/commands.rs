@@ -789,20 +789,73 @@ pub fn inspect_business_pack_directory(path: String) -> Result<ImportPreview, St
     inspect_directory(Path::new(&path))
 }
 
+/// 設定ディレクトリから取り込んだものの入れ先。
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImportMode {
+    /// 新しいプロジェクトを作り、アクティブにする。
+    NewProject,
+    /// アクティブなプロジェクトにメンバーとして足す。既存のメンバーは変えない。
+    AddToProject,
+}
+
+/// 設定ディレクトリから取り込んだアセットと接続を、新しいプロジェクトか、アクティブなプロジェクトに入れる。
+/// 取り込みは利用者が構成を明示的に入れる操作なので、取り込んだメンバーだけを今の内容で承認する
+/// （既存のメンバーの承認待ちの変更は、承認しない）。入れた先のプロジェクトの id を返す。
 #[tauri::command]
-pub fn apply_import_preview(state: State<'_, AppState>, preview: ImportPreview) -> Result<Workspace, String> {
-    let project_id = state.lock_store()?.active_project_id().to_owned();
-    let _gate = state.ensure_mutable(&project_id)?;
-    let mut workspace = state.active_workspace()?;
-    workspace.source_directory = Some(preview.source_directory);
-    workspace.assets = preview.assets;
-    workspace.imported_connections = preview.connections;
-    let mut store = state.lock_store()?;
-    crate::edit::apply_workspace(&mut store, &project_id, &workspace)?;
-    // 取り込みは利用者が構成を明示的に入れる操作なので、今の内容で承認する。
-    store.accept(&project_id)?;
-    drop(store);
-    state.active_workspace()
+pub fn apply_import_preview(state: State<'_, AppState>, preview: ImportPreview, mode: ImportMode) -> Result<String, String> {
+    match mode {
+        ImportMode::NewProject => {
+            state.release_if_idle();
+            let gate = state.lock_gate();
+            if state.start_all_running.load(Ordering::Acquire) || state.stop_all_running.load(Ordering::Acquire) || state.running_project_id().is_some() {
+                return Err("実行中は新しいプロジェクトに取り込めません。すべて停止するか、今のプロジェクトに足してください。".to_owned());
+            }
+            let name = Path::new(&preview.source_directory).file_name().map(|name| name.to_string_lossy().into_owned()).filter(|name| !name.is_empty()).unwrap_or_else(|| "取り込んだ構成".to_owned());
+            let project_id = {
+                let mut store = state.lock_store()?;
+                let mut project = crate::model::Project::empty(Uuid::new_v4().to_string(), name);
+                project.source_directory = Some(preview.source_directory.clone());
+                store.save_project(&project)?;
+                store.projects.insert(project.id.clone(), project.clone());
+                let mut workspace = crate::resolve::resolve(&project, &store.library)?;
+                workspace.assets = preview.assets;
+                workspace.imported_connections = preview.connections;
+                crate::edit::apply_workspace(&mut store, &project.id, &workspace)?;
+                store.accept(&project.id)?;
+                project.id
+            };
+            drop(gate);
+            state.select_project(&project_id)?;
+            Ok(project_id)
+        }
+        ImportMode::AddToProject => {
+            let project_id = state.lock_store()?.active_project_id().to_owned();
+            let _gate = state.ensure_mutable(&project_id)?;
+            // ゲートを取った後は切り替えられない。取る前に切り替わっていれば拒否する。
+            // 足す先は id で引く（アクティブなものを引き直すと、別のプロジェクトを読みうる）。
+            let mut store = state.lock_store()?;
+            if store.active_project_id() != project_id {
+                return Err(SWITCHED.to_owned());
+            }
+            let project = store.projects.get(&project_id).cloned().ok_or_else(|| "そのプロジェクトはありません。".to_owned())?;
+            let mut workspace = crate::resolve::resolve(&project, &store.library)?;
+            let taken = workspace.assets.iter().map(|asset| asset.id.clone()).collect();
+            let (mut assets, mut connections) = (preview.assets, preview.connections);
+            let added = crate::manage::renumber_imported(&taken, &mut assets, &mut connections);
+            workspace.assets.extend(assets);
+            workspace.imported_connections.extend(connections);
+            if workspace.source_directory.is_none() {
+                workspace.source_directory = Some(preview.source_directory);
+            }
+            crate::edit::apply_workspace(&mut store, &project_id, &workspace)?;
+            let mut project = store.projects[&project_id].clone();
+            crate::check::accept_members(&mut project, &store.library, &added)?;
+            let draft = store.draft();
+            store.commit(draft, project)?;
+            Ok(project_id)
+        }
+    }
 }
 
 /// 接続チェック用に、プロジェクトとライブラリを複製する。ファイルはロックの外で読むため。
@@ -1379,4 +1432,83 @@ pub fn rename_project(state: State<'_, AppState>, project_id: String, expected: 
 #[tauri::command]
 pub fn set_core_controller(state: State<'_, AppState>, project_id: String, expected: Option<crate::types::CoreController>, controller: Option<crate::types::CoreController>) -> Result<(), String> {
     edit_project(&state, &project_id, |store| crate::manage::set_core_controller(store, &project_id, expected.as_ref(), controller))
+}
+
+/// 読み込む前に見せる、`.hakoproj.json` の中身。
+#[derive(serde::Serialize)]
+pub struct BundlePreview {
+    project_name: String,
+    members: Vec<String>,
+    assets: Vec<BundleAssetPreview>,
+    /// 置き換える相手（同じ出所のプロジェクト）の名前。
+    replaces: Option<String>,
+    warnings: Vec<String>,
+    sha256: String,
+    root: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct BundleAssetPreview {
+    name: String,
+    /// ライブラリの同じ内容のものを使い回す（足さない）。
+    reused: bool,
+}
+
+// ファイルを読むので、UI を止めないよう async にする。
+#[tauri::command(async)]
+pub fn inspect_project_bundle(state: State<'_, AppState>, path: String, root: Option<String>) -> Result<BundlePreview, String> {
+    let loaded = crate::bundle::load(Path::new(&path), root.as_deref().map(Path::new))?;
+    let store = state.lock_store()?;
+    let origin = crate::bundle::origin(&loaded.bundle);
+    let names: BTreeMap<&str, &str> = loaded.bundle.assets.iter().map(|asset| (asset.id.as_str(), asset.name.as_str())).collect();
+    Ok(BundlePreview {
+        project_name: loaded.bundle.project.name.clone(),
+        members: loaded.bundle.project.members.iter().map(|member| member.name.clone().unwrap_or_else(|| names.get(member.asset_id.as_str()).copied().unwrap_or(&member.id).to_owned())).collect(),
+        assets: loaded.bundle.assets.iter().map(|asset| BundleAssetPreview { name: asset.name.clone(), reused: store.reuses(asset) }).collect(),
+        replaces: store.projects.values().find(|project| project.origin.as_deref() == Some(origin.as_str())).map(|project| project.name.clone()),
+        warnings: loaded.warnings.clone(),
+        sha256: loaded.sha256.clone(),
+        root: loaded.root.clone(),
+    })
+}
+
+/// プレビューで見た `.hakoproj.json` を読み込む。プレビューの後にファイルが変わっていれば拒否する。
+/// 承認は付けない（接続チェックで内容を見て承認する）。
+#[tauri::command(async)]
+pub fn import_project_bundle(state: State<'_, AppState>, path: String, root: Option<String>, sha256: String, replace: bool) -> Result<String, String> {
+    let loaded = crate::bundle::load(Path::new(&path), root.as_deref().map(Path::new))?;
+    if loaded.sha256 != sha256 {
+        return Err("プレビューの後にファイルが変わりました。もう一度プレビューしてから読み込んでください。".to_owned());
+    }
+    import_bundle_into(&state, &loaded, replace, false)
+}
+
+/// 読み込んだ `.hakoproj.json` をプロジェクトにして、アクティブにする。何かが実行中なら拒否する。
+pub fn import_bundle_into(state: &AppState, loaded: &crate::bundle::Loaded, replace: bool, accept: bool) -> Result<String, String> {
+    state.release_if_idle();
+    let gate = state.lock_gate();
+    if state.start_all_running.load(Ordering::Acquire) || state.stop_all_running.load(Ordering::Acquire) || state.running_project_id().is_some() {
+        return Err("実行中は読み込めません。すべて停止してから読み込んでください。".to_owned());
+    }
+    let project_id = state.lock_store()?.import_bundle(loaded, replace, accept)?.project_id;
+    drop(gate);
+    state.select_project(&project_id)?;
+    Ok(project_id)
+}
+
+/// プロジェクトを `.hakoproj.json` に書き出す。`root` は基準ルート（なければ取込元のディレクトリ、
+/// それもなければ書き出し先のディレクトリ）。返すのは、持ち運べないかもしれないパスの警告。
+#[tauri::command(async)]
+pub fn export_project(state: State<'_, AppState>, project_id: String, path: String, root: Option<String>) -> Result<Vec<String>, String> {
+    let (project, library) = {
+        let store = state.lock_store()?;
+        let project = store.projects.get(&project_id).cloned().ok_or_else(|| "そのプロジェクトはありません。".to_owned())?;
+        let library: crate::model::Library = project.members.iter().filter_map(|member| store.library.get(&member.asset_id).map(|asset| (asset.id.clone(), asset.clone()))).collect();
+        (project, library)
+    };
+    let file = Path::new(&path);
+    let root = root.filter(|root| !root.trim().is_empty()).or_else(|| project.source_directory.clone()).map(std::path::PathBuf::from).or_else(|| file.parent().map(Path::to_path_buf)).ok_or_else(|| "基準ルートを決められません。".to_owned())?;
+    let (bundle, warnings) = crate::bundle::export(&project, &library, file, &root)?;
+    crate::bundle::write(&bundle, file)?;
+    Ok(warnings)
 }

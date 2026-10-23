@@ -1,3 +1,4 @@
+mod bundle;
 mod check;
 mod commands;
 mod compat;
@@ -29,6 +30,10 @@ const START_ALL_FLAG: &str = "--start-all";
 /// デモの生成スクリプトが書いた構成を、起動のたびに取り込み直すために使う。
 const IMPORT_FLAG: &str = "--import";
 
+/// `--import` で `.hakoproj.json` を読み込むとき、読み込んだ内容で全員を承認する。
+/// 利用者がコマンドラインで明示したときだけ（デモの起動コマンドなど）。
+const ACCEPT_IMPORTED_FLAG: &str = "--accept-imported";
+
 /// 起動直後にアクティブにするプロジェクト（id か名前）。
 const PROJECT_FLAG: &str = "--project";
 
@@ -37,6 +42,7 @@ struct Cli {
     import: Option<String>,
     project: Option<String>,
     start_all: bool,
+    accept_imported: bool,
 }
 
 fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
@@ -45,7 +51,8 @@ fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             START_ALL_FLAG => cli.start_all = true,
-            IMPORT_FLAG => cli.import = Some(args.next().ok_or_else(|| format!("{IMPORT_FLAG} の後に workspace.json のパスを指定してください。"))?),
+            ACCEPT_IMPORTED_FLAG => cli.accept_imported = true,
+            IMPORT_FLAG => cli.import = Some(args.next().ok_or_else(|| format!("{IMPORT_FLAG} の後に workspace.json か {} のパスを指定してください。", bundle::EXTENSION))?),
             PROJECT_FLAG => cli.project = Some(args.next().ok_or_else(|| format!("{PROJECT_FLAG} の後にプロジェクトの ID か名前を指定してください。"))?),
             _ => {}
         }
@@ -71,7 +78,18 @@ fn resolve_project_arg(store: &store::Store, value: &str) -> Result<String, Stri
 /// 一括起動の前の準備（取り込みとプロジェクトの選択）。
 fn prepare(state: &AppState, cli: &Cli) -> Result<(), String> {
     if let Some(path) = &cli.import {
-        commands::import_v1(state, std::path::Path::new(path), true)?;
+        let path = std::path::Path::new(path);
+        // 起動時の移行で退避済みの v1 は、ここではもうない。取り込みの側が、移行で作った
+        // プロジェクトを選ぶ。
+        let is_bundle = path.is_file() && bundle::is_bundle(&std::fs::read(path).map_err(|error| format!("{} を読めません: {error}", path.display()))?);
+        if is_bundle {
+            let loaded = bundle::load(path, None)?;
+            commands::import_bundle_into(state, &loaded, true, cli.accept_imported)?;
+            // 読み込みの警告（見つからないファイルなど）は、画面の警告に出す。
+            state.lock_store()?.warnings.extend(loaded.warnings);
+        } else {
+            commands::import_v1(state, path, true)?;
+        }
     }
     if let Some(value) = &cli.project {
         let id = resolve_project_arg(&*state.lock_store()?, value)?;
@@ -134,6 +152,9 @@ pub fn run() {
             commands::select_project,
             commands::create_project,
             commands::import_v1_workspace,
+            commands::inspect_project_bundle,
+            commands::import_project_bundle,
+            commands::export_project,
             commands::clear_store_warnings,
             commands::check_project,
             commands::accept_member_changes,
@@ -164,7 +185,9 @@ mod tests {
     #[test]
     fn parses_the_launch_flags() {
         let cli = parse_cli(args(&["--import", "C:/demo/workspace.v1.json", "--project", "Gimbal x Drone demo", "--start-all"])).unwrap();
-        assert_eq!(cli, Cli { import: Some("C:/demo/workspace.v1.json".to_owned()), project: Some("Gimbal x Drone demo".to_owned()), start_all: true });
+        assert_eq!(cli, Cli { import: Some("C:/demo/workspace.v1.json".to_owned()), project: Some("Gimbal x Drone demo".to_owned()), start_all: true, accept_imported: false });
+        let cli = parse_cli(args(&["--import", "C:/demo/demo.hakoproj.json", "--accept-imported"])).unwrap();
+        assert!(cli.accept_imported && !cli.start_all);
         assert!(parse_cli(args(&["--project"])).is_err());
         assert!(parse_cli(args(&["--import"])).is_err());
         assert_eq!(parse_cli(args(&[])).unwrap(), Cli::default());
