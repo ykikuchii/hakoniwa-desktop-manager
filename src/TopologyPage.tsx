@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { ConnectionSnapshot, PduFlow, ProcessSnapshot, ProjectCheck, WorkspaceSnapshot } from "./types";
 import { TopologyAlertOverlay } from "./TopologyAlertOverlay";
 import { connectionsForAsset, latestActivity, selectAssetProcess, selectCoreProcess } from "./selectors";
@@ -59,20 +59,42 @@ function positionFor(index: number, total: number): Position {
   };
 }
 
-/** 2 点を結ぶ、少し曲げた線。逆向きの流れが重ならないよう、進む向きの右へ膨らませる。 */
-function flowPath(from: Position, to: Position) {
+/**
+ * 2 点（画素）を結ぶ曲線。中央の Core と重ならないよう、線の中ほどが中心から `clearance` 以上
+ * 離れる側へ膨らませる。ラベルは曲線の中ほどに置く。
+ */
+function flowPath(from: Position, to: Position, center: Position, clearance: number, nodeRadius = 36) {
+  const mx = (from.x + to.x) / 2;
+  const my = (from.y + to.y) / 2;
   const dx = to.x - from.x;
   const dy = to.y - from.y;
   const length = Math.hypot(dx, dy) || 1;
-  const bend = Math.min(6, length * 0.15);
-  const cx = (from.x + to.x) / 2 - (dy / length) * bend;
-  const cy = (from.y + to.y) / 2 + (dx / length) * bend;
-  return { d: `M ${from.x} ${from.y} Q ${cx} ${cy} ${to.x} ${to.y}`, label: { x: (from.x + 2 * cx + to.x) / 4, y: (from.y + 2 * cy + to.y) / 4 } };
+  let nx = -dy / length;
+  let ny = dx / length;
+  // 中心から離れる側へ曲げる。
+  if ((mx - center.x) * nx + (my - center.y) * ny < 0) { nx = -nx; ny = -ny; }
+  const distance = Math.hypot(mx - center.x, my - center.y);
+  // 二次ベジェの中ほどは、直線の中点から制御点の方向へ半分だけ進んだ所。
+  const bend = Math.max(length * 0.12, 2 * Math.max(0, clearance - distance));
+  const cx = mx + nx * bend;
+  const cy = my + ny * bend;
+  // 両端はノードの中心ではなく縁で止める（矢印がノードに隠れないように）。
+  const trim = (point: Position, radius: number) => {
+    const ux = cx - point.x;
+    const uy = cy - point.y;
+    const norm = Math.hypot(ux, uy) || 1;
+    return { x: point.x + (ux / norm) * radius, y: point.y + (uy / norm) * radius };
+  };
+  const start = trim(from, nodeRadius);
+  const end = trim(to, nodeRadius);
+  return { d: `M ${start.x} ${start.y} Q ${cx} ${cy} ${end.x} ${end.y}`, label: { x: (mx + cx) / 2, y: (my + cy) / 2 } };
 }
 
 function flowKey(flow: PduFlow) {
-  return `${flow.from}\u0000${flow.to}\u0000${flow.directed}\u0000${flow.inferred}`;
+  return `${flow.a}\u0000${flow.b}`;
 }
+
+const directionArrow: Record<PduFlow["channels"][number]["direction"], string> = { a_to_b: "→", b_to_a: "←", both: "⇄", shared: "―" };
 
 function compactCount(value: number) {
   return new Intl.NumberFormat("ja-JP", { notation: "compact", maximumFractionDigits: 1 }).format(value);
@@ -95,6 +117,16 @@ export function TopologyPage({
   const [activeNodeId, setActiveNodeId] = useState<string | null>(null);
   const [showFlows, setShowFlows] = useState(true);
   const [selectedFlowKey, setSelectedFlowKey] = useState<string | null>(null);
+  // 流れの線は画素で描く（縦横比の違う枠に 100×100 の図を伸ばすと、矢印の形が崩れるため）。
+  const stageRef = useRef<HTMLDivElement | null>(null);
+  const [stageSize, setStageSize] = useState({ width: 0, height: 0 });
+  useEffect(() => {
+    const stage = stageRef.current;
+    if (!stage) return;
+    const observer = new ResizeObserver(([entry]) => setStageSize({ width: entry.contentRect.width, height: entry.contentRect.height }));
+    observer.observe(stage);
+    return () => observer.disconnect();
+  }, []);
 
   const coreProcess = useMemo(() => selectCoreProcess(snapshot.processes), [snapshot.processes]);
   const coreStatus: VisualStatus = coreProcess?.status === "failed"
@@ -122,8 +154,23 @@ export function TopologyPage({
 
   const positions = useMemo(() => new Map(assets.map((asset) => [asset.id, asset.position])), [assets]);
   // 線を引けるのは、両端がこの画面のアセットであるものだけ。
-  const flows = useMemo(() => (check?.flows ?? []).filter((flow) => positions.has(flow.from) && positions.has(flow.to)), [check, positions]);
+  const flows = useMemo(() => (check?.flows ?? []).filter((flow) => positions.has(flow.a) && positions.has(flow.b)), [check, positions]);
   const selectedFlow = flows.find((flow) => flowKey(flow) === selectedFlowKey) ?? null;
+  // 選んでいた流れがなくなったら、選択を外す。
+  useEffect(() => { if (selectedFlowKey && !selectedFlow) setSelectedFlowKey(null); }, [selectedFlowKey, selectedFlow]);
+  const toPixels = (position: Position) => ({ x: (position.x / 100) * stageSize.width, y: (position.y / 100) * stageSize.height });
+  const center = toPixels({ x: 50, y: 50 });
+  const clearance = Math.min(stageSize.width, stageSize.height) * 0.16;
+  const drawn = flows.map((flow) => {
+    const directions = new Set(flow.channels.map((channel) => channel.direction));
+    return {
+      flow,
+      key: flowKey(flow),
+      path: flowPath(toPixels(positions.get(flow.a)!), toPixels(positions.get(flow.b)!), center, clearance),
+      toB: directions.has("a_to_b") || directions.has("both"),
+      toA: directions.has("b_to_a") || directions.has("both"),
+    };
+  });
   const nameOf = (id: string) => assets.find((asset) => asset.id === id)?.name ?? id;
   const selectedConnection = selected ?? null;
   const activeNode = assets.find((asset) => asset.id === activeNodeId) ?? null;
@@ -171,14 +218,9 @@ export function TopologyPage({
       </header>
 
       <div className="topology-layout">
-        <div className="topology-stage" aria-label="Hakoniwa の接続関係図">
+        <div className="topology-stage" aria-label="Hakoniwa の接続関係図" ref={stageRef}>
           <div className="topology-stage-glow" aria-hidden="true" />
           <svg className="topology-network" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
-            <defs>
-              <marker id="pdu-flow-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
-                <path d="M 0 0 L 10 5 L 0 10 z" className="pdu-flow-arrowhead" />
-              </marker>
-            </defs>
             {assets.map((asset) => {
               const activeConnection = asset.connections.find((connection) => connection.state === "connected");
               const inactiveConnection = asset.connections[0];
@@ -193,34 +235,38 @@ export function TopologyPage({
                 </g>
               );
             })}
-            {showFlows && flows.map((flow) => {
-              const from = positions.get(flow.from)!;
-              const to = positions.get(flow.to)!;
-              const path = flowPath(from, to);
-              const key = flowKey(flow);
-              return (
-                <g key={key} className={`pdu-flow ${flow.inferred ? "is-inferred" : ""} ${flow.directed ? "" : "is-undirected"} ${selectedFlowKey === key ? "is-selected" : ""}`}>
-                  <path d={path.d} markerEnd={flow.directed ? "url(#pdu-flow-arrow)" : undefined} />
-                </g>
-              );
-            })}
           </svg>
-          {showFlows && flows.map((flow) => {
-            const path = flowPath(positions.get(flow.from)!, positions.get(flow.to)!);
-            const key = flowKey(flow);
-            return (
-              <button
-                key={`label-${key}`}
-                type="button"
-                className={`pdu-flow-label ${selectedFlowKey === key ? "is-selected" : ""}`}
-                style={{ left: `${path.label.x}%`, top: `${path.label.y}%` }}
-                aria-label={`PDU の流れ: ${nameOf(flow.from)} から ${nameOf(flow.to)}（${flow.channels.length} チャネル）`}
-                onClick={() => setSelectedFlowKey(selectedFlowKey === key ? null : key)}
-              >
-                {flow.channels.length}
-              </button>
-            );
-          })}
+          {showFlows && stageSize.width > 0 && (
+            <svg className="pdu-flow-layer" viewBox={`0 0 ${stageSize.width} ${stageSize.height}`} aria-hidden="true">
+              <defs>
+                <marker id="pdu-flow-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" markerUnits="userSpaceOnUse" orient="auto-start-reverse">
+                  <path d="M 0 0 L 10 5 L 0 10 z" className="pdu-flow-arrowhead" />
+                </marker>
+              </defs>
+              {drawn.map(({ flow, key, path, toA, toB }) => (
+                <path
+                  key={key}
+                  d={path.d}
+                  className={`pdu-flow ${toA || toB ? "" : "is-shared"} ${selectedFlowKey === key ? "is-selected" : ""}`}
+                  markerEnd={toB ? "url(#pdu-flow-arrow)" : undefined}
+                  markerStart={toA ? "url(#pdu-flow-arrow)" : undefined}
+                  data-pair={`${flow.a} ${flow.b}`}
+                />
+              ))}
+            </svg>
+          )}
+          {showFlows && drawn.map(({ flow, key, path }) => (
+            <button
+              key={`label-${key}`}
+              type="button"
+              className={`pdu-flow-label ${selectedFlowKey === key ? "is-selected" : ""}`}
+              style={{ left: `${path.label.x}px`, top: `${path.label.y}px` }}
+              aria-label={`PDU: ${nameOf(flow.a)} と ${nameOf(flow.b)}（${flow.channels.length} チャネル）`}
+              onClick={() => setSelectedFlowKey(selectedFlowKey === key ? null : key)}
+            >
+              {flow.channels.length}
+            </button>
+          ))}
 
           <button
             type="button"
@@ -342,14 +388,13 @@ export function TopologyPage({
           {selectedFlow && (
             <div className="selected-connection-card">
               <div>
-                <span className="inspector-label">PDU の流れ{selectedFlow.inferred ? "（推定を含む）" : ""}</span>
-                <strong>{nameOf(selectedFlow.from)} {selectedFlow.directed ? "→" : "↔"} {nameOf(selectedFlow.to)}</strong>
+                <span className="inspector-label">共有する PDU チャネル</span>
+                <strong>{nameOf(selectedFlow.a)} ・ {nameOf(selectedFlow.b)}</strong>
               </div>
               <ul className="pdu-flow-channels">
-                {selectedFlow.channels.map((channel) => <li key={`${channel.robot}:${channel.channel_id}`}><code>{channel.robot} ch{channel.channel_id}</code> {channel.org_name}</li>)}
+                {selectedFlow.channels.map((channel) => <li key={`${channel.robot}:${channel.channel_id}`}><code>{channel.robot} ch{channel.channel_id}</code> {channel.org_name} <span className="muted">{nameOf(selectedFlow.a)} {directionArrow[channel.direction]} {nameOf(selectedFlow.b)}</span></li>)}
               </ul>
-              {selectedFlow.inferred && <p className="muted">書き手か読み手の宣言がないため、チャネルを作るメンバーを書き手（または読み手）とみなしています。</p>}
-              {!selectedFlow.directed && <p className="muted">どちらも向きを宣言していないため、向きは分かりません。</p>}
+              {selectedFlow.channels.some((channel) => channel.direction === "shared") && <p className="muted">― は、どちらかが向きを宣言していない（チャネルを作るだけ、compact 形式など）ため、向きが分からないチャネルです。</p>}
             </div>
           )}
 
@@ -372,7 +417,7 @@ export function TopologyPage({
         <span><i className="legend-swatch legend-swatch-active" />起動・接続中</span>
         <span><i className="legend-swatch legend-swatch-idle" />停止・未接続</span>
         <span className="topology-motion-note">流れる線は接続済みの通信経路を示します。</span>
-        <span><i className="legend-swatch legend-swatch-pdu" />PDU の流れ（破線は推定、点線は向き不明。数字はチャネル数）</span>
+        <span><i className="legend-swatch legend-swatch-pdu" />PDU のチャネルの共有（矢印は宣言された書き手から読み手へ、破線は向き不明。数字はチャネル数）</span>
         <label className="toggle"><input type="checkbox" checked={showFlows} onChange={(event) => setShowFlows(event.target.checked)} />PDU の流れを表示</label>
         {!check && <span className="muted">接続チェックの結果を待っています。</span>}
       </footer>
