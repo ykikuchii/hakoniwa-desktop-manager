@@ -63,7 +63,8 @@ function positionFor(index: number, total: number): Position {
  * 2 点（画素）を結ぶ曲線。中央の Core と重ならないよう、線の中ほどが中心から `clearance` 以上
  * 離れる側へ膨らませる。ラベルは曲線の中ほどに置く。
  */
-function flowPath(from: Position, to: Position, center: Position, clearance: number, nodeRadius = 36) {
+// node はカード（114×74 px）の半分の大きさに、矢印の分の余白を足したもの。
+function flowPath(from: Position, to: Position, center: Position, clearance: number, node = { halfWidth: 61, halfHeight: 41 }) {
   const mx = (from.x + to.x) / 2;
   const my = (from.y + to.y) / 2;
   const dx = to.x - from.x;
@@ -78,15 +79,15 @@ function flowPath(from: Position, to: Position, center: Position, clearance: num
   const bend = Math.max(length * 0.12, 2 * Math.max(0, clearance - distance));
   const cx = mx + nx * bend;
   const cy = my + ny * bend;
-  // 両端はノードの中心ではなく縁で止める（矢印がノードに隠れないように）。
-  const trim = (point: Position, radius: number) => {
+  // 両端はノードの中心ではなく、カード（長方形）の縁で止める（矢印がカードに隠れないように）。
+  const trim = (point: Position) => {
     const ux = cx - point.x;
     const uy = cy - point.y;
-    const norm = Math.hypot(ux, uy) || 1;
-    return { x: point.x + (ux / norm) * radius, y: point.y + (uy / norm) * radius };
+    const scale = Math.min(ux ? node.halfWidth / Math.abs(ux) : Infinity, uy ? node.halfHeight / Math.abs(uy) : Infinity, 1);
+    return { x: point.x + ux * scale, y: point.y + uy * scale };
   };
-  const start = trim(from, nodeRadius);
-  const end = trim(to, nodeRadius);
+  const start = trim(from);
+  const end = trim(to);
   return { d: `M ${start.x} ${start.y} Q ${cx} ${cy} ${end.x} ${end.y}`, label: { x: (mx + cx) / 2, y: (my + cy) / 2 } };
 }
 
