@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import type { ConnectionSnapshot, ProcessSnapshot, WorkspaceSnapshot } from "./types";
+import type { ConnectionSnapshot, PduFlow, ProcessSnapshot, ProjectCheck, WorkspaceSnapshot } from "./types";
 import { TopologyAlertOverlay } from "./TopologyAlertOverlay";
 import { connectionsForAsset, latestActivity, selectAssetProcess, selectCoreProcess } from "./selectors";
 
@@ -59,16 +59,33 @@ function positionFor(index: number, total: number): Position {
   };
 }
 
+/** 2 点を結ぶ、少し曲げた線。逆向きの流れが重ならないよう、進む向きの右へ膨らませる。 */
+function flowPath(from: Position, to: Position) {
+  const dx = to.x - from.x;
+  const dy = to.y - from.y;
+  const length = Math.hypot(dx, dy) || 1;
+  const bend = Math.min(6, length * 0.15);
+  const cx = (from.x + to.x) / 2 - (dy / length) * bend;
+  const cy = (from.y + to.y) / 2 + (dx / length) * bend;
+  return { d: `M ${from.x} ${from.y} Q ${cx} ${cy} ${to.x} ${to.y}`, label: { x: (from.x + 2 * cx + to.x) / 4, y: (from.y + 2 * cy + to.y) / 4 } };
+}
+
+function flowKey(flow: PduFlow) {
+  return `${flow.from}\u0000${flow.to}\u0000${flow.directed}\u0000${flow.inferred}`;
+}
+
 function compactCount(value: number) {
   return new Intl.NumberFormat("ja-JP", { notation: "compact", maximumFractionDigits: 1 }).format(value);
 }
 
 export function TopologyPage({
+  check,
   snapshot,
   selected,
   onSelect,
   onHeartbeat,
 }: {
+  check: ProjectCheck | null;
   snapshot: WorkspaceSnapshot;
   selected: ConnectionSnapshot | null;
   onSelect: (id: string) => void;
@@ -76,6 +93,8 @@ export function TopologyPage({
 }) {
   const [hoveredId, setHoveredId] = useState<string | null>(null);
   const [activeNodeId, setActiveNodeId] = useState<string | null>(null);
+  const [showFlows, setShowFlows] = useState(true);
+  const [selectedFlowKey, setSelectedFlowKey] = useState<string | null>(null);
 
   const coreProcess = useMemo(() => selectCoreProcess(snapshot.processes), [snapshot.processes]);
   const coreStatus: VisualStatus = coreProcess?.status === "failed"
@@ -101,6 +120,11 @@ export function TopologyPage({
     };
   }), [snapshot]);
 
+  const positions = useMemo(() => new Map(assets.map((asset) => [asset.id, asset.position])), [assets]);
+  // 線を引けるのは、両端がこの画面のアセットであるものだけ。
+  const flows = useMemo(() => (check?.flows ?? []).filter((flow) => positions.has(flow.from) && positions.has(flow.to)), [check, positions]);
+  const selectedFlow = flows.find((flow) => flowKey(flow) === selectedFlowKey) ?? null;
+  const nameOf = (id: string) => assets.find((asset) => asset.id === id)?.name ?? id;
   const selectedConnection = selected ?? null;
   const activeNode = assets.find((asset) => asset.id === activeNodeId) ?? null;
   const hoveredNode = assets.find((asset) => asset.id === hoveredId) ?? null;
@@ -150,6 +174,11 @@ export function TopologyPage({
         <div className="topology-stage" aria-label="Hakoniwa の接続関係図">
           <div className="topology-stage-glow" aria-hidden="true" />
           <svg className="topology-network" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
+            <defs>
+              <marker id="pdu-flow-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+                <path d="M 0 0 L 10 5 L 0 10 z" className="pdu-flow-arrowhead" />
+              </marker>
+            </defs>
             {assets.map((asset) => {
               const activeConnection = asset.connections.find((connection) => connection.state === "connected");
               const inactiveConnection = asset.connections[0];
@@ -164,7 +193,34 @@ export function TopologyPage({
                 </g>
               );
             })}
+            {showFlows && flows.map((flow) => {
+              const from = positions.get(flow.from)!;
+              const to = positions.get(flow.to)!;
+              const path = flowPath(from, to);
+              const key = flowKey(flow);
+              return (
+                <g key={key} className={`pdu-flow ${flow.inferred ? "is-inferred" : ""} ${flow.directed ? "" : "is-undirected"} ${selectedFlowKey === key ? "is-selected" : ""}`}>
+                  <path d={path.d} markerEnd={flow.directed ? "url(#pdu-flow-arrow)" : undefined} />
+                </g>
+              );
+            })}
           </svg>
+          {showFlows && flows.map((flow) => {
+            const path = flowPath(positions.get(flow.from)!, positions.get(flow.to)!);
+            const key = flowKey(flow);
+            return (
+              <button
+                key={`label-${key}`}
+                type="button"
+                className={`pdu-flow-label ${selectedFlowKey === key ? "is-selected" : ""}`}
+                style={{ left: `${path.label.x}%`, top: `${path.label.y}%` }}
+                aria-label={`PDU の流れ: ${nameOf(flow.from)} から ${nameOf(flow.to)}（${flow.channels.length} チャネル）`}
+                onClick={() => setSelectedFlowKey(selectedFlowKey === key ? null : key)}
+              >
+                {flow.channels.length}
+              </button>
+            );
+          })}
 
           <button
             type="button"
@@ -283,6 +339,20 @@ export function TopologyPage({
             </>
           )}
 
+          {selectedFlow && (
+            <div className="selected-connection-card">
+              <div>
+                <span className="inspector-label">PDU の流れ{selectedFlow.inferred ? "（推定を含む）" : ""}</span>
+                <strong>{nameOf(selectedFlow.from)} {selectedFlow.directed ? "→" : "↔"} {nameOf(selectedFlow.to)}</strong>
+              </div>
+              <ul className="pdu-flow-channels">
+                {selectedFlow.channels.map((channel) => <li key={`${channel.robot}:${channel.channel_id}`}><code>{channel.robot} ch{channel.channel_id}</code> {channel.org_name}</li>)}
+              </ul>
+              {selectedFlow.inferred && <p className="muted">書き手か読み手の宣言がないため、チャネルを作るメンバーを書き手（または読み手）とみなしています。</p>}
+              {!selectedFlow.directed && <p className="muted">どちらも向きを宣言していないため、向きは分かりません。</p>}
+            </div>
+          )}
+
           {selectedConnection && (
             <div className="selected-connection-card">
               <div>
@@ -302,6 +372,9 @@ export function TopologyPage({
         <span><i className="legend-swatch legend-swatch-active" />起動・接続中</span>
         <span><i className="legend-swatch legend-swatch-idle" />停止・未接続</span>
         <span className="topology-motion-note">流れる線は接続済みの通信経路を示します。</span>
+        <span><i className="legend-swatch legend-swatch-pdu" />PDU の流れ（破線は推定、点線は向き不明。数字はチャネル数）</span>
+        <label className="toggle"><input type="checkbox" checked={showFlows} onChange={(event) => setShowFlows(event.target.checked)} />PDU の流れを表示</label>
+        {!check && <span className="muted">接続チェックの結果を待っています。</span>}
       </footer>
     </section>
   );

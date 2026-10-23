@@ -76,6 +76,74 @@ pub struct ProjectCheck {
     pub project_id: String,
     pub report: CompatReport,
     pub members: Vec<MemberCheck>,
+    /// 一括起動の対象のメンバーの間の PDU の流れ。トポロジー画面が線として描く。
+    pub flows: Vec<PduFlow>,
+}
+
+/// メンバー 2 つの間の PDU の流れ（同じ組のチャネルをまとめたもの）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PduFlow {
+    pub from: String,
+    pub to: String,
+    /// `from` から `to` へ流れる。false なら向きが分からない（どちらも向きを宣言していない）。
+    pub directed: bool,
+    /// 書き手が宣言されておらず、チャネルを作るメンバーを書き手とみなした。
+    pub inferred: bool,
+    pub channels: Vec<FlowChannel>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FlowChannel {
+    pub robot: String,
+    pub channel_id: i64,
+    pub org_name: String,
+}
+
+/// メンバーのチャネルの使い方から、PDU の流れを求める。
+///
+/// チャネルごとに、書き手（`write` を宣言）から読み手（`read`）へ流れるとする。書き手が
+/// 宣言されていなければ、チャネルを作るメンバー（登録）を書き手とみなす（推定）。向きを
+/// 宣言していないメンバー（compact 形式の `unknown`）とは、向きの分からない流れにする。
+/// 同じメンバーの組の流れは 1 つにまとめる。
+pub fn pdu_flows(members: &[MemberCheck]) -> Vec<PduFlow> {
+    use crate::ports::Access;
+    type Pair = (String, String, bool, bool);
+    let mut channels: BTreeMap<(String, i64), Vec<(&str, &ChannelUse)>> = BTreeMap::new();
+    for member in members.iter().filter(|member| member.enabled) {
+        for channel in &member.channels {
+            channels.entry((channel.robot.clone(), channel.channel_id)).or_default().push((member.member_id.as_str(), channel));
+        }
+    }
+    let mut flows: BTreeMap<Pair, Vec<FlowChannel>> = BTreeMap::new();
+    for ((robot, channel_id), uses) in &channels {
+        let has = |use_: &ChannelUse, access: Access| use_.access.contains(&access);
+        let writers: Vec<&str> = uses.iter().filter(|(_, use_)| has(use_, Access::Write)).map(|(id, _)| *id).collect();
+        let owners: Vec<&str> = uses.iter().filter(|(_, use_)| use_.registers).map(|(id, _)| *id).collect();
+        let readers: Vec<&str> = uses.iter().filter(|(_, use_)| has(use_, Access::Read)).map(|(id, _)| *id).collect();
+        let unknown: Vec<&str> = uses.iter().filter(|(_, use_)| !use_.registers && has(use_, Access::Unknown) && !has(use_, Access::Read) && !has(use_, Access::Write)).map(|(id, _)| *id).collect();
+        let org_name = uses.first().map(|(_, use_)| use_.org_name.clone()).unwrap_or_default();
+        let channel = FlowChannel { robot: robot.clone(), channel_id: *channel_id, org_name };
+        // 書き手がいれば、書き手でない所有者は読み手とみなす（推定）。いなければ、所有者を書き手とみなす（推定）。
+        let (sources, mut targets): (Vec<&str>, Vec<(&str, bool)>) = if writers.is_empty() {
+            (owners.clone(), readers.iter().map(|reader| (*reader, true)).collect())
+        } else {
+            let mut targets: Vec<(&str, bool)> = readers.iter().map(|reader| (*reader, false)).collect();
+            targets.extend(owners.iter().filter(|owner| !writers.contains(owner) && !readers.contains(owner)).map(|owner| (*owner, true)));
+            (writers.clone(), targets)
+        };
+        targets.dedup();
+        for source in &sources {
+            for (target, inferred) in targets.iter().filter(|(target, _)| target != source) {
+                flows.entry((source.to_string(), target.to_string(), true, *inferred)).or_default().push(channel.clone());
+            }
+            for other in unknown.iter().filter(|other| *other != source) {
+                // 向きが分からないので、組の順を決めて 1 本にする。
+                let (a, b) = if source <= other { (source, other) } else { (other, source) };
+                flows.entry((a.to_string(), b.to_string(), false, true)).or_default().push(channel.clone());
+            }
+        }
+    }
+    flows.into_iter().map(|((from, to, directed, inferred), channels)| PduFlow { from, to, directed, inferred, channels }).collect()
 }
 
 impl ProjectCheck {
@@ -354,7 +422,8 @@ pub fn check_project(project: &Project, library: &Library) -> Result<ProjectChec
         report.findings.push(compat::Finding { severity: compat::Severity::Info, code: "unverified_member".to_owned(), members: Vec::new(), robot: None, channel_id: None, message: format!("この PC からは確かめられないメンバー: {}", unverified.join("、")) });
         report.findings.sort_by(|a, b| a.severity.cmp(&b.severity).then_with(|| a.code.cmp(&b.code)));
     }
-    Ok(ProjectCheck { project_id: project.id.clone(), report, members })
+    let flows = pdu_flows(&members);
+    Ok(ProjectCheck { project_id: project.id.clone(), report, members, flows })
 }
 
 /// `member_ids` のメンバーを、今の内容で承認する。
@@ -595,6 +664,40 @@ mod tests {
         assert_eq!(check.report.coverage, crate::ports::Coverage::Partial);
     }
 
+    /// 書き手から読み手へ流れる。書き手がなければチャネルを作るメンバーから（推定）。対象外のメンバーは入れない。
+    #[test]
+    fn flows_follow_writers_and_owners() {
+        let (dir, project, library) = project("check-flows");
+        // owner は compact で登録（向きの宣言なし）、sim は legacy で ch0 を読み ch1 を書く。
+        let check = check_project(&project, &library).unwrap();
+        let flows = &check.flows;
+        let ch = |flow: &PduFlow| flow.channels.iter().map(|c| c.channel_id).collect::<Vec<_>>();
+        let owner_to_sim = flows.iter().find(|f| f.from == "owner" && f.to == "sim").unwrap();
+        assert!(owner_to_sim.directed && owner_to_sim.inferred, "ch0 は書き手がいないので、作るメンバーからの推定");
+        assert_eq!(ch(owner_to_sim), vec![0]);
+        assert!(flows.iter().all(|f| !(f.from == "sim" && f.to == "sim")));
+        // sim が書く ch1 は、宣言した読み手がいないので、作る側の owner を読み手とみなす（推定）。
+        let sim_to_owner = flows.iter().find(|f| f.from == "sim" && f.to == "owner").unwrap();
+        assert!(sim_to_owner.directed && sim_to_owner.inferred);
+        assert_eq!(ch(sim_to_owner), vec![1]);
+        // 読み手を足すと、sim → reader の宣言どおりの流れができる。
+        legacy(&dir, "reader.json", "Rig", &[(1, "attitude", 72)], &[]);
+        let mut project = project;
+        let mut library = library;
+        let reader = definition("reader", ActivationTiming::AfterStart, &dir, vec!["reader.json"]);
+        let asset = library_asset_from_definition("asset-reader".to_owned(), &reader);
+        project.members.push(member_from_definition(&reader, asset.id.clone()));
+        library.insert(asset.id.clone(), asset);
+        let check = check_project(&project, &library).unwrap();
+        let sim_to_reader = check.flows.iter().find(|f| f.from == "sim" && f.to == "reader").unwrap();
+        assert!(sim_to_reader.directed && !sim_to_reader.inferred);
+        assert_eq!(ch(sim_to_reader), vec![1]);
+        // 一括起動の対象外のメンバーは流れに入れない。
+        project.members.iter_mut().find(|m| m.id == "reader").unwrap().enabled = false;
+        let check = check_project(&project, &library).unwrap();
+        assert!(check.flows.iter().all(|f| f.to != "reader" && f.from != "reader"));
+    }
+
     /// WSL のメンバーでも、承認していないか、承認した後に起動定義が変われば止める。
     #[test]
     fn wsl_members_still_need_acceptance_of_their_launch() {
@@ -712,5 +815,14 @@ mod tests {
         assert!(check.blocking_reasons().is_empty(), "{:?}", check.blocking_reasons());
         let owned: usize = check.members.iter().filter(|m| m.enabled).flat_map(|m| m.entries.iter()).filter(|e| e.usage == Usage::Register).count();
         assert_eq!(owned, 2, "rig-owner と drone-mock が登録する");
+        for flow in &check.flows {
+            println!("flow {} -> {} directed={} inferred={} {:?}", flow.from, flow.to, flow.directed, flow.inferred, flow.channels.iter().map(|c| format!("{}:{}", c.robot, c.channel_id)).collect::<Vec<_>>());
+        }
+        // 指令は pilot が書き、自由飛行機（Drone の所有者）とジンバルのシムが読む。ビューアは両方の状態を読む。
+        let has = |from: &str, to: &str| check.flows.iter().any(|flow| flow.from == from && flow.to == to && flow.directed);
+        assert!(has("pilot", "drone-mock"), "pilot の指令が drone-mock へ");
+        assert!(has("pilot", "rig-sim"), "pilot の指令（ミラー）が rig-sim へ");
+        assert!(has("rig-sim", "viz-foxglove"), "ジンバルの状態がビューアへ");
+        assert!(check.flows.iter().all(|flow| flow.from != "viz-mujoco" && flow.to != "viz-mujoco"), "対象外のビューアは入れない");
     }
 }

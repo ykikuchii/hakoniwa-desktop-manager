@@ -231,10 +231,21 @@ export interface MemberCheck {
   port_changes: string[];
 }
 
+export interface PduFlow {
+  from: string;
+  to: string;
+  /** false なら向きが分からない。 */
+  directed: boolean;
+  /** 書き手か読み手を、チャネルを作るメンバーから推定した。 */
+  inferred: boolean;
+  channels: { robot: string; channel_id: number; org_name: string }[];
+}
+
 export interface ProjectCheck {
   project_id: string;
   report: { findings: Finding[]; coverage: "complete" | "partial" };
   members: MemberCheck[];
+  flows: PduFlow[];
 }
 
 export interface ProjectSummary {
