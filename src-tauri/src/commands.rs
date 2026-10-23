@@ -694,6 +694,15 @@ fn start_all_inner(state: State<'_, AppState>) -> Result<Vec<crate::types::Proce
     if state.stop_all_running.load(Ordering::Acquire) {
         return Err("一括停止の実行中は一括起動できません。".to_owned());
     }
+    // 接続チェックの Error と、承認した後に変わったメンバーがあれば起動しない。実行中の
+    // プロジェクトは変更できないので、ここで見た内容のまま起動する。
+    let reasons = {
+        let (project, library) = check_snapshot(&state, state.running_project_id())?;
+        crate::check::check_project(&project, &library)?.blocking_reasons()
+    };
+    if !reasons.is_empty() {
+        return Err(format!("接続チェックで問題があるため一括起動しません。\n{}", reasons.join("\n")));
+    }
     // 稼働中のアセットがあるまま一括起動すると、同じアセットが二重に起動する。
     // 登録アセットは Core に二重登録できず、外部アセットは同じポートを取り合う。
     // 一括起動の対象外でも、単独で起動したものが動いていれば同じ Core を使っているので数える。
@@ -829,12 +838,92 @@ pub fn inspect_business_pack_directory(path: String) -> Result<ImportPreview, St
 
 #[tauri::command]
 pub fn apply_import_preview(state: State<'_, AppState>, preview: ImportPreview) -> Result<Workspace, String> {
-    edit_active_workspace(&state, |workspace| {
-        workspace.source_directory = Some(preview.source_directory);
-        workspace.assets = preview.assets;
-        workspace.imported_connections = preview.connections;
-        Ok(())
-    })
+    let project_id = state.lock_store()?.active_project_id().to_owned();
+    let _gate = state.ensure_mutable(&project_id)?;
+    let mut workspace = state.active_workspace()?;
+    workspace.source_directory = Some(preview.source_directory);
+    workspace.assets = preview.assets;
+    workspace.imported_connections = preview.connections;
+    let mut store = state.lock_store()?;
+    crate::edit::apply_workspace(&mut store, &project_id, &workspace)?;
+    // 取り込みは利用者が構成を明示的に入れる操作なので、今の内容で承認する。
+    store.accept(&project_id)?;
+    drop(store);
+    state.active_workspace()
+}
+
+/// 接続チェック用に、プロジェクトとライブラリを複製する。ファイルはロックの外で読むため。
+/// `project_id` が `None` ならアクティブなプロジェクト。
+fn check_snapshot(state: &AppState, project_id: Option<String>) -> Result<(crate::model::Project, crate::model::Library), String> {
+    let store = state.lock_store()?;
+    let id = project_id.unwrap_or_else(|| store.active_project_id().to_owned());
+    let project = store.projects.get(&id).cloned().ok_or_else(|| "プロジェクトがありません。".to_owned())?;
+    let library = project.members.iter().filter_map(|member| store.library.get(&member.asset_id).map(|asset| (asset.id.clone(), asset.clone()))).collect();
+    Ok((project, library))
+}
+
+/// アクティブなプロジェクトの接続チェック。実行中なら、実行中のプロジェクトを見る。
+// ファイルを読むので、UI を止めないよう async にする。
+#[tauri::command(async)]
+pub fn check_project(state: State<'_, AppState>) -> Result<crate::check::ProjectCheck, String> {
+    let (project, library) = check_snapshot(&state, state.running_project_id())?;
+    crate::check::check_project(&project, &library)
+}
+
+/// 画面が表示していた接続チェックのとおりに、メンバーを承認する。表示したプロジェクトが
+/// アクティブでないか、表示した後に内容が変わっていれば拒否する。実行中も拒否する。
+#[tauri::command(async)]
+pub fn accept_member_changes(state: State<'_, AppState>, project_id: String, revisions: BTreeMap<String, String>) -> Result<crate::check::ProjectCheck, String> {
+    const SWITCHED: &str = "表示中のプロジェクトが切り替わっています。接続チェックを見直してから承認してください。";
+    if state.lock_store()?.active_project_id() != project_id {
+        return Err(SWITCHED.to_owned());
+    }
+    // ファイルはロックの外で読む。読んでいる間にロックを持つと、画面の更新（ゲートを
+    // 取る get_snapshot）まで待たされる。
+    let (snapshot, library) = check_snapshot(&state, Some(project_id.clone()))?;
+    let mut accepted = snapshot.clone();
+    crate::check::accept_shown(&mut accepted, &library, &revisions)?;
+    {
+        let _gate = state.ensure_mutable(&project_id)?;
+        let mut store = state.lock_store()?;
+        if store.active_project_id() != project_id {
+            return Err(SWITCHED.to_owned());
+        }
+        // 読んでいる間にプロジェクトかそのアセットが変わっていれば、承認しない。
+        let unchanged = store.projects.get(&project_id).is_some_and(|current| serde_json::to_value(current).ok() == serde_json::to_value(&snapshot).ok())
+            && library.iter().all(|(id, asset)| store.library.get(id).is_some_and(|current| serde_json::to_value(current).ok() == serde_json::to_value(asset).ok()));
+        if !unchanged {
+            return Err("承認している間にプロジェクトが変わりました。接続チェックを見直してから承認してください。".to_owned());
+        }
+        let draft = store.draft();
+        store.commit(draft, accepted)?;
+    }
+    let (project, library) = check_snapshot(&state, Some(project_id))?;
+    crate::check::check_project(&project, &library)
+}
+
+/// ライブラリのアセットをメンバーとして足したら、接続チェックがどうなるかを返す。保存しない。
+// ファイルを読むので、UI を止めないよう async にする。
+#[tauri::command(async)]
+pub fn preview_add_member(state: State<'_, AppState>, asset_id: String, variant_id: String, member_id: String) -> Result<crate::check::ProjectCheck, String> {
+    let (project, mut library) = check_snapshot(&state, None)?;
+    if let Some(asset) = state.lock_store()?.library.get(&asset_id) {
+        library.insert(asset.id.clone(), asset.clone());
+    }
+    let member = crate::model::Member {
+        id: member_id,
+        asset_id,
+        variant_id,
+        name: None,
+        enabled: true,
+        depends_on: Vec::new(),
+        optional_depends_on: Vec::new(),
+        activation_timing: None,
+        readiness: None,
+        env_overrides: Default::default(),
+        accepted: None,
+    };
+    crate::check::preview_add(&project, &library, member)
 }
 
 #[tauri::command]
