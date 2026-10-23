@@ -20,10 +20,6 @@ import type {
 
 export const api = {
   snapshot: () => invoke<WorkspaceSnapshot>("get_snapshot"),
-  saveWorkspace: (workspace: Workspace) => invoke<Workspace>("save_workspace", { workspace }),
-  createAsset: (asset: AssetDefinition) => invoke<Workspace>("create_asset", { asset }),
-  updateAsset: (asset: AssetDefinition) => invoke<Workspace>("update_asset", { asset }),
-  deleteAsset: (assetId: string) => invoke<Workspace>("delete_asset", { assetId }),
   startAsset: (assetId: string) => invoke<ProcessSnapshot>("start_asset", { assetId }),
   stopAsset: (assetId: string) => invoke<ProcessSnapshot[]>("stop_asset", { assetId }),
   startCore: () => invoke<ProcessSnapshot>("start_core_controller"),
@@ -49,27 +45,13 @@ export const api = {
   deleteLibraryAsset: (assetId: string) => invoke<void>("delete_library_asset", { assetId }),
   inspectVariant: (variant: Variant) => invoke<VariantPorts>("inspect_variant", { variant }),
   updateMember: (projectId: string, expected: MemberSettings, member: MemberSettings) => invoke<void>("update_member", { projectId, expected, member }),
-  setMemberAsset: (projectId: string, memberId: string, expectedAssetId: string, assetId: string, variantId: string) => invoke<void>("set_member_asset", { projectId, memberId, expectedAssetId, assetId, variantId }),
+  setMemberAsset: (projectId: string, memberId: string, expectedAssetId: string, expectedVariantId: string, assetId: string, variantId: string) => invoke<void>("set_member_asset", { projectId, memberId, expectedAssetId, expectedVariantId, assetId, variantId }),
   removeMember: (projectId: string, expected: MemberSettings) => invoke<void>("remove_member", { projectId, expected }),
   previewAddMember: (projectId: string, member: MemberSettings) => invoke<ProjectCheck>("preview_add_member", { projectId, member }),
   addMember: (projectId: string, member: MemberSettings, shownRevision: string | null) => invoke<void>("add_member", { projectId, member, shownRevision }),
-  renameProject: (projectId: string, name: string) => invoke<void>("rename_project", { projectId, name }),
-  setCoreController: (projectId: string, controller: CoreController | null) => invoke<void>("set_core_controller", { projectId, controller }),
+  renameProject: (projectId: string, expected: string, name: string) => invoke<void>("rename_project", { projectId, expected, name }),
+  setCoreController: (projectId: string, expected: CoreController | null, controller: CoreController | null) => invoke<void>("set_core_controller", { projectId, expected, controller }),
 };
-
-export function newAsset(): AssetDefinition {
-  return {
-    id: crypto.randomUUID(),
-    name: "新しいアセット",
-    role: "other",
-    command: { program: "", args: [], cwd: null, env: {}, target: "native" },
-    depends_on: ["core"],
-    optional_depends_on: [],
-    activation_timing: "manual",
-    config_files: [],
-    enabled: true,
-  };
-}
 
 export function newConnection(): ConnectionDefinition {
   return {

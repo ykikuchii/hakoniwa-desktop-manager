@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use crate::compat::{self, CompatReport, MemberPorts};
 use crate::model::{Acceptance, ChannelUse, Library, LibraryAsset, Member, PduEntrySpec, Project, Variant, CORE_NAMESPACE_VARIABLE};
 use crate::ports::{self, FileDigest, PduEntry, PortSet, Usage};
-use crate::types::ActivationTiming;
+use crate::types::{ActivationTiming, ProgramSpec, ReadinessCheck};
 
 /// 承認との照合の結果。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -49,6 +49,8 @@ pub struct MemberCheck {
     pub acceptance: AcceptanceState,
     /// 承認した時点からの変化（ファイルの追加・削除・変更、起動定義の変更）。
     pub changes: Vec<String>,
+    /// 承認の対象になる起動の内容。承認する画面に、PDU の宣言と一緒に見せる。
+    pub contract: LaunchContract,
     /// PDU 設定のファイルをこの PC から読んで確かめたか（WSL で動くメンバーは読めない）。
     /// 承認の状態とは別に持つ。
     pub files_checked: bool,
@@ -56,6 +58,16 @@ pub struct MemberCheck {
     pub channels: Vec<ChannelUse>,
     /// 承認した時点のチャネルからの変化。変化がなければ空。
     pub port_changes: Vec<String>,
+}
+
+/// メンバーの起動のしかた。環境変数はアセットの値にメンバーの上書きを重ねたもの。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LaunchContract {
+    pub launch: ProgramSpec,
+    pub activation_timing: ActivationTiming,
+    pub readiness: ReadinessCheck,
+    pub depends_on: Vec<String>,
+    pub optional_depends_on: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -287,26 +299,14 @@ fn evaluate(member: &Member, asset: &LibraryAsset) -> Result<Evaluated, String> 
         manifest.extend(extra_digests(variant));
     }
     let revision = revision(variant, member, &entries, &manifest, &ports.problems);
-    let (acceptance, changes) = if wsl {
-        // ファイルは確かめられないが、起動定義が承認した時点から変わっていれば承認を求める。
-        match &member.accepted {
-            Some(accepted) if accepted.revision == revision => (AcceptanceState::Unverified, Vec::new()),
-            Some(accepted) => (AcceptanceState::Changed, describe_changes(accepted, &manifest)),
-            None => (AcceptanceState::NotAccepted, Vec::new()),
-        }
-    } else if entries.is_empty() {
-        // 承認したときには PDU 設定があったのに、今は見つからない。変化として扱う。
-        // 承認した内容のままなら（PDU 設定がもともとない場合も含めて）対象外にする。
-        match &member.accepted {
-            Some(accepted) if accepted.revision != revision && accepted.had_pdu_entries => (AcceptanceState::Changed, describe_changes(accepted, &manifest)),
-            _ => (AcceptanceState::NoPduConfig, Vec::new()),
-        }
-    } else {
-        match &member.accepted {
-            None => (AcceptanceState::NotAccepted, Vec::new()),
-            Some(accepted) if accepted.revision == revision => (AcceptanceState::Accepted, Vec::new()),
-            Some(accepted) => (AcceptanceState::Changed, describe_changes(accepted, &manifest)),
-        }
+    // 承認は、PDU 設定の有無や実行先にかかわらず、起動の内容（revision）ごとに求める。
+    // 承認したままの内容なら、確かめた範囲に応じて状態を分ける。
+    let (acceptance, changes) = match &member.accepted {
+        None => (AcceptanceState::NotAccepted, Vec::new()),
+        Some(accepted) if accepted.revision != revision => (AcceptanceState::Changed, describe_changes(accepted, &manifest)),
+        Some(_) if wsl => (AcceptanceState::Unverified, Vec::new()),
+        Some(_) if entries.is_empty() => (AcceptanceState::NoPduConfig, Vec::new()),
+        Some(_) => (AcceptanceState::Accepted, Vec::new()),
     };
     let channels = channel_uses(&ports);
     let port_changes = match (&member.accepted, acceptance) {
@@ -316,9 +316,16 @@ fn evaluate(member: &Member, asset: &LibraryAsset) -> Result<Evaluated, String> 
     let name = member.name.clone().unwrap_or_else(|| asset.name.clone());
     let mut env = variant.launch.env.clone();
     env.extend(member.env_overrides.clone());
+    let contract = LaunchContract {
+        launch: ProgramSpec { env: env.clone(), ..variant.launch.clone() },
+        activation_timing: timing.clone(),
+        readiness: member.readiness.clone().unwrap_or_else(|| variant.readiness.clone()),
+        depends_on: member.depends_on.clone(),
+        optional_depends_on: member.optional_depends_on.clone(),
+    };
     Ok(Evaluated {
         ports: MemberPorts { member_id: member.id.clone(), name: name.clone(), activation_timing: timing, hako_config_path: env.get(CORE_NAMESPACE_VARIABLE).cloned(), ports },
-        check: MemberCheck { member_id: member.id.clone(), name, enabled: member.enabled, entries, inferred, revision, manifest, acceptance, changes, files_checked: !wsl, channels, port_changes },
+        check: MemberCheck { member_id: member.id.clone(), name, enabled: member.enabled, entries, inferred, revision, manifest, acceptance, changes, contract, files_checked: !wsl, channels, port_changes },
     })
 }
 
@@ -624,13 +631,35 @@ mod tests {
 
     /// PDU 設定のないメンバーは対象外で、承認も求めない。
     #[test]
-    fn members_without_pdu_config_are_not_gated() {
+    fn members_without_pdu_config_still_need_their_launch_accepted() {
         let (_, mut project, mut library) = project("check-none");
         library.get_mut("asset-sim").unwrap().variants[0].config_files = vec!["other.json".to_owned()];
         accept_members(&mut project, &library, &["owner".to_owned()]).unwrap();
         let check = check_project(&project, &library).unwrap();
+        assert_eq!(check.members[1].acceptance, AcceptanceState::NotAccepted);
+        assert_eq!(check.blocking_reasons().len(), 1);
+        accept_members(&mut project, &library, &["sim".to_owned()]).unwrap();
+        let check = check_project(&project, &library).unwrap();
         assert_eq!(check.members[1].acceptance, AcceptanceState::NoPduConfig);
         assert!(check.blocking_reasons().is_empty());
+        // 起動の内容が変われば、PDU 設定がなくても承認を求める。
+        library.get_mut("asset-sim").unwrap().variants[0].launch.args.push("--other".to_owned());
+        assert_eq!(check_project(&project, &library).unwrap().members[1].acceptance, AcceptanceState::Changed);
+    }
+
+    /// WSL で承認したメンバーを、PDU 設定のないローカルのバリエーションに替えても承認を求める。
+    #[test]
+    fn switching_from_wsl_to_native_needs_acceptance() {
+        let (_, mut project, mut library) = project("check-wsl-native");
+        let sim = library.get_mut("asset-sim").unwrap();
+        let mut native = sim.variants[0].clone();
+        native.id = "native".to_owned();
+        native.config_files = vec!["other.json".to_owned()];
+        sim.variants[0].launch.target = crate::types::ExecutionTarget::Wsl { distribution: "Ubuntu".to_owned() };
+        sim.variants.push(native);
+        accept_all(&mut project, &library).unwrap();
+        project.members[1].variant_id = "native".to_owned();
+        assert_eq!(check_project(&project, &library).unwrap().members[1].acceptance, AcceptanceState::Changed);
     }
 
     /// 手動の向き指定は、compact の不明な向きを上書きする。対応するチャネルがなければ問題になる。

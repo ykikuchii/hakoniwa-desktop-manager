@@ -117,10 +117,6 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_snapshot,
-            commands::save_workspace,
-            commands::create_asset,
-            commands::update_asset,
-            commands::delete_asset,
             commands::start_asset,
             commands::stop_asset,
             commands::start_core_controller,

@@ -1,8 +1,8 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "./api";
 import { selectAssetProcess } from "./selectors";
 import type { ActivationTiming, LibraryEntry, MemberSettings, ProjectCheck, WorkspaceSnapshot } from "./types";
-import { Empty, Field, ReadinessEditor, describeReadiness, formatEnv, messageOf, parseEnv } from "./ui";
+import { ContractView, Empty, EnvArea, Field, ReadinessEditor, accessLabel, describeReadiness, messageOf } from "./ui";
 
 type Run = (action: () => Promise<unknown>, message: string) => Promise<void>;
 
@@ -67,7 +67,7 @@ function MemberEditor({ snapshot, member, library, busy, running, onRun, onOpenI
       <Field label="準備完了の条件"><div><label className="toggle"><input type="checkbox" checked={!draft.readiness} onChange={(event) => patch({ readiness: event.target.checked ? null : variant?.readiness ?? { kind: "manual" } })} />バリエーションの既定（{variant ? describeReadiness(variant.readiness) : "?"}）</label>{draft.readiness && <ReadinessEditor value={draft.readiness} onChange={(readiness) => patch({ readiness })} />}</div></Field>
       <Field label="必須の依存先"><select multiple value={draft.depends_on} onChange={(event) => patch({ depends_on: Array.from(event.target.selectedOptions).map((option) => option.value) })}><option value="core">core</option>{others.map((candidate) => <option key={candidate.id} value={candidate.id}>{nameOf(candidate.id)}</option>)}</select><small>一括起動はこれらの準備完了を待ちます。一括起動の対象外のものを選ぶと、一括起動は拒否されます。</small></Field>
       <Field label="任意の依存先"><select multiple value={draft.optional_depends_on} onChange={(event) => patch({ optional_depends_on: Array.from(event.target.selectedOptions).map((option) => option.value) })}>{others.map((candidate) => <option key={candidate.id} value={candidate.id}>{nameOf(candidate.id)}</option>)}</select><small>一括起動の対象なら待ち、対象外なら待たずに進みます。</small></Field>
-      <Field label="環境変数の上書き（KEY=VALUE、1行に1個）" wide><textarea value={formatEnv(draft.env_overrides)} onChange={(event) => patch({ env_overrides: parseEnv(event.target.value) })} /><small>アセットの環境変数より優先します。HAKO_CONFIG_PATH は Core の設定で指定します。</small></Field>
+      <Field label="環境変数の上書き（KEY=VALUE、1行に1個）" wide><EnvArea value={draft.env_overrides} onChange={(env_overrides) => patch({ env_overrides })} /><small>アセットの環境変数より優先します。HAKO_CONFIG_PATH は Core の設定で指定します。</small></Field>
       <label className="toggle"><input type="checkbox" checked={draft.enabled} onChange={(event) => patch({ enabled: event.target.checked })} />一括起動の対象に含める（外しても単独では起動できます）</label>
     </div>
     <div className="form-actions">
@@ -87,7 +87,7 @@ function MemberEditor({ snapshot, member, library, busy, running, onRun, onOpenI
       <div className="inline-fields">
         <select value={switchTo.assetId} onChange={(event) => { const next = library.find((entry) => entry.asset.id === event.target.value)?.asset; setSwitchTo({ assetId: event.target.value, variantId: next?.variants[0]?.id ?? "" }); }}>{library.map((entry) => <option key={entry.asset.id} value={entry.asset.id}>{entry.asset.name}{entry.asset.id === member.asset_id ? "（今の版）" : ""}</option>)}</select>
         <select value={switchTo.variantId} onChange={(event) => setSwitchTo({ ...switchTo, variantId: event.target.value })}>{(switchAsset?.variants ?? []).map((candidate) => <option key={candidate.id} value={candidate.id}>{candidate.label}</option>)}</select>
-        <button className="button subtle small" disabled={busy || running || (switchTo.assetId === member.asset_id && switchTo.variantId === member.variant_id)} onClick={() => void onRun(() => api.setMemberAsset(projectId, member.id, member.asset_id, switchTo.assetId, switchTo.variantId), "使うアセットを選び直しました。接続チェックで承認してください。")}>選び直す</button>
+        <button className="button subtle small" disabled={busy || running || (switchTo.assetId === member.asset_id && switchTo.variantId === member.variant_id)} onClick={() => void onRun(() => api.setMemberAsset(projectId, member.id, member.asset_id, member.variant_id, switchTo.assetId, switchTo.variantId), "使うアセットを選び直しました。接続チェックで承認してください。")}>選び直す</button>
       </div>
     </div>
   </>;
@@ -99,12 +99,15 @@ function AddMember({ projectId, members, library, busy, onRun, onDone }: { proje
   const [memberId, setMemberId] = useState("");
   const [name, setName] = useState("");
   const [enabled, setEnabled] = useState(true);
-  const [preview, setPreview] = useState<ProjectCheck | null>(null);
+  // プレビューは、出したときの設定と一緒に持つ。設定が変わったら、その結果では追加しない。
+  const [preview, setPreview] = useState<{ settings: string; check: ProjectCheck } | null>(null);
   const [error, setError] = useState("");
+  const generation = useRef(0);
   const asset = library.find((entry) => entry.asset.id === assetId)?.asset;
   const settings: MemberSettings = { id: memberId.trim(), asset_id: assetId, variant_id: variantId, name: name.trim() || null, enabled, depends_on: [], optional_depends_on: [], activation_timing: null, readiness: null, env_overrides: {} };
-  // 入力を変えたら、前のプレビューは使わない（表示した内容で承認するため）。
-  useEffect(() => { setPreview(null); setError(""); }, [assetId, variantId, memberId, name, enabled]);
+  const settingsKey = JSON.stringify(settings);
+  // 入力を変えたら、前のプレビューも、まだ返ってきていない問い合わせも使わない（表示した内容で承認するため）。
+  useEffect(() => { generation.current++; setPreview(null); setError(""); }, [settingsKey]);
   const chooseAsset = (id: string) => {
     const next = library.find((entry) => entry.asset.id === id)?.asset;
     setAssetId(id);
@@ -115,8 +118,17 @@ function AddMember({ projectId, members, library, busy, onRun, onDone }: { proje
     setMemberId(candidate);
   };
   const ready = settings.id !== "" && assetId !== "" && variantId !== "";
-  const shown = preview?.members.find((member) => member.member_id === settings.id);
-  const related = preview?.report.findings.filter((finding) => finding.members.includes(settings.id)) ?? [];
+  const current = preview && preview.settings === settingsKey ? preview.check : null;
+  const shown = current?.members.find((member) => member.member_id === settings.id);
+  const related = current?.report.findings.filter((finding) => finding.members.includes(settings.id)) ?? [];
+  const requestPreview = () => {
+    const mine = ++generation.current;
+    const key = settingsKey;
+    api.previewAddMember(projectId, settings).then(
+      (result) => { if (mine === generation.current) { setPreview({ settings: key, check: result }); setError(""); } },
+      (reason) => { if (mine === generation.current) { setPreview(null); setError(messageOf(reason)); } },
+    );
+  };
 
   return <>
     <div className="panel-heading"><div><p className="eyebrow">ADD MEMBER</p><h2>ライブラリから追加</h2></div></div>
@@ -129,16 +141,18 @@ function AddMember({ projectId, members, library, busy, onRun, onDone }: { proje
       <label className="toggle"><input type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} />一括起動の対象に含める</label>
     </div>
     <div className="form-actions">
-      <button className="button secondary" disabled={busy || !ready} onClick={() => { api.previewAddMember(projectId, settings).then((result) => { setPreview(result); setError(""); }, (reason) => { setPreview(null); setError(messageOf(reason)); }); }}>プレビュー</button>
+      <button className="button secondary" disabled={busy || !ready} onClick={requestPreview}>プレビュー</button>
       <button className="button primary" disabled={busy || !shown} onClick={() => void onRun(async () => { await api.addMember(projectId, settings, shown?.revision ?? null); onDone(settings.id); }, "メンバーを追加しました。")}>表示した内容で追加する</button>
     </div>
     {error && <p className="error">{error}</p>}
-    {preview && shown && <div className="sub-editor">
+    {current && shown && <div className="sub-editor">
       <h3>足した後の接続チェック</h3>
       {related.length === 0 ? <p className="muted">このメンバーに関わる所見はありません。</p> : related.map((finding, index) => <p key={index} className={`finding ${finding.severity}`}><span>{({ error: "エラー", warning: "注意", info: "情報" } as Record<string, string>)[finding.severity]}</span>{finding.message}</p>)}
-      {preview.report.findings.some((finding) => finding.severity === "error") && <p className="muted">エラーがあると、足しても一括起動は止まります。</p>}
+      {current.report.findings.some((finding) => finding.severity === "error") && <p className="muted">エラーがあると、足しても一括起動は止まります。</p>}
+      <h3>起動の内容</h3>
+      <ContractView contract={shown.contract} />
       <h3>このメンバーのチャネル</h3>
-      {shown.channels.length === 0 ? <p className="muted">{shown.files_checked ? "チャネルの宣言はありません。" : "この PC からは PDU 設定を読めません（WSL）。"}</p> : <ul>{shown.channels.map((channel, index) => <li key={index}>{channel.robot} ch{channel.channel_id} {channel.org_name}（<code>{channel.type_name}</code> / {channel.pdu_size}）{channel.registers ? " 登録" : ""}</li>)}</ul>}
+      {shown.channels.length === 0 ? <p className="muted">{shown.files_checked ? "チャネルの宣言はありません。" : "この PC からは PDU 設定を読めません（WSL）。"}</p> : <ul>{shown.channels.map((channel, index) => <li key={index}>{channel.robot} ch{channel.channel_id} {channel.org_name}（<code>{channel.type_name}</code> / {channel.pdu_size}）{[channel.registers ? " 登録" : "", ...channel.access.filter((access) => !(channel.registers && access === "unknown")).map((access) => ` ${accessLabel[access]}`)].join("")}</li>)}</ul>}
     </div>}
   </>;
 }

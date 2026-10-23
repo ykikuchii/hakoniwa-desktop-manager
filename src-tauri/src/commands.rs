@@ -73,55 +73,6 @@ fn edit_active_workspace(state: &AppState, edit: impl FnOnce(&mut Workspace) -> 
 }
 
 #[tauri::command]
-pub fn save_workspace(state: State<'_, AppState>, workspace: Workspace) -> Result<Workspace, String> {
-    edit_active_workspace(&state, |current| {
-        // 画面が切り替え前のプロジェクトを送ってきたら拒否する。書くと、前のプロジェクトの
-        // 内容で今のプロジェクトを上書きしてしまう。
-        if workspace.id != current.id {
-            return Err("表示中のプロジェクトが切り替わっています。画面が更新されてから、もう一度保存してください。".to_owned());
-        }
-        *current = Workspace { schema_version: current.schema_version, ..workspace };
-        Ok(())
-    })
-}
-
-#[tauri::command]
-pub fn create_asset(state: State<'_, AppState>, asset: AssetDefinition) -> Result<Workspace, String> {
-    asset.command.validate()?;
-    edit_active_workspace(&state, |workspace| {
-        if workspace.assets.iter().any(|candidate| candidate.id == asset.id) {
-            return Err("同じアセットIDが既に存在します。".to_owned());
-        }
-        workspace.assets.push(asset);
-        Ok(())
-    })
-}
-
-#[tauri::command]
-pub fn update_asset(state: State<'_, AppState>, asset: AssetDefinition) -> Result<Workspace, String> {
-    asset.command.validate()?;
-    edit_active_workspace(&state, |workspace| {
-        let existing = workspace.assets.iter_mut().find(|candidate| candidate.id == asset.id).ok_or_else(|| "更新対象のアセットが見つかりません。".to_owned())?;
-        *existing = asset;
-        Ok(())
-    })
-}
-
-#[tauri::command]
-pub fn delete_asset(state: State<'_, AppState>, asset_id: String) -> Result<Workspace, String> {
-    edit_active_workspace(&state, |workspace| {
-        let before = workspace.assets.len();
-        workspace.assets.retain(|asset| asset.id != asset_id);
-        if before == workspace.assets.len() { return Err("削除対象のアセットが見つかりません。".to_owned()); }
-        for asset in &mut workspace.assets {
-            asset.depends_on.retain(|dependency| dependency != &asset_id);
-            asset.optional_depends_on.retain(|dependency| dependency != &asset_id);
-        }
-        Ok(())
-    })
-}
-
-#[tauri::command]
 pub fn select_project(state: State<'_, AppState>, project_id: String) -> Result<(), String> {
     state.select_project(&project_id)
 }
@@ -1381,8 +1332,8 @@ pub fn update_member(state: State<'_, AppState>, project_id: String, expected: c
 }
 
 #[tauri::command]
-pub fn set_member_asset(state: State<'_, AppState>, project_id: String, member_id: String, expected_asset_id: String, asset_id: String, variant_id: String) -> Result<(), String> {
-    edit_project(&state, &project_id, |store| crate::manage::set_member_asset(store, &project_id, &member_id, &expected_asset_id, &asset_id, &variant_id))
+pub fn set_member_asset(state: State<'_, AppState>, project_id: String, member_id: String, expected_asset_id: String, expected_variant_id: String, asset_id: String, variant_id: String) -> Result<(), String> {
+    edit_project(&state, &project_id, |store| crate::manage::set_member_asset(store, &project_id, &member_id, &expected_asset_id, &expected_variant_id, &asset_id, &variant_id))
 }
 
 #[tauri::command]
@@ -1421,11 +1372,11 @@ fn add_member_snapshot(state: &AppState, project_id: &str, asset_id: &str) -> Re
 }
 
 #[tauri::command]
-pub fn rename_project(state: State<'_, AppState>, project_id: String, name: String) -> Result<(), String> {
-    edit_project(&state, &project_id, |store| crate::manage::rename_project(store, &project_id, &name))
+pub fn rename_project(state: State<'_, AppState>, project_id: String, expected: String, name: String) -> Result<(), String> {
+    edit_project(&state, &project_id, |store| crate::manage::rename_project(store, &project_id, &expected, &name))
 }
 
 #[tauri::command]
-pub fn set_core_controller(state: State<'_, AppState>, project_id: String, controller: Option<crate::types::CoreController>) -> Result<(), String> {
-    edit_project(&state, &project_id, |store| crate::manage::set_core_controller(store, &project_id, controller))
+pub fn set_core_controller(state: State<'_, AppState>, project_id: String, expected: Option<crate::types::CoreController>, controller: Option<crate::types::CoreController>) -> Result<(), String> {
+    edit_project(&state, &project_id, |store| crate::manage::set_core_controller(store, &project_id, expected.as_ref(), controller))
 }

@@ -1,4 +1,5 @@
 import type { ChannelUse, MemberCheck, ProjectCheck } from "./types";
+import { ContractView, accessLabel } from "./ui";
 
 const severityLabel: Record<string, string> = { error: "エラー", warning: "注意", info: "情報" };
 const acceptanceLabel: Record<MemberCheck["acceptance"], string> = {
@@ -40,6 +41,10 @@ export function ChecksPage({ check, error, disabled, onAccept }: { check: Projec
               <div className="member-check-heading"><strong>{member.name}</strong><span className="status-badge" data-state={member.acceptance === "changed" || member.acceptance === "not_accepted" ? "failed" : member.acceptance === "accepted" ? "running" : "unknown"}>{acceptanceLabel[member.acceptance]}</span>{!member.enabled && <span className="muted">一括起動の対象外</span>}</div>
               {member.entries.length > 0 && <p className="muted">{member.entries.map((entry) => `${entry.path}（${entry.usage === "register" ? "登録" : "接続"}${entry.usage_inferred ? "・推定" : ""}）`).join("、")}</p>}
               {member.acceptance === "changed" && <ul>{member.changes.map((change) => <li key={change}>{change}</li>)}{member.port_changes.map((change) => <li key={change}>{change}</li>)}</ul>}
+              {member.enabled && (member.acceptance === "changed" || member.acceptance === "not_accepted") && <>
+                <ContractView contract={member.contract} />
+                {member.channels.length > 0 && <p className="muted">チャネル：{member.channels.map((channel) => `${channel.robot} ch${channel.channel_id} ${channel.org_name}（${channel.type_name} / ${channel.pdu_size}${channel.registers ? "・登録" : ""}${channel.access.filter((access) => !(channel.registers && access === "unknown")).map((access) => "・" + accessLabel[access]).join("")}）`).join("、")}</p>}
+              </>}
             </div>
           ))}
         </div>
@@ -54,35 +59,42 @@ export function ChecksPage({ check, error, disabled, onAccept }: { check: Projec
 
 function ChannelMatrix({ members }: { members: MemberCheck[] }) {
   if (members.length === 0) return <p className="muted">チャネルを宣言しているメンバーがありません。</p>;
-  const rows = new Map<string, { robot: string; channel_id: number; org_name: string; type_name: string; owner?: ChannelUse }>();
+  // 行は宣言ごと（robot・ch・名前・型・サイズ）。同じチャネルの宣言が食い違えば、行が分かれて見える。
+  const declKey = (channel: ChannelUse) => JSON.stringify([channel.robot, channel.channel_id, channel.org_name, channel.type_name, channel.pdu_size]);
+  const channelKey = (channel: ChannelUse) => `${channel.robot}\u0000${channel.channel_id}`;
+  const rows = new Map<string, ChannelUse>();
+  const owners = new Map<string, ChannelUse>();
+  const declarations = new Map<string, Set<string>>();
   for (const member of members) {
     for (const channel of member.channels) {
-      const key = `${channel.robot}\u0000${channel.channel_id}`;
-      const row = rows.get(key) ?? { robot: channel.robot, channel_id: channel.channel_id, org_name: channel.org_name, type_name: channel.type_name };
-      if (channel.registers && !row.owner) row.owner = channel;
-      rows.set(key, row);
+      rows.set(declKey(channel), channel);
+      if (channel.registers && !owners.has(channelKey(channel))) owners.set(channelKey(channel), channel);
+      declarations.set(channelKey(channel), (declarations.get(channelKey(channel)) ?? new Set()).add(declKey(channel)));
     }
   }
-  const sorted = [...rows.entries()].sort(([, a], [, b]) => a.robot.localeCompare(b.robot) || a.channel_id - b.channel_id);
+  const sorted = [...rows.entries()].sort(([, a], [, b]) => a.robot.localeCompare(b.robot) || a.channel_id - b.channel_id || a.org_name.localeCompare(b.org_name) || a.pdu_size - b.pdu_size);
   return (
     <div className="matrix-scroll">
       <table className="channel-matrix">
-        <thead><tr><th>robot</th><th>ch</th><th>名前</th><th>型</th>{members.map((member) => <th key={member.member_id}>{member.name}</th>)}</tr></thead>
+        <thead><tr><th>robot</th><th>ch</th><th>名前</th><th>型</th><th>サイズ</th>{members.map((member) => <th key={member.member_id}>{member.name}</th>)}</tr></thead>
         <tbody>
-          {sorted.map(([key, row]) => (
-            <tr key={key} className={row.owner ? undefined : "no-owner"}>
-              <td>{row.robot}</td><td>{row.channel_id}</td><td>{row.org_name}</td><td><code>{row.type_name}</code></td>
+          {sorted.map(([key, row]) => {
+            const owner = owners.get(channelKey(row));
+            const conflicting = (declarations.get(channelKey(row))?.size ?? 0) > 1;
+            const mismatch = owner ? row.pdu_size !== owner.pdu_size || row.type_name !== owner.type_name : false;
+            return <tr key={key} className={[owner ? "" : "no-owner", conflicting ? "conflict" : ""].join(" ").trim() || undefined}>
+              <td>{row.robot}</td><td>{row.channel_id}</td><td>{row.org_name}</td><td><code>{row.type_name}</code></td><td>{row.pdu_size}</td>
               {members.map((member) => {
-                const use = member.channels.find((channel) => channel.robot === row.robot && channel.channel_id === row.channel_id);
+                const use = member.channels.find((channel) => declKey(channel) === key);
                 if (!use) return <td key={member.member_id} />;
-                const mismatch = row.owner ? use.pdu_size !== row.owner.pdu_size || use.type_name !== row.owner.type_name : false;
-                const label = [use.registers ? "登録" : "", ...use.access.filter((access) => !(use.registers && access === "unknown")).map((access) => ({ read: "読", write: "書", unknown: "?" })[access])].filter(Boolean).join("・");
-                return <td key={member.member_id} className={mismatch ? "cell mismatch" : "cell"} title={mismatch ? `所有側は ${row.owner?.type_name} / ${row.owner?.pdu_size}` : undefined}>{label} <small>{use.pdu_size}</small></td>;
+                const label = [use.registers ? "登録" : "", ...use.access.filter((access) => !(use.registers && access === "unknown")).map((access) => accessLabel[access])].filter(Boolean).join("・");
+                return <td key={member.member_id} className={mismatch ? "cell mismatch" : "cell"} title={mismatch ? `所有側は ${owner?.type_name} / ${owner?.pdu_size}` : undefined}>{label}</td>;
               })}
-            </tr>
-          ))}
+            </tr>;
+          })}
         </tbody>
       </table>
+      {sorted.some(([, row]) => (declarations.get(channelKey(row))?.size ?? 0) > 1) && <p className="muted">左端が黄色の行は、同じチャネルに食い違う宣言があることを示します。</p>}
     </div>
   );
 }

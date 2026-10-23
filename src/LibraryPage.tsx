@@ -1,10 +1,9 @@
 import { useEffect, useState } from "react";
 import { api } from "./api";
 import type { Access, ActivationTiming, AssetRole, LibraryAsset, LibraryEntry, MemberSettings, Variant, VariantPorts } from "./types";
-import { Empty, Field, ReadinessEditor, formatEnv, messageOf, parseEnv, parseLines } from "./ui";
+import { Empty, EnvArea, Field, LinesArea, ReadinessEditor, accessLabel, messageOf } from "./ui";
 
 const roles: AssetRole[] = ["simulator", "controller", "visualizer", "bridge", "service", "external_client", "monitor", "other"];
-const accessLabel: Record<Access, string> = { read: "読", write: "書", unknown: "?" };
 
 function newVariant(id: string): Variant {
   return { id, label: "既定", launch: { program: "", args: [], cwd: null, env: {}, target: "native" }, activation_timing: "after_start", readiness: { kind: "manual" }, config_files: [], pdu_entries: [], extra_inputs: [], manual_access: [] };
@@ -104,15 +103,15 @@ function LibraryEditor({ entry, isNew, projectId, members, running, busy, onSave
       <Field label="バリエーション ID"><input value={variant.id} disabled={!isNew && entry.asset.variants.some((candidate) => candidate.id === variant.id)} onChange={(event) => patchVariant({ id: event.target.value })} /></Field>
       <Field label="表示名"><input value={variant.label} onChange={(event) => patchVariant({ label: event.target.value })} /></Field>
       <Field label="実行ファイル / コマンド" wide><input value={variant.launch.program} placeholder="例: python" onChange={(event) => patchLaunch({ program: event.target.value })} /></Field>
-      <Field label="引数（1行に1個）" wide><textarea value={variant.launch.args.join("\n")} onChange={(event) => patchLaunch({ args: parseLines(event.target.value) })} /></Field>
+      <Field label="引数（1行に1個）" wide><LinesArea key={`args-${variantIndex}`} trim={false} value={variant.launch.args} onChange={(args) => patchLaunch({ args })} /></Field>
       <Field label="作業ディレクトリ" wide><input value={variant.launch.cwd ?? ""} onChange={(event) => patchLaunch({ cwd: event.target.value || null })} /></Field>
       <Field label="実行環境"><select value={variant.launch.target === "native" ? "native" : "wsl"} onChange={(event) => patchLaunch({ target: event.target.value === "native" ? "native" : { wsl: { distribution: "Ubuntu" } } })}><option value="native">ローカルOS</option><option value="wsl">WSL2</option></select></Field>
       {variant.launch.target !== "native" && <Field label="WSLディストリビューション"><input value={variant.launch.target.wsl.distribution} onChange={(event) => patchLaunch({ target: { wsl: { distribution: event.target.value } } })} /></Field>}
       <Field label="起動タイミング（既定）"><select value={variant.activation_timing} onChange={(event) => patchVariant({ activation_timing: event.target.value as ActivationTiming })}><option value="before_start">before_start</option><option value="manual">manual</option><option value="after_start">after_start</option></select></Field>
       <Field label="準備完了の条件（既定）"><ReadinessEditor value={variant.readiness} onChange={(readiness) => patchVariant({ readiness })} /></Field>
-      <Field label="環境変数（KEY=VALUE、1行に1個）" wide><textarea value={formatEnv(variant.launch.env)} onChange={(event) => patchLaunch({ env: parseEnv(event.target.value) })} /></Field>
-      <Field label="設定ファイル（1行に1個）" wide><textarea value={variant.config_files.join("\n")} onChange={(event) => patchVariant({ config_files: parseLines(event.target.value) })} /><small>PDU 設定の入口を登録していなければ、ここから推定します。</small></Field>
-      <Field label="ほかに変更を監視するファイル（1行に1個）" wide><textarea value={variant.extra_inputs.join("\n")} onChange={(event) => patchVariant({ extra_inputs: parseLines(event.target.value) })} /><small>サイズを直接書いたスクリプトなど。変われば承認を求めます。</small></Field>
+      <Field label="環境変数（KEY=VALUE、1行に1個）" wide><EnvArea key={`env-${variantIndex}`} value={variant.launch.env} onChange={(env) => patchLaunch({ env })} /></Field>
+      <Field label="設定ファイル（1行に1個）" wide><LinesArea key={`config-${variantIndex}`} value={variant.config_files} onChange={(config_files) => patchVariant({ config_files })} /><small>PDU 設定の入口を登録していなければ、ここから推定します。</small></Field>
+      <Field label="ほかに変更を監視するファイル（1行に1個）" wide><LinesArea key={`extra-${variantIndex}`} value={variant.extra_inputs} onChange={(extra_inputs) => patchVariant({ extra_inputs })} /><small>サイズを直接書いたスクリプトなど。変われば承認を求めます。</small></Field>
     </div>
     <PduEntriesEditor variant={variant} onChange={patchVariant} />
     <PortsView variant={variant} />

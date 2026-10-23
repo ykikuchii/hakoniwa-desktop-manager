@@ -162,10 +162,10 @@ pub fn update_member(store: &mut Store, project_id: &str, expected: &MemberSetti
 
 /// メンバーが使うアセットとバリエーションを選び直す。承認は引き継ぐので、内容が変われば
 /// 接続チェックで「変更あり」になる。
-pub fn set_member_asset(store: &mut Store, project_id: &str, member_id: &str, expected_asset_id: &str, asset_id: &str, variant_id: &str) -> Result<(), String> {
+pub fn set_member_asset(store: &mut Store, project_id: &str, member_id: &str, expected_asset_id: &str, expected_variant_id: &str, asset_id: &str, variant_id: &str) -> Result<(), String> {
     let mut project = project_of(store, project_id)?;
     let member = project.members.iter_mut().find(|member| member.id == member_id).ok_or_else(|| "そのメンバーはもうありません。".to_owned())?;
-    if member.asset_id != expected_asset_id {
+    if member.asset_id != expected_asset_id || member.variant_id != expected_variant_id {
         return Err("メンバーのアセットが、表示した後に変わっています。画面を読み直してください。".to_owned());
     }
     member.asset_id = asset_id.to_owned();
@@ -192,14 +192,20 @@ pub fn with_new_member(project: &Project, settings: MemberSettings) -> Result<Pr
     Ok(candidate)
 }
 
-pub fn rename_project(store: &mut Store, project_id: &str, name: &str) -> Result<(), String> {
+pub fn rename_project(store: &mut Store, project_id: &str, expected: &str, name: &str) -> Result<(), String> {
     let mut project = project_of(store, project_id)?;
+    if project.name != expected {
+        return Err("プロジェクト名が、表示した後に変わっています。画面を読み直してください。".to_owned());
+    }
     project.name = name.trim().to_owned();
     store.commit(store.draft(), project)
 }
 
-pub fn set_core_controller(store: &mut Store, project_id: &str, controller: Option<CoreController>) -> Result<(), String> {
+pub fn set_core_controller(store: &mut Store, project_id: &str, expected: Option<&CoreController>, controller: Option<CoreController>) -> Result<(), String> {
     let mut project = project_of(store, project_id)?;
+    if serde_json::to_value(&project.core_controller).ok() != serde_json::to_value(expected).ok() {
+        return Err("Core コントローラーの設定が、表示した後に変わっています。画面を読み直してください。".to_owned());
+    }
     project.core_controller = controller;
     store.commit(store.draft(), project)
 }
@@ -327,9 +333,24 @@ mod tests {
         let (mut store, id) = store_with_demo("switch");
         let pilot = member_asset(&store, &id, "pilot");
         let other = member_asset(&store, &id, "viz-foxglove");
-        assert!(set_member_asset(&mut store, &id, "pilot", &other, &other, "default").is_err());
-        set_member_asset(&mut store, &id, "pilot", &pilot, &other, "default").unwrap();
+        assert!(set_member_asset(&mut store, &id, "pilot", &other, "default", &other, "default").is_err());
+        assert!(set_member_asset(&mut store, &id, "pilot", &pilot, "other-variant", &other, "default").is_err(), "バリエーションも照合する");
+        set_member_asset(&mut store, &id, "pilot", &pilot, "default", &other, "default").unwrap();
         assert_eq!(member_asset(&store, &id, "pilot"), other);
-        assert!(set_member_asset(&mut store, &id, "pilot", &other, &other, "missing").is_err(), "ないバリエーションは検証で拒否");
+        assert!(set_member_asset(&mut store, &id, "pilot", &other, "default", &other, "missing").is_err(), "ないバリエーションは検証で拒否");
+    }
+
+    /// プロジェクト名と Core コントローラーも、表示した後に変わっていれば上書きしない。
+    #[test]
+    fn project_fields_check_the_expected_values() {
+        let (mut store, id) = store_with_demo("fields");
+        let name = store.projects[&id].name.clone();
+        rename_project(&mut store, &id, &name, "Renamed").unwrap();
+        assert!(rename_project(&mut store, &id, &name, "Again").is_err());
+        let current = store.projects[&id].core_controller.clone();
+        let next = CoreController { id: "controller-e2e".to_owned(), name: "C".to_owned(), command: crate::types::ProgramSpec { program: "x".to_owned(), args: Vec::new(), cwd: None, env: BTreeMap::new(), target: Default::default() }, readiness: Default::default() };
+        set_core_controller(&mut store, &id, current.as_ref(), Some(next.clone())).unwrap();
+        assert!(set_core_controller(&mut store, &id, current.as_ref(), None).is_err());
+        set_core_controller(&mut store, &id, Some(&next), None).unwrap();
     }
 }

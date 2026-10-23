@@ -198,6 +198,14 @@ export interface Finding {
   message: string;
 }
 
+export interface LaunchContract {
+  launch: ProgramSpec;
+  activation_timing: ActivationTiming;
+  readiness: ReadinessCheck;
+  depends_on: string[];
+  optional_depends_on: string[];
+}
+
 export interface ChannelUse {
   robot: string;
   channel_id: number;
@@ -217,6 +225,7 @@ export interface MemberCheck {
   revision: string;
   acceptance: "no_pdu_config" | "accepted" | "changed" | "not_accepted" | "unverified";
   changes: string[];
+  contract: LaunchContract;
   files_checked: boolean;
   channels: ChannelUse[];
   port_changes: string[];
