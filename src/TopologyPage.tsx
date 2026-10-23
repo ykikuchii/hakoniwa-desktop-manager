@@ -133,7 +133,43 @@ function flowPath(from: Position, to: Position, center: Position, clearance: num
   const w1 = (1 - t0) * t1 + t0 * (1 - t1);
   const w2 = t0 * t1;
   const c = { x: w0 * from.x + w1 * control.x + w2 * to.x, y: w0 * from.y + w1 * control.y + w2 * to.y };
-  return { d: `M ${start.x} ${start.y} Q ${c.x} ${c.y} ${end.x} ${end.y}`, label: bezierAt(start, c, end, 0.5) };
+  return { d: `M ${start.x} ${start.y} Q ${c.x} ${c.y} ${end.x} ${end.y}`, curve: { start, c, end }, label: bezierAt(start, c, end, 0.5) };
+}
+
+function distanceToSegment(p: Position, a: Position, b: Position) {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const t = dx || dy ? Math.min(Math.max(((p.x - a.x) * dx + (p.y - a.y) * dy) / (dx * dx + dy * dy), 0), 1) : 0;
+  return Math.hypot(p.x - (a.x + dx * t), p.y - (a.y + dy * t));
+}
+
+// ラベル（直径 20 px）を、ほかの線やラベルから離れたとみなす距離。
+const LABEL_CLEARANCE = 22;
+
+/**
+ * 各曲線のラベルを、Core から各ノードへの線とほかのラベルから離れた位置に置く。
+ * 曲線の中ほど（t = 0.2〜0.8）から、近くのものとの距離が最も大きい点を選ぶ（同じなら中央寄り）。
+ */
+function placeLabels(curves: { start: Position; c: Position; end: Position }[], spokes: [Position, Position][]) {
+  const placed: Position[] = [];
+  return curves.map(({ start, c, end }) => {
+    let best = bezierAt(start, c, end, 0.5);
+    let bestScore = -Infinity;
+    for (let i = 0; i <= 12; i++) {
+      const t = 0.2 + (i / 12) * 0.6;
+      const p = bezierAt(start, c, end, t);
+      const near = Math.min(
+        ...spokes.map(([a, b]) => distanceToSegment(p, a, b)),
+        ...placed.map((q) => Math.hypot(p.x - q.x, p.y - q.y)),
+        Infinity,
+      );
+      // 十分離れていれば、それ以上は区別せず中央寄りを選ぶ。
+      const score = Math.min(near, LABEL_CLEARANCE) - Math.abs(t - 0.5) * 4;
+      if (score > bestScore) { bestScore = score; best = p; }
+    }
+    placed.push(best);
+    return best;
+  });
 }
 
 function flowKey(flow: PduFlow) {
@@ -211,12 +247,16 @@ export function TopologyPage({
     const center = toPixels({ x: 50, y: 50 });
     // Core（直径 142 px）の半径に余白を足したものを下限にする。
     const clearance = Math.max(Math.min(stageSize.width, stageSize.height) * 0.16, 83);
-    return flows.map((flow) => {
+    const paths = flows.map((flow) => flowPath(toPixels(positions.get(flow.a)!), toPixels(positions.get(flow.b)!), center, clearance, stageSize));
+    // Core から各ノードへの線（接続の線）にラベルが乗らないようにする。
+    const spokes = [...positions.values()].map((position): [Position, Position] => [center, toPixels(position)]);
+    const labels = placeLabels(paths.map((path) => path.curve), spokes);
+    return flows.map((flow, index) => {
       const directions = new Set(flow.channels.map((channel) => channel.direction));
       return {
         flow,
         key: flowKey(flow),
-        path: flowPath(toPixels(positions.get(flow.a)!), toPixels(positions.get(flow.b)!), center, clearance, stageSize),
+        path: { ...paths[index], label: labels[index] },
         toB: directions.has("a_to_b") || directions.has("both"),
         toA: directions.has("b_to_a") || directions.has("both"),
       };
