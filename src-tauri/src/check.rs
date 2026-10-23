@@ -76,6 +76,84 @@ pub struct ProjectCheck {
     pub project_id: String,
     pub report: CompatReport,
     pub members: Vec<MemberCheck>,
+    /// 一括起動の対象のメンバーの間の PDU の流れ。トポロジー画面が線として描く。
+    pub flows: Vec<PduFlow>,
+}
+
+/// メンバー 2 つ（`a` < `b`）が共有するチャネル。チャネルごとに、宣言から分かる向きを持つ。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PduFlow {
+    pub a: String,
+    pub b: String,
+    pub channels: Vec<FlowChannel>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FlowChannel {
+    pub robot: String,
+    pub channel_id: i64,
+    pub org_name: String,
+    pub direction: FlowDirection,
+}
+
+/// 流れの向き。宣言された書き手から、宣言された読み手へのものだけを向きとする。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum FlowDirection {
+    /// `a` が書き、`b` が読む。
+    AToB,
+    /// `b` が書き、`a` が読む。
+    BToA,
+    /// 両方が書き、両方が読む。
+    Both,
+    /// 同じチャネルを使うが、向きは宣言から分からない（チャネルを作るだけ、向きの宣言なし、など）。
+    Shared,
+}
+
+/// メンバーのチャネルの使い方から、メンバーの組ごとの共有チャネルと向きを求める。
+///
+/// 向きは、`write` を宣言したメンバーから `read` を宣言したメンバーへのものだけにする。
+/// チャネルを作る（登録する）ことは読むことも書くことも意味しないので、向きの推定には使わない。
+/// 同じメンバーの宣言が食い違って複数あっても、メンバーとチャネルの組ごとに役割をまとめてから求める。
+pub fn pdu_flows(members: &[MemberCheck]) -> Vec<PduFlow> {
+    use crate::ports::Access;
+    #[derive(Default, Clone)]
+    struct Roles {
+        read: bool,
+        write: bool,
+        org_name: String,
+    }
+    // チャネル → メンバー → 役割
+    let mut channels: BTreeMap<(String, i64), BTreeMap<&str, Roles>> = BTreeMap::new();
+    for member in members.iter().filter(|member| member.enabled) {
+        for channel in &member.channels {
+            let roles = channels.entry((channel.robot.clone(), channel.channel_id)).or_default().entry(member.member_id.as_str()).or_default();
+            roles.read |= channel.access.contains(&Access::Read);
+            roles.write |= channel.access.contains(&Access::Write);
+            if roles.org_name.is_empty() {
+                roles.org_name = channel.org_name.clone();
+            }
+        }
+    }
+    let mut pairs: BTreeMap<(String, String), Vec<FlowChannel>> = BTreeMap::new();
+    for ((robot, channel_id), users) in &channels {
+        let users: Vec<(&str, &Roles)> = users.iter().map(|(id, roles)| (*id, roles)).collect();
+        for (i, (a, ra)) in users.iter().enumerate() {
+            for (b, rb) in users.iter().skip(i + 1) {
+                let forward = ra.write && rb.read;
+                let backward = rb.write && ra.read;
+                let direction = match (forward, backward) {
+                    (true, true) => FlowDirection::Both,
+                    (true, false) => FlowDirection::AToB,
+                    (false, true) => FlowDirection::BToA,
+                    (false, false) => FlowDirection::Shared,
+                };
+                let org_name = if ra.org_name.is_empty() { rb.org_name.clone() } else { ra.org_name.clone() };
+                pairs.entry((a.to_string(), b.to_string())).or_default().push(FlowChannel { robot: robot.clone(), channel_id: *channel_id, org_name, direction });
+            }
+        }
+    }
+    pairs.into_iter().map(|((a, b), channels)| PduFlow { a, b, channels }).collect()
 }
 
 impl ProjectCheck {
@@ -354,7 +432,8 @@ pub fn check_project(project: &Project, library: &Library) -> Result<ProjectChec
         report.findings.push(compat::Finding { severity: compat::Severity::Info, code: "unverified_member".to_owned(), members: Vec::new(), robot: None, channel_id: None, message: format!("この PC からは確かめられないメンバー: {}", unverified.join("、")) });
         report.findings.sort_by(|a, b| a.severity.cmp(&b.severity).then_with(|| a.code.cmp(&b.code)));
     }
-    Ok(ProjectCheck { project_id: project.id.clone(), report, members })
+    let flows = pdu_flows(&members);
+    Ok(ProjectCheck { project_id: project.id.clone(), report, members, flows })
 }
 
 /// `member_ids` のメンバーを、今の内容で承認する。
@@ -595,6 +674,53 @@ mod tests {
         assert_eq!(check.report.coverage, crate::ports::Coverage::Partial);
     }
 
+    /// 向きは宣言された書き手から読み手へのものだけ。作るだけのメンバーとは向きなしで共有。対象外のメンバーは入れない。
+    #[test]
+    fn flows_follow_declared_directions_only() {
+        let (dir, project, library) = project("check-flows");
+        // owner は compact で登録（向きの宣言なし）、sim は legacy で ch0 を読み ch1 を書く。
+        let check = check_project(&project, &library).unwrap();
+        let pair = check.flows.iter().find(|f| f.a == "owner" && f.b == "sim").unwrap();
+        assert!(pair.channels.iter().all(|c| c.direction == FlowDirection::Shared), "{pair:?}");
+        assert_eq!(pair.channels.iter().map(|c| c.channel_id).collect::<Vec<_>>(), vec![0, 1]);
+        // 読み手を足すと、sim が書く ch1 は sim → reader の向きを持つ。
+        legacy(&dir, "reader.json", "Rig", &[(1, "attitude", 72)], &[]);
+        let mut project = project;
+        let mut library = library;
+        let reader = definition("reader", ActivationTiming::AfterStart, &dir, vec!["reader.json"]);
+        let asset = library_asset_from_definition("asset-reader".to_owned(), &reader);
+        project.members.push(member_from_definition(&reader, asset.id.clone()));
+        library.insert(asset.id.clone(), asset);
+        let check = check_project(&project, &library).unwrap();
+        let pair = check.flows.iter().find(|f| f.a == "reader" && f.b == "sim").unwrap();
+        assert_eq!(pair.channels.len(), 1);
+        assert_eq!(pair.channels[0].direction, FlowDirection::BToA, "sim（b）が書き reader（a）が読む");
+        // 一括起動の対象外のメンバーは流れに入れない。
+        project.members.iter_mut().find(|m| m.id == "reader").unwrap().enabled = false;
+        let check = check_project(&project, &library).unwrap();
+        assert!(check.flows.iter().all(|f| f.a != "reader" && f.b != "reader"));
+    }
+
+    /// 書き手も作る側もいないチャネルでも共有として出し、食い違う宣言は 1 つにまとめる。
+    #[test]
+    fn flows_merge_roles_per_member_and_channel() {
+        let use_ = |access: Vec<crate::ports::Access>, size: i64| ChannelUse { robot: "R".to_owned(), channel_id: 3, org_name: "x".to_owned(), type_name: "T".to_owned(), pdu_size: size, registers: false, access };
+        let member = |id: &str, channels: Vec<ChannelUse>| MemberCheck { member_id: id.to_owned(), name: id.to_owned(), enabled: true, entries: Vec::new(), inferred: false, revision: String::new(), manifest: Vec::new(), acceptance: AcceptanceState::Accepted, changes: Vec::new(), contract: LaunchContract { launch: ProgramSpec { program: String::new(), args: Vec::new(), cwd: None, env: BTreeMap::new(), target: Default::default() }, activation_timing: ActivationTiming::AfterStart, readiness: Default::default(), depends_on: Vec::new(), optional_depends_on: Vec::new() }, files_checked: true, channels, port_changes: Vec::new() };
+        use crate::ports::Access::{Read, Unknown, Write};
+        let members = vec![
+            member("a", vec![use_(vec![Write], 72), use_(vec![Write], 80)]),
+            member("b", vec![use_(vec![Read], 72)]),
+            member("c", vec![use_(vec![Unknown], 72)]),
+            member("d", vec![use_(vec![Unknown], 72)]),
+        ];
+        let flows = pdu_flows(&members);
+        let find = |a: &str, b: &str| flows.iter().find(|f| f.a == a && f.b == b).unwrap();
+        assert_eq!(find("a", "b").channels.len(), 1, "食い違う 2 つの宣言でもチャネルは 1 つ");
+        assert_eq!(find("a", "b").channels[0].direction, FlowDirection::AToB);
+        assert_eq!(find("c", "d").channels[0].direction, FlowDirection::Shared, "書き手も作る側もいなくても共有として出す");
+        assert!(flows.iter().all(|f| f.a != f.b));
+    }
+
     /// WSL のメンバーでも、承認していないか、承認した後に起動定義が変われば止める。
     #[test]
     fn wsl_members_still_need_acceptance_of_their_launch() {
@@ -712,5 +838,21 @@ mod tests {
         assert!(check.blocking_reasons().is_empty(), "{:?}", check.blocking_reasons());
         let owned: usize = check.members.iter().filter(|m| m.enabled).flat_map(|m| m.entries.iter()).filter(|e| e.usage == Usage::Register).count();
         assert_eq!(owned, 2, "rig-owner と drone-mock が登録する");
+        for flow in &check.flows {
+            println!("flow {} - {} {:?}", flow.a, flow.b, flow.channels.iter().map(|c| format!("{}:{} {:?}", c.robot, c.channel_id, c.direction)).collect::<Vec<_>>());
+        }
+        // 指令は pilot が書き、ジンバルのシムとビューアが読む。ジンバルの状態はシムが書き、ビューアが読む。
+        // drone-mock は compact で作るだけなので、pilot とは向きなしの共有になる。
+        let direction = |from: &str, to: &str| {
+            check.flows.iter().find_map(|flow| {
+                if flow.a == from && flow.b == to { Some(flow.channels.iter().map(|c| c.direction).collect::<Vec<_>>()) }
+                else if flow.a == to && flow.b == from { Some(flow.channels.iter().map(|c| match c.direction { FlowDirection::AToB => FlowDirection::BToA, FlowDirection::BToA => FlowDirection::AToB, other => other }).collect()) }
+                else { None }
+            }).unwrap_or_default()
+        };
+        assert!(direction("pilot", "rig-sim").contains(&FlowDirection::AToB), "pilot の指令（ミラー）が rig-sim へ");
+        assert!(direction("rig-sim", "viz-foxglove").contains(&FlowDirection::AToB), "ジンバルの状態がビューアへ");
+        assert!(direction("pilot", "drone-mock").iter().all(|d| *d == FlowDirection::Shared) && !direction("pilot", "drone-mock").is_empty());
+        assert!(check.flows.iter().all(|flow| flow.a != "viz-mujoco" && flow.b != "viz-mujoco"), "対象外のビューアは入れない");
     }
 }

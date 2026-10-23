@@ -340,3 +340,14 @@
   .topology-experience *, .topology-experience *::before, .topology-experience *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; scroll-behavior: auto !important; }
   .network-edge-flow { stroke-dasharray: none; opacity: .82; }
 }
+
+/* PDU のチャネルの共有（接続チェックが求めたもの）。画素で描く層。 */
+.pdu-flow-layer { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: 1; }
+.pdu-flow { fill: none; stroke: #7cc4ff; stroke-width: 2px; opacity: 0.85; }
+.pdu-flow.is-shared { stroke: #a7b4c6; stroke-dasharray: 5 4; opacity: 0.6; }
+.pdu-flow.is-selected { stroke: #ffd36b; opacity: 1; stroke-width: 3px; }
+.pdu-flow-arrowhead { fill: #7cc4ff; }
+.pdu-flow-label { position: absolute; transform: translate(-50%, -50%); min-width: 20px; height: 20px; padding: 0 5px; border-radius: 10px; border: 1px solid #3b6c96; background: #102133; color: #cfe6ff; font-size: 11px; line-height: 18px; cursor: pointer; z-index: 4; }
+.pdu-flow-label.is-selected { border-color: #ffd36b; color: #ffd36b; }
+.legend-swatch-pdu { background: #7cc4ff; }
+.pdu-flow-channels { margin: 6px 0; padding-left: 18px; font-size: 12px; max-height: 180px; overflow: auto; }

@@ -1,5 +1,5 @@
-import { useMemo, useState } from "react";
-import type { ConnectionSnapshot, ProcessSnapshot, WorkspaceSnapshot } from "./types";
+import { useEffect, useMemo, useRef, useState } from "react";
+import type { ConnectionSnapshot, PduFlow, ProcessSnapshot, ProjectCheck, WorkspaceSnapshot } from "./types";
 import { TopologyAlertOverlay } from "./TopologyAlertOverlay";
 import { connectionsForAsset, latestActivity, selectAssetProcess, selectCoreProcess } from "./selectors";
 
@@ -59,16 +59,101 @@ function positionFor(index: number, total: number): Position {
   };
 }
 
+/** 二次ベジェ（p0, c, p2）の t の点。 */
+function bezierAt(p0: Position, c: Position, p2: Position, t: number): Position {
+  const u = 1 - t;
+  return { x: u * u * p0.x + 2 * u * t * c.x + t * t * p2.x, y: u * u * p0.y + 2 * u * t * c.y + t * t * p2.y };
+}
+
+const FLOW_SAMPLES = 64;
+
+/**
+ * 2 点（画素）を結ぶ曲線。中央の Core と重ならないよう、曲線のどの点も中心から `clearance` 以上
+ * 離れるまで、中心から離れる側へ膨らませる。両端はカードの縁で切り、ラベルは切った曲線の中ほどに置く。
+ */
+// node はカード（114×74 px）の半分の大きさに、矢印の分の余白を足したもの。
+function flowPath(from: Position, to: Position, center: Position, clearance: number, bounds: { width: number; height: number }, node = { halfWidth: 61, halfHeight: 41 }) {
+  const mx = (from.x + to.x) / 2;
+  const my = (from.y + to.y) / 2;
+  const dx = to.x - from.x;
+  const dy = to.y - from.y;
+  const length = Math.hypot(dx, dy) || 1;
+  let nx = -dy / length;
+  let ny = dx / length;
+  // 中心から離れる側へ曲げる。
+  if ((mx - center.x) * nx + (my - center.y) * ny < 0) { nx = -nx; ny = -ny; }
+  const closest = (c: Position) => {
+    let min = Infinity;
+    for (let i = 0; i <= FLOW_SAMPLES; i++) {
+      const p = bezierAt(from, c, to, i / FLOW_SAMPLES);
+      min = Math.min(min, Math.hypot(p.x - center.x, p.y - center.y));
+    }
+    return min;
+  };
+  // 制御点は枠の中に収める（曲線は両端と制御点の作る三角形の中にあるので、枠からはみ出さない）。
+  const controlFor = (bend: number) => ({
+    x: Math.min(Math.max(mx + nx * bend, 0), bounds.width),
+    y: Math.min(Math.max(my + ny * bend, 0), bounds.height),
+  });
+  let bend = length * 0.12;
+  let control = controlFor(bend);
+  for (let i = 0; i < 24 && closest(control) < clearance; i++) {
+    bend = bend * 1.25 + 4;
+    const next = controlFor(bend);
+    // 枠の端に当たってそれ以上曲げられなければ、そこで止める。
+    if (next.x === control.x && next.y === control.y) break;
+    control = next;
+  }
+  // 両端はノードの中心ではなく、カード（長方形）の縁で止める（矢印がカードに隠れないように）。
+  // 曲線がカードの外へ出る t を求め、その区間を切り出す。外へ出なければ（カードが重なるほど近い）切らない。
+  const inside = (p: Position, nodeCenter: Position) => Math.abs(p.x - nodeCenter.x) <= node.halfWidth && Math.abs(p.y - nodeCenter.y) <= node.halfHeight;
+  // 内側の t と外側の t の間を二分探索して、縁の位置を詰める。
+  const boundary = (tIn: number, tOut: number, nodeCenter: Position) => {
+    for (let i = 0; i < 20; i++) {
+      const t = (tIn + tOut) / 2;
+      if (inside(bezierAt(from, control, to, t), nodeCenter)) tIn = t; else tOut = t;
+    }
+    return tOut;
+  };
+  let t0 = 0;
+  let t1 = 1;
+  for (let i = 0; i <= FLOW_SAMPLES; i++) {
+    const t = i / FLOW_SAMPLES;
+    if (!inside(bezierAt(from, control, to, t), from)) { t0 = i === 0 ? 0 : boundary((i - 1) / FLOW_SAMPLES, t, from); break; }
+  }
+  for (let i = FLOW_SAMPLES; i >= 0; i--) {
+    const t = i / FLOW_SAMPLES;
+    if (!inside(bezierAt(from, control, to, t), to)) { t1 = i === FLOW_SAMPLES ? 1 : boundary((i + 1) / FLOW_SAMPLES, t, to); break; }
+  }
+  if (t1 - t0 < 1 / FLOW_SAMPLES) { t0 = 0; t1 = 1; }
+  // [t0, t1] の区間も二次ベジェで、制御点は blossom (t0, t1)。
+  const start = bezierAt(from, control, to, t0);
+  const end = bezierAt(from, control, to, t1);
+  const w0 = (1 - t0) * (1 - t1);
+  const w1 = (1 - t0) * t1 + t0 * (1 - t1);
+  const w2 = t0 * t1;
+  const c = { x: w0 * from.x + w1 * control.x + w2 * to.x, y: w0 * from.y + w1 * control.y + w2 * to.y };
+  return { d: `M ${start.x} ${start.y} Q ${c.x} ${c.y} ${end.x} ${end.y}`, label: bezierAt(start, c, end, 0.5) };
+}
+
+function flowKey(flow: PduFlow) {
+  return `${flow.a}\u0000${flow.b}`;
+}
+
+const directionArrow: Record<PduFlow["channels"][number]["direction"], string> = { a_to_b: "→", b_to_a: "←", both: "⇄", shared: "―" };
+
 function compactCount(value: number) {
   return new Intl.NumberFormat("ja-JP", { notation: "compact", maximumFractionDigits: 1 }).format(value);
 }
 
 export function TopologyPage({
+  check,
   snapshot,
   selected,
   onSelect,
   onHeartbeat,
 }: {
+  check: ProjectCheck | null;
   snapshot: WorkspaceSnapshot;
   selected: ConnectionSnapshot | null;
   onSelect: (id: string) => void;
@@ -76,6 +161,18 @@ export function TopologyPage({
 }) {
   const [hoveredId, setHoveredId] = useState<string | null>(null);
   const [activeNodeId, setActiveNodeId] = useState<string | null>(null);
+  const [showFlows, setShowFlows] = useState(true);
+  const [selectedFlowKey, setSelectedFlowKey] = useState<string | null>(null);
+  // 流れの線は画素で描く（縦横比の違う枠に 100×100 の図を伸ばすと、矢印の形が崩れるため）。
+  const stageRef = useRef<HTMLDivElement | null>(null);
+  const [stageSize, setStageSize] = useState({ width: 0, height: 0 });
+  useEffect(() => {
+    const stage = stageRef.current;
+    if (!stage) return;
+    const observer = new ResizeObserver(([entry]) => setStageSize({ width: entry.contentRect.width, height: entry.contentRect.height }));
+    observer.observe(stage);
+    return () => observer.disconnect();
+  }, []);
 
   const coreProcess = useMemo(() => selectCoreProcess(snapshot.processes), [snapshot.processes]);
   const coreStatus: VisualStatus = coreProcess?.status === "failed"
@@ -101,6 +198,31 @@ export function TopologyPage({
     };
   }), [snapshot]);
 
+  const positions = useMemo(() => new Map(assets.map((asset) => [asset.id, asset.position])), [assets]);
+  // 線を引けるのは、両端がこの画面のアセットであるものだけ。
+  const flows = useMemo(() => (check?.flows ?? []).filter((flow) => positions.has(flow.a) && positions.has(flow.b)), [check, positions]);
+  const selectedFlow = flows.find((flow) => flowKey(flow) === selectedFlowKey) ?? null;
+  // 選んでいた流れがなくなったら、選択を外す。
+  useEffect(() => { if (selectedFlowKey && !selectedFlow) setSelectedFlowKey(null); }, [selectedFlowKey, selectedFlow]);
+  // 線は表示していて、枠の大きさが分かっているときだけ求める。
+  const drawn = useMemo(() => {
+    if (!showFlows || stageSize.width <= 0 || stageSize.height <= 0) return [];
+    const toPixels = (position: Position) => ({ x: (position.x / 100) * stageSize.width, y: (position.y / 100) * stageSize.height });
+    const center = toPixels({ x: 50, y: 50 });
+    // Core（直径 142 px）の半径に余白を足したものを下限にする。
+    const clearance = Math.max(Math.min(stageSize.width, stageSize.height) * 0.16, 83);
+    return flows.map((flow) => {
+      const directions = new Set(flow.channels.map((channel) => channel.direction));
+      return {
+        flow,
+        key: flowKey(flow),
+        path: flowPath(toPixels(positions.get(flow.a)!), toPixels(positions.get(flow.b)!), center, clearance, stageSize),
+        toB: directions.has("a_to_b") || directions.has("both"),
+        toA: directions.has("b_to_a") || directions.has("both"),
+      };
+    });
+  }, [flows, positions, showFlows, stageSize]);
+  const nameOf = (id: string) => assets.find((asset) => asset.id === id)?.name ?? id;
   const selectedConnection = selected ?? null;
   const activeNode = assets.find((asset) => asset.id === activeNodeId) ?? null;
   const hoveredNode = assets.find((asset) => asset.id === hoveredId) ?? null;
@@ -147,7 +269,7 @@ export function TopologyPage({
       </header>
 
       <div className="topology-layout">
-        <div className="topology-stage" aria-label="Hakoniwa の接続関係図">
+        <div className="topology-stage" aria-label="Hakoniwa の接続関係図" ref={stageRef}>
           <div className="topology-stage-glow" aria-hidden="true" />
           <svg className="topology-network" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
             {assets.map((asset) => {
@@ -165,6 +287,37 @@ export function TopologyPage({
               );
             })}
           </svg>
+          {showFlows && stageSize.width > 0 && (
+            <svg className="pdu-flow-layer" viewBox={`0 0 ${stageSize.width} ${stageSize.height}`} aria-hidden="true">
+              <defs>
+                <marker id="pdu-flow-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" markerUnits="userSpaceOnUse" orient="auto-start-reverse">
+                  <path d="M 0 0 L 10 5 L 0 10 z" className="pdu-flow-arrowhead" />
+                </marker>
+              </defs>
+              {drawn.map(({ flow, key, path, toA, toB }) => (
+                <path
+                  key={key}
+                  d={path.d}
+                  className={`pdu-flow ${toA || toB ? "" : "is-shared"} ${selectedFlowKey === key ? "is-selected" : ""}`}
+                  markerEnd={toB ? "url(#pdu-flow-arrow)" : undefined}
+                  markerStart={toA ? "url(#pdu-flow-arrow)" : undefined}
+                  data-pair={`${flow.a} ${flow.b}`}
+                />
+              ))}
+            </svg>
+          )}
+          {showFlows && drawn.map(({ flow, key, path }) => (
+            <button
+              key={`label-${key}`}
+              type="button"
+              className={`pdu-flow-label ${selectedFlowKey === key ? "is-selected" : ""}`}
+              style={{ left: `${path.label.x}px`, top: `${path.label.y}px` }}
+              aria-label={`PDU: ${nameOf(flow.a)} と ${nameOf(flow.b)}（${flow.channels.length} チャネル）`}
+              onClick={() => setSelectedFlowKey(selectedFlowKey === key ? null : key)}
+            >
+              {flow.channels.length}
+            </button>
+          ))}
 
           <button
             type="button"
@@ -283,6 +436,19 @@ export function TopologyPage({
             </>
           )}
 
+          {selectedFlow && (
+            <div className="selected-connection-card">
+              <div>
+                <span className="inspector-label">共有する PDU チャネル</span>
+                <strong>{nameOf(selectedFlow.a)} ・ {nameOf(selectedFlow.b)}</strong>
+              </div>
+              <ul className="pdu-flow-channels">
+                {selectedFlow.channels.map((channel) => <li key={`${channel.robot}:${channel.channel_id}`}><code>{channel.robot} ch{channel.channel_id}</code> {channel.org_name} <span className="muted">{nameOf(selectedFlow.a)} {directionArrow[channel.direction]} {nameOf(selectedFlow.b)}</span></li>)}
+              </ul>
+              {selectedFlow.channels.some((channel) => channel.direction === "shared") && <p className="muted">― は、どちらかが向きを宣言していない（チャネルを作るだけ、compact 形式など）ため、向きが分からないチャネルです。</p>}
+            </div>
+          )}
+
           {selectedConnection && (
             <div className="selected-connection-card">
               <div>
@@ -302,6 +468,9 @@ export function TopologyPage({
         <span><i className="legend-swatch legend-swatch-active" />起動・接続中</span>
         <span><i className="legend-swatch legend-swatch-idle" />停止・未接続</span>
         <span className="topology-motion-note">流れる線は接続済みの通信経路を示します。</span>
+        <span><i className="legend-swatch legend-swatch-pdu" />PDU のチャネルの共有（矢印は宣言された書き手から読み手へ、破線は向き不明。数字はチャネル数）</span>
+        <label className="toggle"><input type="checkbox" checked={showFlows} onChange={(event) => setShowFlows(event.target.checked)} />PDU の流れを表示</label>
+        {!check && <span className="muted">接続チェックの結果を待っています。</span>}
       </footer>
     </section>
   );

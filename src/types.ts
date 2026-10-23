@@ -231,10 +231,18 @@ export interface MemberCheck {
   port_changes: string[];
 }
 
+/** メンバー 2 つ（a < b）が共有するチャネル。向きは宣言された書き手から読み手へのものだけ。 */
+export interface PduFlow {
+  a: string;
+  b: string;
+  channels: { robot: string; channel_id: number; org_name: string; direction: "a_to_b" | "b_to_a" | "both" | "shared" }[];
+}
+
 export interface ProjectCheck {
   project_id: string;
   report: { findings: Finding[]; coverage: "complete" | "partial" };
   members: MemberCheck[];
+  flows: PduFlow[];
 }
 
 export interface ProjectSummary {

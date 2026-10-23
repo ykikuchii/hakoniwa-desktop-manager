@@ -54,7 +54,7 @@ export default function App() {
       setCatalog(coreCatalog);
       // 接続チェックが失敗しても、ほかの表示は続ける。結果は、表示中のプロジェクトのもの
       // だけを使う（切り替えの前に出した問い合わせの結果は捨てる）。
-      if (tabRef.current === "dashboard" || tabRef.current === "checks") {
+      if (tabRef.current === "dashboard" || tabRef.current === "checks" || tabRef.current === "topology") {
         const shownProject = next.running_project_id ?? next.active_project_id;
         const generation = ++checkGeneration.current;
         api.checkProject().then(
@@ -177,7 +177,7 @@ export default function App() {
         {tab === "project" && <ProjectPage key={workspace.id} snapshot={snapshot} busy={busy} selectedId={selectedAssetId} onSelect={setSelectedAssetId} onRun={run} onOpenInLibrary={(assetId) => { setLibraryFocus(assetId); setTab("library"); }} />}
         {tab === "library" && <LibraryPage key={workspace.id} projectId={snapshot.active_project_id} members={snapshot.members} running={snapshot.running_project_id === snapshot.active_project_id} busy={busy} focusAssetId={libraryFocus} onRun={run} />}
         {tab === "checks" && <ChecksPage check={check && check.project_id === (snapshot.running_project_id ?? snapshot.active_project_id) ? check : null} error={checkError} disabled={busy || !!snapshot.running_project_id} onAccept={(projectId, revisions) => void run(() => api.acceptMemberChanges(projectId, revisions), "変更を承認しました。")} />}
-        {tab === "topology" && <TopologyPage snapshot={snapshot} selected={selectedConnection} onSelect={setSelectedConnectionId} onHeartbeat={(id) => void run(() => api.recordHeartbeat(id, "ユーザー操作による確認イベント"), "通信確認イベントを記録しました。")} />}
+        {tab === "topology" && <TopologyPage key={workspace.id} check={check && check.project_id === (snapshot.running_project_id ?? snapshot.active_project_id) ? check : null} snapshot={snapshot} selected={selectedConnection} onSelect={setSelectedConnectionId} onHeartbeat={(id) => void run(() => api.recordHeartbeat(id, "ユーザー操作による確認イベント"), "通信確認イベントを記録しました。")} />}
         {tab === "core" && <CorePage key={`${workspace.id}:${JSON.stringify(workspace.core_controller ?? null)}`} workspace={workspace} catalog={catalog} activeCore={activeCore?.status ?? "unknown"} busy={busy} onSaveController={(controller) => void run(() => api.setCoreController(snapshot.active_project_id, workspace.core_controller ?? null, controller), "Core設定を保存しました。")} onInstall={(version) => void run(() => api.installCore(version), "Coreを検証して導入しました。")} onStart={() => void run(api.startCore, "Coreコントローラーを起動しました。")} onStop={() => void run(api.stopCore, "Coreコントローラーを停止しました。")} />}
         {tab === "workspace" && <WorkspacePage key={`${workspace.id}:${workspace.name}`} workspace={workspace} busy={busy} preview={preview} onChoose={() => void chooseDirectory()} onImportV1={() => void importV1()} onApply={(mode) => preview && void run(async () => { await api.applyPreview(preview, mode); resetView(); }, mode === "new_project" ? "新しいプロジェクトとして取り込みました。" : "このプロジェクトにメンバーとして足しました。")} onRename={(name) => void run(() => api.renameProject(snapshot.active_project_id, workspace.name, name), "プロジェクト名を保存しました。")} />}
         {tab === "workspace" && <ProjectFilePanel key={workspace.id} projectId={snapshot.active_project_id} projectName={workspace.name} sourceDirectory={workspace.source_directory ?? null} busy={busy} running={!!snapshot.running_project_id} onRun={run} onImported={() => { resetView(); setTab("checks"); }} />}
