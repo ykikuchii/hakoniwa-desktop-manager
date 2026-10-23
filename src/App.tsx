@@ -3,6 +3,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { api, newAsset } from "./api";
 import type { AssetDefinition, ConnectionSnapshot, CoreCatalog, ImportPreview, ProjectCheck, Workspace, WorkspaceSnapshot } from "./types";
 import { CheckPanel } from "./CheckPanel";
+import { ChecksPage } from "./ChecksPage";
 import { TopologyPage } from "./TopologyPage";
 import { selectAssetProcess, selectCoreProcess } from "./selectors";
 import "./topology-visualization.css";
@@ -11,6 +12,7 @@ import "./topology-alerts.css";
 const tabs = [
   ["dashboard", "概要"],
   ["assets", "アセット"],
+  ["checks", "接続チェック"],
   ["topology", "接続・通信"],
   ["core", "Core管理"],
   ["workspace", "取込・設定"],
@@ -32,7 +34,7 @@ export default function App() {
   const [preview, setPreview] = useState<ImportPreview | null>(null);
   const [selectedConnectionId, setSelectedConnectionId] = useState<string | null>(null);
   const [check, setCheck] = useState<ProjectCheck | null>(null);
-  // 接続チェックはファイルを読むので、概要を開いているときだけ確かめる。
+  // 接続チェックはファイルを読むので、概要か接続チェックを開いているときだけ確かめる。
   const tabRef = useRef<Tab>("dashboard");
   tabRef.current = tab;
   // 接続チェックの問い合わせの世代。切り替えのたびに進め、古い問い合わせの結果
@@ -47,7 +49,7 @@ export default function App() {
       setCatalog(coreCatalog);
       // 接続チェックが失敗しても、ほかの表示は続ける。結果は、表示中のプロジェクトのもの
       // だけを使う（切り替えの前に出した問い合わせの結果は捨てる）。
-      if (tabRef.current === "dashboard") {
+      if (tabRef.current === "dashboard" || tabRef.current === "checks") {
         const shownProject = next.running_project_id ?? next.active_project_id;
         const generation = ++checkGeneration.current;
         api.checkProject().then(
@@ -190,6 +192,7 @@ export default function App() {
         {tab === "dashboard" && <CheckPanel check={check && check.project_id === (snapshot.running_project_id ?? snapshot.active_project_id) ? check : null} error={checkError} disabled={busy || !!snapshot.running_project_id} onAccept={(projectId, revisions) => void run(() => api.acceptMemberChanges(projectId, revisions), "変更を承認しました。")} />}
         {tab === "dashboard" && <Dashboard snapshot={snapshot} activeCore={activeCore?.status ?? "unknown"} onStartCore={() => void run(api.startCore, "Coreコントローラーを起動しました。")} onStopCore={() => void run(api.stopCore, "Coreコントローラーを停止しました。")} onLifecycle={(command) => void run(async () => { const result = await api.runLifecycle(command); if (result.status === "failed") throw new Error(result.stderr || "hako-cmdが失敗しました。"); }, `hako-cmd ${command} を実行しました。`)} onAssetClick={(id) => { setSelectedAssetId(id); setTab("assets"); }} onConnectionClick={(id) => { setSelectedConnectionId(id); setTab("topology"); }} />}
         {tab === "assets" && <AssetsPage key={workspace.id} workspace={workspace} processes={snapshot.processes} selected={selectedAsset} draft={draftAsset} busy={busy} onSelect={selectAsset} onSave={upsertAsset} onDelete={removeAsset} onStart={(id) => void run(() => api.startAsset(id), "アセットを起動しました。")} onStop={(id) => void run(() => api.stopAsset(id), "アセットを停止しました。")} onCreate={createDraftAsset} />}
+        {tab === "checks" && <ChecksPage check={check && check.project_id === (snapshot.running_project_id ?? snapshot.active_project_id) ? check : null} error={checkError} disabled={busy || !!snapshot.running_project_id} onAccept={(projectId, revisions) => void run(() => api.acceptMemberChanges(projectId, revisions), "変更を承認しました。")} />}
         {tab === "topology" && <TopologyPage snapshot={snapshot} selected={selectedConnection} onSelect={setSelectedConnectionId} onHeartbeat={(id) => void run(() => api.recordHeartbeat(id, "ユーザー操作による確認イベント"), "通信確認イベントを記録しました。")} />}
         {tab === "core" && <CorePage key={workspace.id} workspace={workspace} catalog={catalog} activeCore={activeCore?.status ?? "unknown"} busy={busy} onSaveWorkspace={(next) => void run(() => api.saveWorkspace(next), "Core設定を保存しました。")} onInstall={(version) => void run(() => api.installCore(version), "Coreを検証して導入しました。")} onStart={() => void run(api.startCore, "Coreコントローラーを起動しました。")} onStop={() => void run(api.stopCore, "Coreコントローラーを停止しました。")} />}
         {tab === "workspace" && <WorkspacePage key={workspace.id} workspace={workspace} busy={busy} preview={preview} onChoose={() => void chooseDirectory()} onImportV1={() => void importV1()} onApply={() => preview && void run(() => api.applyPreview(preview), "インポート結果をワークスペースへ適用しました。")} onSave={(next) => void run(() => api.saveWorkspace(next), "ワークスペースを保存しました。")} />}

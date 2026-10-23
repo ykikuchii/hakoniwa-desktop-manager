@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::compat::{self, CompatReport, MemberPorts};
-use crate::model::{Acceptance, Library, LibraryAsset, Member, PduEntrySpec, Project, Variant, CORE_NAMESPACE_VARIABLE};
+use crate::model::{Acceptance, ChannelUse, Library, LibraryAsset, Member, PduEntrySpec, Project, Variant, CORE_NAMESPACE_VARIABLE};
 use crate::ports::{self, FileDigest, PduEntry, PortSet, Usage};
 use crate::types::ActivationTiming;
 
@@ -49,6 +49,13 @@ pub struct MemberCheck {
     pub acceptance: AcceptanceState,
     /// 承認した時点からの変化（ファイルの追加・削除・変更、起動定義の変更）。
     pub changes: Vec<String>,
+    /// PDU 設定のファイルをこの PC から読んで確かめたか（WSL で動くメンバーは読めない）。
+    /// 承認の状態とは別に持つ。
+    pub files_checked: bool,
+    /// 今の PDU 設定から読んだチャネル。
+    pub channels: Vec<ChannelUse>,
+    /// 承認した時点のチャネルからの変化。変化がなければ空。
+    pub port_changes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,7 +73,7 @@ impl ProjectCheck {
         for member in self.members.iter().filter(|member| member.enabled) {
             match member.acceptance {
                 AcceptanceState::Changed => reasons.push(format!("{} の起動定義か PDU 設定が、承認した後に変わっています（{}）。接続チェックで確認して承認してください。", member.name, member.changes.join("、"))),
-                AcceptanceState::NotAccepted => reasons.push(format!("{} の PDU 設定はまだ承認されていません。接続チェックで確認して承認してください。", member.name)),
+                AcceptanceState::NotAccepted => reasons.push(format!("{} の起動定義と PDU 設定はまだ承認されていません。接続チェックで確認して承認してください。", member.name)),
                 AcceptanceState::NoPduConfig | AcceptanceState::Accepted | AcceptanceState::Unverified => {}
             }
         }
@@ -121,7 +128,7 @@ pub fn effective_entries(variant: &Variant, timing: &ActivationTiming) -> (Vec<P
 }
 
 /// 入口からポートを抽出し、手動の向き指定を当てる。
-fn member_ports(variant: &Variant, entries: &[PduEntrySpec]) -> PortSet {
+pub fn member_ports(variant: &Variant, entries: &[PduEntrySpec]) -> PortSet {
     let resolved: Vec<PduEntry> = entries.iter().map(|entry| PduEntry { path: resolve_entry_path(&entry.path, variant), usage: entry.usage }).collect();
     let mut ports = ports::extract(&resolved);
     for manual in &variant.manual_access {
@@ -192,6 +199,76 @@ fn describe_changes(accepted: &Acceptance, manifest: &[FileDigest]) -> Vec<Strin
     changes
 }
 
+/// ポートを、宣言ごとの使い方にまとめる。同じチャネルでも名前・型・サイズの違う宣言は
+/// 別の要素にする（矛盾を 1 つの代表に丸めて隠さないため）。
+pub fn channel_uses(ports: &PortSet) -> Vec<ChannelUse> {
+    type Key = (String, i64, String, String, i64);
+    fn slot<'a>(uses: &'a mut BTreeMap<Key, ChannelUse>, decl: &ports::ChannelDecl) -> &'a mut ChannelUse {
+        let key = (decl.robot.clone(), decl.channel_id, decl.org_name.clone(), decl.type_name.clone(), decl.pdu_size);
+        uses.entry(key).or_insert_with(|| ChannelUse { robot: decl.robot.clone(), channel_id: decl.channel_id, org_name: decl.org_name.clone(), type_name: decl.type_name.clone(), pdu_size: decl.pdu_size, registers: false, access: Vec::new() })
+    }
+    let mut uses = BTreeMap::new();
+    for decl in &ports.registrations {
+        slot(&mut uses, decl).registers = true;
+    }
+    for access in &ports.access {
+        let channel = slot(&mut uses, &access.channel);
+        if !channel.access.contains(&access.access) {
+            channel.access.push(access.access);
+            channel.access.sort();
+        }
+    }
+    uses.into_values().collect()
+}
+
+/// 承認した時点のチャネルと今のチャネルの違いを、文で返す。
+fn describe_port_changes(accepted: &Acceptance, current: &[ChannelUse]) -> Vec<String> {
+    if accepted.channels.is_empty() {
+        return if accepted.had_pdu_entries && !current.is_empty() { vec!["以前の承認にはチャネルの記録がありません".to_owned()] } else { Vec::new() };
+    }
+    fn group(channels: &[ChannelUse]) -> BTreeMap<(String, i64), Vec<&ChannelUse>> {
+        let mut groups: BTreeMap<(String, i64), Vec<&ChannelUse>> = BTreeMap::new();
+        for channel in channels {
+            groups.entry((channel.robot.clone(), channel.channel_id)).or_default().push(channel);
+        }
+        groups
+    }
+    let describe = |uses: &[&ChannelUse]| uses.iter().map(|use_| format!("{} {} / {}", use_.org_name, use_.type_name, use_.pdu_size)).collect::<Vec<_>>().join("、");
+    let before = group(&accepted.channels);
+    let after = group(current);
+    let mut changes = Vec::new();
+    for (key, now) in &after {
+        let label = format!("{} ch{}", key.0, key.1);
+        match before.get(key) {
+            None => changes.push(format!("{label}（{}）が増えた", describe(now))),
+            Some(old) if old != now => match (old.as_slice(), now.as_slice()) {
+                ([old], [new]) if old.org_name == new.org_name => {
+                    let mut parts = Vec::new();
+                    if old.type_name != new.type_name {
+                        parts.push(format!("型 {} → {}", old.type_name, new.type_name));
+                    }
+                    if old.pdu_size != new.pdu_size {
+                        parts.push(format!("サイズ {} → {}", old.pdu_size, new.pdu_size));
+                    }
+                    if old.registers != new.registers {
+                        parts.push(if new.registers { "登録するようになった".to_owned() } else { "登録しなくなった".to_owned() });
+                    }
+                    if old.access != new.access {
+                        parts.push("向きが変わった".to_owned());
+                    }
+                    changes.push(format!("{label}（{}）: {}", new.org_name, parts.join("、")));
+                }
+                _ => changes.push(format!("{label}: 宣言が変わった（{} → {}）", describe(old), describe(now))),
+            },
+            _ => {}
+        }
+    }
+    for (key, old) in before.iter().filter(|(key, _)| !after.contains_key(*key)) {
+        changes.push(format!("{} ch{}（{}）がなくなった", key.0, key.1, describe(old)));
+    }
+    changes
+}
+
 struct Evaluated {
     check: MemberCheck,
     ports: MemberPorts,
@@ -211,7 +288,12 @@ fn evaluate(member: &Member, asset: &LibraryAsset) -> Result<Evaluated, String> 
     }
     let revision = revision(variant, member, &entries, &manifest, &ports.problems);
     let (acceptance, changes) = if wsl {
-        (AcceptanceState::Unverified, Vec::new())
+        // ファイルは確かめられないが、起動定義が承認した時点から変わっていれば承認を求める。
+        match &member.accepted {
+            Some(accepted) if accepted.revision == revision => (AcceptanceState::Unverified, Vec::new()),
+            Some(accepted) => (AcceptanceState::Changed, describe_changes(accepted, &manifest)),
+            None => (AcceptanceState::NotAccepted, Vec::new()),
+        }
     } else if entries.is_empty() {
         // 承認したときには PDU 設定があったのに、今は見つからない。変化として扱う。
         // 承認した内容のままなら（PDU 設定がもともとない場合も含めて）対象外にする。
@@ -226,12 +308,17 @@ fn evaluate(member: &Member, asset: &LibraryAsset) -> Result<Evaluated, String> 
             Some(accepted) => (AcceptanceState::Changed, describe_changes(accepted, &manifest)),
         }
     };
+    let channels = channel_uses(&ports);
+    let port_changes = match (&member.accepted, acceptance) {
+        (Some(accepted), AcceptanceState::Changed) => describe_port_changes(accepted, &channels),
+        _ => Vec::new(),
+    };
     let name = member.name.clone().unwrap_or_else(|| asset.name.clone());
     let mut env = variant.launch.env.clone();
     env.extend(member.env_overrides.clone());
     Ok(Evaluated {
         ports: MemberPorts { member_id: member.id.clone(), name: name.clone(), activation_timing: timing, hako_config_path: env.get(CORE_NAMESPACE_VARIABLE).cloned(), ports },
-        check: MemberCheck { member_id: member.id.clone(), name, enabled: member.enabled, entries, inferred, revision, manifest, acceptance, changes },
+        check: MemberCheck { member_id: member.id.clone(), name, enabled: member.enabled, entries, inferred, revision, manifest, acceptance, changes, files_checked: !wsl, channels, port_changes },
     })
 }
 
@@ -250,7 +337,7 @@ pub fn check_project(project: &Project, library: &Library) -> Result<ProjectChec
     let mut report = compat::check(&ports, project.core_env.get(CORE_NAMESPACE_VARIABLE).map(String::as_str));
     // 確かめられないメンバーがいれば、そのメンバーが登録するチャネルかもしれないので
     // 「登録者がいない」は止めずに注意にとどめる。
-    let unverified: Vec<&str> = members.iter().filter(|member| member.enabled && member.acceptance == AcceptanceState::Unverified).map(|member| member.name.as_str()).collect();
+    let unverified: Vec<&str> = members.iter().filter(|member| member.enabled && !member.files_checked).map(|member| member.name.as_str()).collect();
     if !unverified.is_empty() {
         report.coverage = crate::ports::Coverage::Partial;
         for finding in report.findings.iter_mut().filter(|finding| finding.code == "no_owner") {
@@ -284,7 +371,7 @@ fn accept_revisions(project: &mut Project, library: &Library, wanted: Vec<(Strin
             return Err(format!("{} の内容が、表示した後に変わっています。接続チェックを見直してから承認してください。", evaluated.check.name));
         }
         let had_pdu_entries = !evaluated.check.entries.is_empty();
-        accepted.push((id, Acceptance { revision: evaluated.check.revision, manifest: evaluated.check.manifest, accepted_at: Utc::now(), had_pdu_entries }));
+        accepted.push((id, Acceptance { revision: evaluated.check.revision, manifest: evaluated.check.manifest, accepted_at: Utc::now(), had_pdu_entries, channels: evaluated.check.channels }));
     }
     for (id, acceptance) in accepted {
         if let Some(member) = project.members.iter_mut().find(|member| member.id == id) {
@@ -299,13 +386,6 @@ fn accept_revisions(project: &mut Project, library: &Library, wanted: Vec<(Strin
 pub fn accept_all(project: &mut Project, library: &Library) -> Result<(), String> {
     let ids: Vec<String> = project.members.iter().map(|member| member.id.clone()).collect();
     accept_members(project, library, &ids)
-}
-
-/// メンバーを足したらどうなるかを、保存せずに確かめる。
-pub fn preview_add(project: &Project, library: &Library, member: Member) -> Result<ProjectCheck, String> {
-    let mut candidate = project.clone();
-    candidate.members.push(member);
-    check_project(&candidate, library)
 }
 
 #[cfg(test)]
@@ -387,6 +467,23 @@ mod tests {
         assert_eq!(check.blocking_reasons().len(), 1);
         accept_members(&mut project, &library, &["sim".to_owned()]).unwrap();
         assert!(check_project(&project, &library).unwrap().blocking_reasons().is_empty());
+    }
+
+    /// 承認した時点のチャネルを記録し、変わったチャネルを差分として示す。
+    #[test]
+    fn port_changes_name_the_changed_channels() {
+        let (dir, mut project, library) = project("check-port-changes");
+        accept_all(&mut project, &library).unwrap();
+        let sim = project.member("sim").unwrap().accepted.clone().unwrap();
+        assert_eq!(sim.channels.iter().map(|c| (c.channel_id, c.registers, c.access.clone())).collect::<Vec<_>>(), vec![(0, false, vec![Access::Read]), (1, false, vec![Access::Write])]);
+        legacy(&dir, "sim.json", "Rig", &[(0, "cmd", 144), (2, "imu", 72)], &[]);
+        let check = check_project(&project, &library).unwrap();
+        let changes = &check.members.iter().find(|m| m.member_id == "sim").unwrap().port_changes;
+        assert!(changes.iter().any(|c| c.contains("ch0") && c.contains("サイズ 136 → 144")), "{changes:?}");
+        assert!(changes.iter().any(|c| c.contains("ch2") && c.contains("増えた")), "{changes:?}");
+        assert!(changes.iter().any(|c| c.contains("ch1") && c.contains("なくなった")), "{changes:?}");
+        // 承認済みのメンバーには差分を出さない。
+        assert!(check.members.iter().find(|m| m.member_id == "owner").unwrap().port_changes.is_empty());
     }
 
     /// 起動定義（引数）を変えても、ファイルが同じなら「起動定義が変わった」として止める。
@@ -491,6 +588,19 @@ mod tests {
         assert_eq!(check.report.coverage, crate::ports::Coverage::Partial);
     }
 
+    /// WSL のメンバーでも、承認していないか、承認した後に起動定義が変われば止める。
+    #[test]
+    fn wsl_members_still_need_acceptance_of_their_launch() {
+        let (_, mut project, mut library) = project("check-wsl-changed");
+        library.get_mut("asset-owner").unwrap().variants[0].launch.target = crate::types::ExecutionTarget::Wsl { distribution: "Ubuntu".to_owned() };
+        assert_eq!(check_project(&project, &library).unwrap().members[0].acceptance, AcceptanceState::NotAccepted);
+        accept_all(&mut project, &library).unwrap();
+        library.get_mut("asset-owner").unwrap().variants[0].launch.args.push("--other".to_owned());
+        let check = check_project(&project, &library).unwrap();
+        assert_eq!(check.members[0].acceptance, AcceptanceState::Changed);
+        assert_eq!(check.blocking_reasons().len(), 1, "{:?}", check.blocking_reasons());
+    }
+
     /// 承認しても、接続チェックの Error は一括起動を止める。
     #[test]
     fn accepted_members_with_incompatible_ports_still_block() {
@@ -548,7 +658,8 @@ mod tests {
         let viewer = definition("viewer", ActivationTiming::AfterStart, &dir, vec!["big.json"]);
         let asset = library_asset_from_definition("asset-viewer".to_owned(), &viewer);
         library.insert(asset.id.clone(), asset.clone());
-        let preview = preview_add(&project, &library, member_from_definition(&viewer, asset.id)).unwrap();
+        let settings = crate::manage::MemberSettings::of(&member_from_definition(&viewer, asset.id));
+        let preview = check_project(&crate::manage::with_new_member(&project, settings).unwrap(), &library).unwrap();
         assert!(preview.report.findings.iter().any(|f| f.code == "size_exceeds_owner"));
         assert_eq!(project.members.len(), 2);
     }

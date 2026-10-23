@@ -138,6 +138,16 @@ export interface Finding {
   message: string;
 }
 
+export interface ChannelUse {
+  robot: string;
+  channel_id: number;
+  org_name: string;
+  type_name: string;
+  pdu_size: number;
+  registers: boolean;
+  access: ("read" | "write" | "unknown")[];
+}
+
 export interface MemberCheck {
   member_id: string;
   name: string;
@@ -147,6 +157,8 @@ export interface MemberCheck {
   revision: string;
   acceptance: "no_pdu_config" | "accepted" | "changed" | "not_accepted" | "unverified";
   changes: string[];
+  channels: ChannelUse[];
+  port_changes: string[];
 }
 
 export interface ProjectCheck {
