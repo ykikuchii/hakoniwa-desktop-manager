@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { api } from "./api";
 import type { BundlePreview } from "./types";
@@ -12,7 +12,9 @@ export function ProjectFilePanel({ projectId, projectName, sourceDirectory, busy
   const [exportWarnings, setExportWarnings] = useState<string[] | null>(null);
   const [path, setPath] = useState<string | null>(null);
   const [importRoot, setImportRoot] = useState("");
-  const [preview, setPreview] = useState<BundlePreview | null>(null);
+  // プレビューは、出したときのファイルと基準ルートと一緒に持つ。読み込みはそれで行う。
+  const [preview, setPreview] = useState<{ path: string; root: string; result: BundlePreview } | null>(null);
+  const generation = useRef(0);
   const [replace, setReplace] = useState(true);
   const [error, setError] = useState("");
 
@@ -23,14 +25,16 @@ export function ProjectFilePanel({ projectId, projectName, sourceDirectory, busy
   }
 
   async function inspect(file: string, root: string) {
+    const mine = ++generation.current;
     setPreview(null);
     setError("");
     try {
       const result = await api.inspectBundle(file, root.trim() || null);
-      setPreview(result);
+      if (mine !== generation.current) return;
+      setPreview({ path: file, root: root.trim(), result });
       setReplace(!!result.replaces);
     } catch (reason) {
-      setError(messageOf(reason));
+      if (mine === generation.current) setError(messageOf(reason));
     }
   }
 
@@ -53,15 +57,17 @@ export function ProjectFilePanel({ projectId, projectName, sourceDirectory, busy
     <div className="sub-editor">
       <div className="panel-heading"><h3>読み込む</h3><button className="button secondary small" disabled={busy || running} title={running ? "実行中は読み込めません。" : undefined} onClick={() => void chooseFile()}>ファイルを選ぶ</button></div>
       {error && <p className="error">{error}</p>}
-      {path && preview && <>
-        <p><strong>{preview.project_name}</strong>（{path}）</p>
-        <p className="muted">メンバー：{preview.members.join("、")}</p>
-        <p className="muted">アセット：{preview.assets.map((asset) => `${asset.name}（${asset.reused ? "ライブラリのものを使う" : "ライブラリに足す"}）`).join("、")}</p>
-        <div className="inline-fields"><span className="muted">基準ルート</span><input value={importRoot} placeholder={preview.root} onChange={(event) => setImportRoot(event.target.value)} /><button className="button subtle small" disabled={busy} onClick={() => void inspect(path, importRoot)}>この基準でプレビューし直す</button></div>
-        {preview.warnings.length > 0 && <div className="warning-list">{preview.warnings.map((warning) => <p key={warning}>{warning}</p>)}</div>}
-        {preview.replaces && <label className="toggle"><input type="checkbox" checked={replace} onChange={(event) => setReplace(event.target.checked)} />同じファイルから読み込んだプロジェクト「{preview.replaces}」を置き換える（外すと新しいプロジェクトとして足します）</label>}
+      {path && preview && preview.path === path && <>
+        <p><strong>{preview.result.project_name}</strong>（{preview.path}）</p>
+        <p className="muted">メンバー：{preview.result.members.join("、")}</p>
+        <p className="muted">アセット：{preview.result.assets.map((asset) => `${asset.name}（${asset.reused ? "ライブラリのものを使う" : "ライブラリに足す"}）`).join("、")}</p>
+        <p className="muted">基準ルート：{preview.result.root}</p>
+        <div className="inline-fields"><span className="muted">別の基準ルート</span><input value={importRoot} placeholder={preview.result.root} onChange={(event) => setImportRoot(event.target.value)} /><button className="button subtle small" disabled={busy} onClick={() => void inspect(path, importRoot)}>この基準でプレビューし直す</button></div>
+        {importRoot.trim() !== preview.root && <p className="muted">基準ルートを変えたら、プレビューし直してから読み込んでください。</p>}
+        {preview.result.warnings.length > 0 && <div className="warning-list">{preview.result.warnings.map((warning) => <p key={warning}>{warning}</p>)}</div>}
+        {preview.result.replaces && <label className="toggle"><input type="checkbox" checked={replace} onChange={(event) => setReplace(event.target.checked)} />同じファイルから読み込んだプロジェクト「{preview.result.replaces}」を置き換える（外すと新しいプロジェクトとして足します）</label>}
         <p className="muted">読み込んだメンバーは承認されていません。接続チェックで起動の内容と PDU の宣言を確かめてから承認してください。</p>
-        <div className="form-actions"><button className="button primary" disabled={busy || running} onClick={() => void onRun(async () => { await api.importBundle(path, importRoot.trim() || null, preview.sha256, replace); setPreview(null); setPath(null); onImported(); }, "プロジェクトを読み込みました。接続チェックで承認してください。")}>表示した内容で読み込む</button></div>
+        <div className="form-actions"><button className="button primary" disabled={busy || running || importRoot.trim() !== preview.root} onClick={() => void onRun(async () => { await api.importBundle(preview.path, preview.root || null, preview.result.sha256, replace); setPreview(null); setPath(null); onImported(); }, "プロジェクトを読み込みました。接続チェックで承認してください。")}>表示した内容で読み込む</button></div>
       </>}
     </div>
   </div>;

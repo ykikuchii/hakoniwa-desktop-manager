@@ -130,6 +130,15 @@ pub fn from_portable(value: &str, root: &str) -> String {
     }
 }
 
+/// `canonicalize` が返す `\\?\C:\...` と `\\?\UNC\server\share\...` を、普通の表記に戻す。
+fn without_verbatim(value: &str) -> String {
+    if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else {
+        value.strip_prefix(r"\\?\").unwrap_or(value).to_owned()
+    }
+}
+
 fn native(value: &str) -> String {
     if cfg!(windows) {
         value.replace('/', "\\")
@@ -144,7 +153,9 @@ fn relative(from: &str, to: &str) -> Option<String> {
     let to = clean(to);
     let split = |value: &str| value.split('/').filter(|part| !part.is_empty()).map(str::to_owned).collect::<Vec<_>>();
     let (a, b) = (split(&from), split(&to));
-    if a.first().map(|part| fold(part)) != b.first().map(|part| fold(part)) || from.starts_with("//") != to.starts_with("//") {
+    // ボリューム（ドライブ、または UNC のサーバーと共有）が同じでなければ、相対では表せない。
+    let volume = if from.starts_with("//") { 2 } else { 1 };
+    if from.starts_with("//") != to.starts_with("//") || a.len() < volume || b.len() < volume || (0..volume).any(|i| fold(&a[i]) != fold(&b[i])) {
         return None;
     }
     let common = a.iter().zip(&b).take_while(|(x, y)| fold(x) == fold(y)).count();
@@ -188,7 +199,10 @@ fn walk(project: &mut Project, assets: &mut [LibraryAsset], f: &mut dyn FnMut(&m
         spec(&mut controller.command, f);
     }
     for member in project.members.iter_mut() {
-        member.env_overrides.values_mut().for_each(&mut *f);
+        let wsl = assets.iter().find(|asset| asset.id == member.asset_id).and_then(|asset| asset.variant(&member.variant_id)).is_some_and(|variant| matches!(variant.launch.target, ExecutionTarget::Wsl { .. }));
+        if !wsl {
+            member.env_overrides.values_mut().for_each(&mut *f);
+        }
     }
 }
 
@@ -213,7 +227,12 @@ pub fn export(project: &Project, library: &Library, file: &Path, root: &Path) ->
     let mut warnings = Vec::new();
     let root_key = fold(&clean(&root));
     walk(&mut project, &mut assets, &mut |value: &mut String| {
-        if let Some(portable) = to_portable(value, &root) {
+        if value.contains(';') {
+            // パスの並びは、先頭だけを書き換えると残りが元の場所を指したままになるので、書き換えない。
+            if is_absolute(value) || fold(&slashes(value)).contains(&root_key) {
+                warnings.push(format!("パスの並び（; 区切り）は書き換えていません（別の PC では見つからないかもしれません）: {value}"));
+            }
+        } else if let Some(portable) = to_portable(value, &root) {
             *value = portable;
         } else if is_absolute(value) {
             warnings.push(format!("基準ルートの外の絶対パスです（別の PC では見つからないかもしれません）: {value}"));
@@ -255,7 +274,7 @@ pub fn load(file: &Path, root_override: Option<&Path>) -> Result<Loaded, String>
         Some(root) => clean(&root.display().to_string()),
         None => {
             let directory = file.parent().map(|parent| parent.display().to_string()).unwrap_or_default();
-            let directory = std::fs::canonicalize(&directory).map(|path| path.display().to_string().trim_start_matches(r"\\?\").to_owned()).unwrap_or(directory);
+            let directory = std::fs::canonicalize(&directory).map(|path| without_verbatim(&path.display().to_string())).unwrap_or(directory);
             clean(&format!("{directory}/{}", bundle.root))
         }
     };
@@ -342,6 +361,10 @@ mod tests {
         assert_eq!(relative("C:/repo/configs/demo/launcher", "C:/repo").as_deref(), Some("../../.."));
         assert_eq!(relative("C:/repo", "C:/repo").as_deref(), Some("."));
         assert_eq!(relative("C:/a", "D:/a"), None);
+        assert_eq!(relative("//server/share/out", "//server/share/root").as_deref(), Some("../root"));
+        assert_eq!(relative("//server/shareA/out", "//server/shareB/root"), None, "共有が違えば表せない");
+        assert_eq!(without_verbatim(r"\\?\UNC\server\share\out"), r"\\server\share\out");
+        assert_eq!(without_verbatim(r"\\?\C:\repo"), r"C:\repo");
         assert_eq!(clean("C:/a/../../b"), "C:/b", "ルートより上には出ない");
     }
 
@@ -460,6 +483,47 @@ mod tests {
             let check = crate::check::check_project(&project, &library).unwrap();
             assert!(check.blocking_reasons().is_empty(), "{file}: {:?}", check.blocking_reasons());
         }
+    }
+
+    /// パスの並び（PATH など）は書き換えず、警告に出す。WSL のメンバーの環境変数の上書きは書き換えない。
+    #[test]
+    fn path_lists_and_wsl_overrides_are_left_alone() {
+        let (mut project, mut library) = demo();
+        let first = project.members[0].asset_id.clone();
+        library.get_mut(&first).unwrap().variants[0].launch.env.insert("PATH".to_owned(), "C:/demo/bin;C:/demo/tools".to_owned());
+        let second = project.members[1].clone();
+        library.get_mut(&second.asset_id).unwrap().variants[0].launch.target = ExecutionTarget::Wsl { distribution: "Ubuntu".to_owned() };
+        project.members[1].env_overrides.insert("DATA".to_owned(), "C:/demo/data".to_owned());
+        let file = std::env::temp_dir().join("hdm-bundle-lists").join("x.hakoproj.json");
+        let (bundle, warnings) = export(&project, &library, &file, Path::new("C:/demo")).unwrap();
+        let exported = bundle.assets.iter().find(|asset| asset.id == first).unwrap();
+        assert_eq!(exported.variants[0].launch.env["PATH"], "C:/demo/bin;C:/demo/tools");
+        assert!(warnings.iter().any(|warning| warning.contains("パスの並び")), "{warnings:?}");
+        assert_eq!(bundle.project.members[1].env_overrides["DATA"], "C:/demo/data", "WSL のメンバーは書き換えない");
+    }
+
+    /// ライブラリに残してある（どのプロジェクトも使っていない）アセットと同じ id で内容の違うものを
+    /// 取り込んでも、残してあるアセットは消えない。
+    #[test]
+    fn importing_keeps_an_unused_library_asset_with_the_same_id() {
+        let (project, library) = demo();
+        let dir = std::env::temp_dir().join(format!("hdm-bundle-keep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        let file = dir.join("demo.hakoproj.json");
+        let (bundle, _) = export(&project, &library, &file, Path::new("C:/demo")).unwrap();
+        write(&bundle, &file).unwrap();
+        let loaded = load(&file, Some(Path::new("C:/demo"))).unwrap();
+        let mut store = crate::store::Store::open(&dir.join("data"));
+        let id = imported_asset_id(&loaded.bundle.assets[0].id);
+        let mut kept = loaded.bundle.assets[0].clone();
+        kept.id = id.clone();
+        kept.description = "kept in the library".to_owned();
+        store.save_asset(&kept).unwrap();
+        store.library.insert(id.clone(), kept);
+        store.import_bundle(&loaded, true, false).unwrap();
+        assert_eq!(store.library[&id].description, "kept in the library");
+        assert!(dir.join("data").join("library").join("assets").join(format!("{id}.json")).is_file());
     }
 
     #[test]

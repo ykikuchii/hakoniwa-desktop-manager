@@ -272,7 +272,17 @@ impl Store {
             let mut asset = asset.clone();
             let original = asset.id.clone();
             asset.id = crate::bundle::imported_asset_id(&original);
-            ids.insert(original, Self::stage_asset(&mut draft, asset));
+            // 同じ id で内容が違うものがライブラリにあれば、それを置き換え（片付けの対象に）せず、
+            // 新しい id で足す。取り込みは、利用者のライブラリにあるものを消さない。
+            let id = match draft.library.get(&asset.id) {
+                Some(existing) if same_content(existing, &asset) => asset.id.clone(),
+                Some(_) => {
+                    asset.id = Uuid::new_v4().to_string();
+                    Self::stage_asset(&mut draft, asset)
+                }
+                None => Self::stage_asset(&mut draft, asset),
+            };
+            ids.insert(original, id);
         }
         for member in project.members.iter_mut() {
             member.asset_id = ids.get(&member.asset_id).cloned().ok_or_else(|| format!("メンバー「{}」のアセットがファイルにありません。", member.id))?;

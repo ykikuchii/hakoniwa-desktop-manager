@@ -832,7 +832,14 @@ pub fn apply_import_preview(state: State<'_, AppState>, preview: ImportPreview, 
         ImportMode::AddToProject => {
             let project_id = state.lock_store()?.active_project_id().to_owned();
             let _gate = state.ensure_mutable(&project_id)?;
-            let mut workspace = state.active_workspace()?;
+            // ゲートを取った後は切り替えられない。取る前に切り替わっていれば拒否する。
+            // 足す先は id で引く（アクティブなものを引き直すと、別のプロジェクトを読みうる）。
+            let mut store = state.lock_store()?;
+            if store.active_project_id() != project_id {
+                return Err(SWITCHED.to_owned());
+            }
+            let project = store.projects.get(&project_id).cloned().ok_or_else(|| "そのプロジェクトはありません。".to_owned())?;
+            let mut workspace = crate::resolve::resolve(&project, &store.library)?;
             let taken = workspace.assets.iter().map(|asset| asset.id.clone()).collect();
             let (mut assets, mut connections) = (preview.assets, preview.connections);
             let added = crate::manage::renumber_imported(&taken, &mut assets, &mut connections);
@@ -841,7 +848,6 @@ pub fn apply_import_preview(state: State<'_, AppState>, preview: ImportPreview, 
             if workspace.source_directory.is_none() {
                 workspace.source_directory = Some(preview.source_directory);
             }
-            let mut store = state.lock_store()?;
             crate::edit::apply_workspace(&mut store, &project_id, &workspace)?;
             let mut project = store.projects[&project_id].clone();
             crate::check::accept_members(&mut project, &store.library, &added)?;

@@ -79,8 +79,10 @@ fn resolve_project_arg(store: &store::Store, value: &str) -> Result<String, Stri
 fn prepare(state: &AppState, cli: &Cli) -> Result<(), String> {
     if let Some(path) = &cli.import {
         let path = std::path::Path::new(path);
-        let bytes = std::fs::read(path).map_err(|error| format!("{} を読めません: {error}", path.display()))?;
-        if bundle::is_bundle(&bytes) {
+        // 起動時の移行で退避済みの v1 は、ここではもうない。取り込みの側が、移行で作った
+        // プロジェクトを選ぶ。
+        let is_bundle = path.is_file() && bundle::is_bundle(&std::fs::read(path).map_err(|error| format!("{} を読めません: {error}", path.display()))?);
+        if is_bundle {
             let loaded = bundle::load(path, None)?;
             commands::import_bundle_into(state, &loaded, true, cli.accept_imported)?;
             // 読み込みの警告（見つからないファイルなど）は、画面の警告に出す。
