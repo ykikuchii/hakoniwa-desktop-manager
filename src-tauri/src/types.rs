@@ -482,6 +482,9 @@ pub struct WorkspaceSnapshot {
     pub active_project_id: String,
     /// 実行中のプロジェクト。実行中は切り替えも変更もできない。
     pub running_project_id: Option<String>,
+    /// 実行中のプロジェクトで `hako-cmd start` が成功し、まだ止めていないか。
+    #[serde(default)]
+    pub core_started: bool,
     /// 保存データの読み込み・移行で起きたこと、開けなかった理由など。
     pub store_warnings: Vec<String>,
     /// アクティブなプロジェクトのメンバーの設定（保存されている形）。

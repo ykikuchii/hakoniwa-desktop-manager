@@ -28,6 +28,9 @@ pub struct AppState {
     pub start_all_cancel: AtomicBool,
     /// 一括停止の実行中フラグ。停止中に始まった一括起動を拒否する。
     pub stop_all_running: AtomicBool,
+    /// 実行中のプロジェクトで `hako-cmd start` が成功し、まだ止めていないか。Core コントローラーの
+    /// ないプロジェクトでは、Core の状態はこれでしか分からない。
+    pub core_started: AtomicBool,
     /// 単独起動の受付と、一括起動・一括停止の開始を直列化する。単独起動は確認から
     /// プロセスの登録までこれを持つので、その間に一括停止が通り過ぎることも、
     /// 一括起動が稼働中の確認を終えてしまうこともない。実行コンテキストの生成・解放と、
@@ -62,6 +65,7 @@ impl AppState {
             start_all_running: AtomicBool::new(false),
             start_all_cancel: AtomicBool::new(false),
             stop_all_running: AtomicBool::new(false),
+            core_started: AtomicBool::new(false),
             lifecycle_gate: Mutex::new(()),
         }
     }
@@ -133,6 +137,8 @@ impl AppState {
         let Some(context) = run.as_ref() else { return };
         if !has_live_processes(&self.processes, &context.workspace) {
             *run = None;
+            // プロセスが残っていなければ、Core を開始したアセットも終わっている。
+            self.core_started.store(false, Ordering::Release);
         }
     }
 
