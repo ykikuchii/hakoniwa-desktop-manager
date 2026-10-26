@@ -9,7 +9,7 @@ import { ProjectFilePanel } from "./ProjectFilePanel";
 import { ProjectPage } from "./ProjectPage";
 import { Empty, Field, messageOf } from "./ui";
 import { TopologyPage } from "./TopologyPage";
-import { selectAssetProcess, selectCoreProcess } from "./selectors";
+import { selectAssetProcess, selectCoreStatus } from "./selectors";
 import "./topology-visualization.css";
 import "./topology-alerts.css";
 
@@ -75,9 +75,7 @@ export default function App() {
 
   const workspace = snapshot?.workspace;
   const selectedConnection = snapshot?.connections.find((connection) => connection.definition.id === selectedConnectionId) ?? null;
-  const activeCore = snapshot ? selectCoreProcess(snapshot.processes) : undefined;
-  // Core コントローラーのないプロジェクトでは、Core の状態は hako-cmd start の成否でしか分からない。
-  const coreStatus = snapshot && !snapshot.workspace.core_controller ? (snapshot.core_started ? "running" : "stopped") : activeCore?.status ?? "unknown";
+  const coreStatus = snapshot ? selectCoreStatus(snapshot) : "unknown";
 
   async function run(action: () => Promise<unknown>, message: string) {
     setBusy(true);

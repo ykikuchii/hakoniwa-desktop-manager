@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ConnectionSnapshot, PduFlow, ProcessSnapshot, ProjectCheck, WorkspaceSnapshot } from "./types";
 import { TopologyAlertOverlay } from "./TopologyAlertOverlay";
-import { connectionsForAsset, latestActivity, selectAssetProcess, selectCoreProcess } from "./selectors";
+import { connectionsForAsset, latestActivity, selectAssetProcess, selectCoreProcess, selectCoreStatus } from "./selectors";
 
 type VisualStatus = "running" | "starting" | "connected" | "disconnected" | "stopped" | "error";
 type Position = { x: number; y: number };
@@ -229,11 +229,12 @@ export function TopologyPage({
   }, []);
 
   const coreProcess = useMemo(() => selectCoreProcess(snapshot.processes), [snapshot.processes]);
-  const coreStatus: VisualStatus = coreProcess?.status === "failed"
+  const coreState = selectCoreStatus(snapshot);
+  const coreStatus: VisualStatus = coreState === "failed"
     ? "error"
-    : coreProcess?.status === "starting"
+    : coreState === "starting"
       ? "starting"
-      : coreProcess?.status === "running"
+      : coreState === "running"
         ? "running"
         : "stopped";
 
