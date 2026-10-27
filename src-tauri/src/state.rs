@@ -28,9 +28,10 @@ pub struct AppState {
     pub start_all_cancel: AtomicBool,
     /// 一括停止の実行中フラグ。停止中に始まった一括起動を拒否する。
     pub stop_all_running: AtomicBool,
-    /// 実行中のプロジェクトで `hako-cmd start` が成功し、まだ止めていないか。Core コントローラーの
-    /// ないプロジェクトでは、Core の状態はこれでしか分からない。
-    pub core_started: AtomicBool,
+    /// `hako-cmd start` が成功し、まだ止めていないプロジェクトの id。Core コントローラーの
+    /// ないプロジェクトでは、Core の状態はこれでしか分からない。別のプロジェクトを表示したときに
+    /// 取り違えないよう、プロジェクトに結び付けて持つ。
+    pub core_started: Mutex<Option<String>>,
     /// 単独起動の受付と、一括起動・一括停止の開始を直列化する。単独起動は確認から
     /// プロセスの登録までこれを持つので、その間に一括停止が通り過ぎることも、
     /// 一括起動が稼働中の確認を終えてしまうこともない。実行コンテキストの生成・解放と、
@@ -65,7 +66,7 @@ impl AppState {
             start_all_running: AtomicBool::new(false),
             start_all_cancel: AtomicBool::new(false),
             stop_all_running: AtomicBool::new(false),
-            core_started: AtomicBool::new(false),
+            core_started: Mutex::new(None),
             lifecycle_gate: Mutex::new(()),
         }
     }
@@ -97,6 +98,23 @@ impl AppState {
             return Ok(run.workspace.clone());
         }
         self.active_workspace()
+    }
+
+    /// `project_id` で `hako-cmd start` が成功し、まだ止めていないか。
+    pub fn core_started_for(&self, project_id: &str) -> bool {
+        self.core_started.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).as_deref() == Some(project_id)
+    }
+
+    pub fn set_core_started(&self, project_id: Option<String>) {
+        *self.core_started.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = project_id;
+    }
+
+    /// `project_id` の Core を止めたと記録する。別のプロジェクトの記録は消さない。
+    pub fn clear_core_started(&self, project_id: &str) {
+        let mut started = self.core_started.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if started.as_deref() == Some(project_id) {
+            *started = None;
+        }
     }
 
     pub fn running_project_id(&self) -> Option<String> {
@@ -138,7 +156,7 @@ impl AppState {
         if !has_live_processes(&self.processes, &context.workspace) {
             *run = None;
             // プロセスが残っていなければ、Core を開始したアセットも終わっている。
-            self.core_started.store(false, Ordering::Release);
+            self.set_core_started(None);
         }
     }
 
@@ -255,6 +273,20 @@ mod tests {
     }
 
     /// 実行中は、そのプロジェクトの変更と切り替えを拒否し、止まれば解放して許す。
+    /// Core を開始した記録はプロジェクトに結び付く。別のプロジェクトの停止では消えない。
+    #[test]
+    fn core_started_belongs_to_one_project() {
+        let (state, demo, other) = state("core-started");
+        assert!(!state.core_started_for(&demo));
+        state.set_core_started(Some(demo.clone()));
+        assert!(state.core_started_for(&demo));
+        assert!(!state.core_started_for(&other));
+        state.clear_core_started(&other);
+        assert!(state.core_started_for(&demo));
+        state.clear_core_started(&demo);
+        assert!(!state.core_started_for(&demo));
+    }
+
     #[test]
     fn running_blocks_edits_and_switching_until_idle() {
         let (state, demo, other) = state("block");

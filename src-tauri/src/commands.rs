@@ -56,7 +56,7 @@ pub fn get_snapshot(state: State<'_, AppState>) -> Result<WorkspaceSnapshot, Str
         projects,
         active_project_id,
         running_project_id: state.running_project_id(),
-        core_started: state.core_started.load(Ordering::Acquire),
+        core_started: state.core_started_for(&workspace.id),
         store_warnings,
         members,
     })
@@ -404,9 +404,14 @@ pub fn stop_core_controller(state: State<'_, AppState>) -> Result<Vec<crate::typ
 
 #[tauri::command]
 pub fn run_lifecycle_command(state: State<'_, AppState>, command: String) -> Result<LifecycleCommandResult, String> {
-    let result = lifecycle(&state.run_workspace()?, command)?;
+    let workspace = state.run_workspace()?;
+    let result = lifecycle(&workspace, command)?;
     if result.status != ProcessStatus::Failed {
-        state.core_started.store(result.command == "start", Ordering::Release);
+        if result.command == "start" {
+            state.set_core_started(Some(workspace.id.clone()));
+        } else {
+            state.clear_core_started(&workspace.id);
+        }
     }
     Ok(result)
 }
@@ -607,8 +612,6 @@ struct StopAllGuard<'a>(&'a AppState);
 impl Drop for StopAllGuard<'_> {
     fn drop(&mut self) {
         self.0.start_all_cancel.store(false, Ordering::Release);
-        // 一括停止は hako-cmd stop を送り、プロセスを止める。成否によらず Core は開始済みではない。
-        self.0.core_started.store(false, Ordering::Release);
         self.0.stop_all_running.store(false, Ordering::Release);
     }
 }
@@ -703,7 +706,7 @@ fn start_all_inner(state: State<'_, AppState>) -> Result<Vec<crate::types::Proce
                 let detail = result.stderr.lines().chain(result.stdout.lines()).rev().find(|line| !line.trim().is_empty()).unwrap_or_default().to_owned();
                 return Err(format!("hako-cmd start が失敗しました。{detail}"));
             }
-            state.core_started.store(true, Ordering::Release);
+            state.set_core_started(Some(workspace.id.clone()));
         }
     }
     // 最後のアセットの起動直後に中断された場合も、成功として報告しない。
@@ -765,6 +768,8 @@ fn stop_all_inner(state: State<'_, AppState>) -> Result<Vec<crate::types::Proces
                     let detail = result.stderr.lines().chain(result.stdout.lines()).rev().find(|line| !line.trim().is_empty()).unwrap_or_default().to_owned();
                     failures.push(format!("hako-cmd {command} が失敗しました。{detail}"));
                 }
+                // 止まった、または元から動いていなかった。失敗したときは開始済みのまま表示する。
+                Ok(_) if command == "stop" => state.clear_core_started(&workspace.id),
                 Ok(_) => {}
                 Err(error) => failures.push(error),
             }
