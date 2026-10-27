@@ -408,7 +408,7 @@ pub fn run_lifecycle_command(state: State<'_, AppState>, command: String) -> Res
     let result = lifecycle(&workspace, command)?;
     if result.status != ProcessStatus::Failed {
         if result.command == "start" {
-            state.set_core_started(Some(workspace.id.clone()));
+            state.record_core_started(&workspace.id);
         } else {
             state.clear_core_started(&workspace.id);
         }
@@ -706,7 +706,7 @@ fn start_all_inner(state: State<'_, AppState>) -> Result<Vec<crate::types::Proce
                 let detail = result.stderr.lines().chain(result.stdout.lines()).rev().find(|line| !line.trim().is_empty()).unwrap_or_default().to_owned();
                 return Err(format!("hako-cmd start が失敗しました。{detail}"));
             }
-            state.set_core_started(Some(workspace.id.clone()));
+            state.record_core_started(&workspace.id);
         }
     }
     // 最後のアセットの起動直後に中断された場合も、成功として報告しない。
