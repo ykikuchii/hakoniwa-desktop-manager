@@ -106,6 +106,8 @@ export interface Workspace {
   schema_version: number;
   id: string;
   name: string;
+  /** プロジェクトの概要（人が読む説明）。 */
+  description?: string;
   source_directory?: string | null;
   core_release?: InstalledCoreSelection | null;
   core_controller?: CoreController | null;

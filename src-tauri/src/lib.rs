@@ -168,6 +168,7 @@ pub fn run() {
             commands::remove_member,
             commands::add_member,
             commands::rename_project,
+            commands::set_project_description,
             commands::set_core_controller,
         ])
         .run(tauri::generate_context!())

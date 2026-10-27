@@ -88,6 +88,9 @@ pub struct Project {
     pub schema_version: u32,
     pub id: String,
     pub name: String,
+    /// 何のプロジェクトかを人が読むための説明。起動には使わない。
+    #[serde(default)]
+    pub description: String,
     /// どこから来たか。同じ出所を取り込み直したとき、増やさずに置き換える相手を探すのに使う。
     #[serde(default)]
     pub origin: Option<String>,
@@ -214,6 +217,7 @@ impl Project {
             schema_version: STORE_SCHEMA_VERSION,
             id,
             name,
+            description: String::new(),
             origin: None,
             source_directory: None,
             core_release: None,
@@ -355,6 +359,7 @@ pub fn split_v1_workspace(workspace: &Workspace) -> (Vec<LibraryAsset>, Project)
         schema_version: STORE_SCHEMA_VERSION,
         id: workspace.id.clone(),
         name: workspace.name.clone(),
+        description: workspace.description.clone(),
         origin: Some(origin),
         source_directory: workspace.source_directory.clone(),
         core_release: workspace.core_release.clone(),

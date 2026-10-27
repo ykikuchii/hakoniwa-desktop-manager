@@ -192,6 +192,9 @@ pub struct Workspace {
     pub schema_version: u32,
     pub id: String,
     pub name: String,
+    /// プロジェクトの説明（`Project::description`）。
+    #[serde(default)]
+    pub description: String,
     #[serde(default)]
     pub source_directory: Option<String>,
     #[serde(default)]
@@ -219,6 +222,7 @@ impl Workspace {
             schema_version: WORKSPACE_SCHEMA_VERSION,
             id,
             name,
+            description: String::new(),
             source_directory: None,
             core_release: None,
             core_controller: None,

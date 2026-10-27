@@ -54,6 +54,7 @@ export const api = {
   previewAddMember: (projectId: string, member: MemberSettings) => invoke<ProjectCheck>("preview_add_member", { projectId, member }),
   addMember: (projectId: string, member: MemberSettings, shownRevision: string | null) => invoke<void>("add_member", { projectId, member, shownRevision }),
   renameProject: (projectId: string, expected: string, name: string) => invoke<void>("rename_project", { projectId, expected, name }),
+  setProjectDescription: (projectId: string, expected: string, description: string) => invoke<void>("set_project_description", { projectId, expected, description }),
   setCoreController: (projectId: string, expected: CoreController | null, controller: CoreController | null) => invoke<void>("set_core_controller", { projectId, expected, controller }),
 };
 

@@ -1433,6 +1433,11 @@ fn add_member_snapshot(state: &AppState, project_id: &str, asset_id: &str) -> Re
 }
 
 #[tauri::command]
+pub fn set_project_description(state: State<'_, AppState>, project_id: String, expected: String, description: String) -> Result<(), String> {
+    edit_project(&state, &project_id, |store| crate::manage::set_project_description(store, &project_id, &expected, &description))
+}
+
+#[tauri::command]
 pub fn rename_project(state: State<'_, AppState>, project_id: String, expected: String, name: String) -> Result<(), String> {
     edit_project(&state, &project_id, |store| crate::manage::rename_project(store, &project_id, &expected, &name))
 }
