@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ConnectionSnapshot, PduFlow, ProcessSnapshot, ProjectCheck, WorkspaceSnapshot } from "./types";
 import { TopologyAlertOverlay } from "./TopologyAlertOverlay";
-import { connectionsForAsset, latestActivity, selectAssetProcess, selectCoreProcess } from "./selectors";
+import { connectionsForAsset, latestActivity, selectAssetProcess, selectCoreProcess, selectCoreStatus } from "./selectors";
 
 type VisualStatus = "running" | "starting" | "connected" | "disconnected" | "stopped" | "error";
 type Position = { x: number; y: number };
@@ -229,11 +229,18 @@ export function TopologyPage({
   }, []);
 
   const coreProcess = useMemo(() => selectCoreProcess(snapshot.processes), [snapshot.processes]);
-  const coreStatus: VisualStatus = coreProcess?.status === "failed"
+  const coreState = selectCoreStatus(snapshot);
+  // Core コントローラーのないプロジェクトでは、Core のプロセスは表示できない。開始したかだけ分かる。
+  const noController = !snapshot.workspace.core_controller;
+  const coreProcessLabel = noController ? "コントローラーなし" : coreProcess?.pid ? `PID ${coreProcess.pid}` : "未起動";
+  const coreStartLabel = noController ? (snapshot.core_started ? "hako-cmd start で開始済み" : "hako-cmd start 前") : formatDate(coreProcess?.started_at);
+  // 共有メモリの PDU は通信量を観測していない。接続チェックで分かる、宣言上のチャネルだけを出す。
+  const pduChannels = (memberId: string) => check?.members.find((member) => member.member_id === memberId)?.channels ?? [];
+  const coreStatus: VisualStatus = coreState === "failed"
     ? "error"
-    : coreProcess?.status === "starting"
+    : coreState === "starting"
       ? "starting"
-      : coreProcess?.status === "running"
+      : coreState === "running"
         ? "running"
         : "stopped";
 
@@ -429,8 +436,8 @@ export function TopologyPage({
           {hoveredId === "core" && (
             <div className="topology-tooltip topology-tooltip-core" role="tooltip">
               <strong>Hakoniwa-core</strong>
-              <span>{statusLabels[coreStatus]} · PID {coreProcess?.pid ?? "未取得"}</span>
-              <span>起動: {formatDate(coreProcess?.started_at)}</span>
+              <span>{statusLabels[coreStatus]} · {coreProcessLabel}</span>
+              <span>起動: {coreStartLabel}</span>
             </div>
           )}
           {hoveredNode && (
@@ -441,7 +448,9 @@ export function TopologyPage({
             >
               <strong>{hoveredNode.name}</strong>
               <span>{statusLabels[hoveredNode.status]} · {hoveredNode.role}</span>
-              <span>接続 {hoveredNode.connections.filter((connection) => connection.state === "connected").length} 件 · 最終通信 {formatDate(latestActivity(hoveredNode.connections))}</span>
+              {hoveredNode.connections.length > 0
+                ? <span>接続 {hoveredNode.connections.filter((connection) => connection.state === "connected").length} 件 · 最終通信 {formatDate(latestActivity(hoveredNode.connections))}</span>
+                : <span>PDU チャネル {pduChannels(hoveredNode.id).length} 本 · 通信量は未観測</span>}
             </div>
           )}
         </div>
@@ -464,8 +473,13 @@ export function TopologyPage({
               <dl className="inspector-list">
                 <div><dt>プロセス</dt><dd>{detailNode.process?.pid ? `PID ${detailNode.process.pid}` : "未起動"}</dd></div>
                 <div><dt>起動時刻</dt><dd>{formatDate(detailNode.process?.started_at)}</dd></div>
-                <div><dt>接続数</dt><dd>{detailNode.connections.length} 件（接続中 {detailNode.connections.filter((connection) => connection.state === "connected").length} 件）</dd></div>
-                <div><dt>最終通信</dt><dd>{formatDate(latestActivity(detailNode.connections))}</dd></div>
+                <div><dt>PDU チャネル</dt><dd>{pduChannels(detailNode.id).length} 本（登録 {pduChannels(detailNode.id).filter((channel) => channel.registers).length} 本）</dd></div>
+                {detailNode.connections.length > 0 ? (
+                  <>
+                    <div><dt>接続数</dt><dd>{detailNode.connections.length} 件（接続中 {detailNode.connections.filter((connection) => connection.state === "connected").length} 件）</dd></div>
+                    <div><dt>最終通信</dt><dd>{formatDate(latestActivity(detailNode.connections))}</dd></div>
+                  </>
+                ) : <div><dt>通信量</dt><dd>未観測（共有メモリの PDU は観測していません）</dd></div>}
               </dl>
               {detailNode.connections.length > 0 ? (
                 <div className="inspector-connections">
@@ -492,8 +506,8 @@ export function TopologyPage({
                 <span>中央コントローラー</span>
               </div>
               <dl className="inspector-list">
-                <div><dt>プロセス</dt><dd>{coreProcess?.pid ? `PID ${coreProcess.pid}` : "未起動"}</dd></div>
-                <div><dt>起動時刻</dt><dd>{formatDate(coreProcess?.started_at)}</dd></div>
+                <div><dt>プロセス</dt><dd>{coreProcessLabel}</dd></div>
+                <div><dt>起動時刻</dt><dd>{coreStartLabel}</dd></div>
                 <div><dt>登録アセット</dt><dd>{assets.length} 件</dd></div>
                 <div><dt>接続中</dt><dd>{connectedCount} / {snapshot.connections.length} 件</dd></div>
               </dl>

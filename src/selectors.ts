@@ -1,4 +1,4 @@
-import type { ConnectionSnapshot, ProcessSnapshot } from "./types";
+import type { ConnectionSnapshot, ProcessSnapshot, WorkspaceSnapshot } from "./types";
 
 /// ProcessManager は終了したプロセスも履歴として保持し続けるため、owner_id で
 /// 素朴に引くと stop→start のあとに古い実体を掴む。表示側はこの規則で選ぶ。
@@ -28,6 +28,13 @@ export function selectAssetProcess(processes: ProcessSnapshot[], ownerId: string
 /// Core コントローラーも同じ理由で、履歴の先頭ではなく代表を選ぶ。
 export function selectCoreProcess(processes: ProcessSnapshot[]): ProcessSnapshot | undefined {
   return pickRepresentativeProcess(processes.filter((process) => process.kind === "core_controller"));
+}
+
+/// Core の状態。Core コントローラーのないプロジェクトでは、Core の状態は hako-cmd start の成否で
+/// しか分からないので、その記録を使う。
+export function selectCoreStatus(snapshot: WorkspaceSnapshot): string {
+  if (!snapshot.workspace.core_controller) return snapshot.core_started ? "running" : "stopped";
+  return selectCoreProcess(snapshot.processes)?.status ?? "unknown";
 }
 
 /// 接続とアセットの対応付けは Rust の linking が解決済み。ここでは結果を読むだけ。

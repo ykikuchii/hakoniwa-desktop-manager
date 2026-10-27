@@ -10,7 +10,7 @@ const acceptanceLabel: Record<MemberCheck["acceptance"], string> = {
   unverified: "確かめられない（WSL）",
 };
 
-/** 接続チェックの全体: 所見、メンバーの承認状態、メンバー × チャネルの対応表。 */
+/** 接続チェックの全体: チェック結果、メンバーの承認状態、メンバー × チャネルの対応表。 */
 export function ChecksPage({ check, error, disabled, onAccept }: { check: ProjectCheck | null; error: string; disabled: boolean; onAccept: (projectId: string, revisions: Record<string, string>) => void }) {
   if (!check) {
     return <section className="checks-page"><div className="panel"><p className="muted">{error || "確認しています。"}</p></div></section>;
@@ -20,11 +20,11 @@ export function ChecksPage({ check, error, disabled, onAccept }: { check: Projec
     <section className="checks-page">
       <div className="panel">
         <div className="panel-heading">
-          <div><p className="eyebrow">FINDINGS</p><h2>所見</h2></div>
+          <div><p className="eyebrow">FINDINGS</p><h2>チェック結果</h2></div>
           <span className="muted">{check.report.coverage === "partial" ? "一部の宣言（RPC の service 定義など）は確かめていません" : "宣言はすべて読めました"}</span>
         </div>
         <p className="muted">一括起動の対象のメンバーについて、PDU 設定の宣言どうしを突き合わせます。スクリプトに直接書かれたサイズまでは確かめません。</p>
-        {check.report.findings.length === 0 ? <p className="muted">所見はありません。</p> : (
+        {check.report.findings.length === 0 ? <p className="muted">問題は見つかりませんでした。</p> : (
           <div className="check-findings">
             {check.report.findings.map((finding, index) => <p key={index} className={`finding ${finding.severity}`}><span>{severityLabel[finding.severity] ?? finding.severity}</span>{finding.message}</p>)}
           </div>

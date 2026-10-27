@@ -56,6 +56,7 @@ pub fn get_snapshot(state: State<'_, AppState>) -> Result<WorkspaceSnapshot, Str
         projects,
         active_project_id,
         running_project_id: state.running_project_id(),
+        core_started: state.core_started_for(&workspace.id),
         store_warnings,
         members,
     })
@@ -403,7 +404,16 @@ pub fn stop_core_controller(state: State<'_, AppState>) -> Result<Vec<crate::typ
 
 #[tauri::command]
 pub fn run_lifecycle_command(state: State<'_, AppState>, command: String) -> Result<LifecycleCommandResult, String> {
-    lifecycle(&state.run_workspace()?, command)
+    let workspace = state.run_workspace()?;
+    let result = lifecycle(&workspace, command)?;
+    if result.status != ProcessStatus::Failed {
+        if result.command == "start" {
+            state.record_core_started(&workspace.id);
+        } else {
+            state.clear_core_started(&workspace.id);
+        }
+    }
+    Ok(result)
 }
 
 /// `workspace` の Core に `hako-cmd` を実行する。一括起動・一括停止は凍結した構成を渡す。
@@ -696,6 +706,7 @@ fn start_all_inner(state: State<'_, AppState>) -> Result<Vec<crate::types::Proce
                 let detail = result.stderr.lines().chain(result.stdout.lines()).rev().find(|line| !line.trim().is_empty()).unwrap_or_default().to_owned();
                 return Err(format!("hako-cmd start が失敗しました。{detail}"));
             }
+            state.record_core_started(&workspace.id);
         }
     }
     // 最後のアセットの起動直後に中断された場合も、成功として報告しない。
@@ -757,7 +768,8 @@ fn stop_all_inner(state: State<'_, AppState>) -> Result<Vec<crate::types::Proces
                     let detail = result.stderr.lines().chain(result.stdout.lines()).rev().find(|line| !line.trim().is_empty()).unwrap_or_default().to_owned();
                     failures.push(format!("hako-cmd {command} が失敗しました。{detail}"));
                 }
-                Ok(_) => {}
+                // stop か reset が通った、または元から動いていなかった。失敗したときは開始済みのまま表示する。
+                Ok(_) => state.clear_core_started(&workspace.id),
                 Err(error) => failures.push(error),
             }
         }
@@ -1422,6 +1434,11 @@ fn add_member_snapshot(state: &AppState, project_id: &str, asset_id: &str) -> Re
     let asset = state.lock_store()?.library.get(asset_id).cloned().ok_or_else(|| "そのアセットはライブラリにありません。".to_owned())?;
     library.insert(asset.id.clone(), asset);
     Ok((project, library))
+}
+
+#[tauri::command]
+pub fn set_project_description(state: State<'_, AppState>, project_id: String, expected: String, description: String) -> Result<(), String> {
+    edit_project(&state, &project_id, |store| crate::manage::set_project_description(store, &project_id, &expected, &description))
 }
 
 #[tauri::command]

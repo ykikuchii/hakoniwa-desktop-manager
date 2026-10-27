@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import appIcon from "./assets/app-icon.png";
 import { open } from "@tauri-apps/plugin-dialog";
 import { api } from "./api";
 import type { CoreCatalog, ImportPreview, ProjectCheck, Workspace, WorkspaceSnapshot } from "./types";
@@ -9,7 +10,7 @@ import { ProjectFilePanel } from "./ProjectFilePanel";
 import { ProjectPage } from "./ProjectPage";
 import { Empty, Field, messageOf } from "./ui";
 import { TopologyPage } from "./TopologyPage";
-import { selectAssetProcess, selectCoreProcess } from "./selectors";
+import { selectAssetProcess, selectCoreStatus } from "./selectors";
 import "./topology-visualization.css";
 import "./topology-alerts.css";
 
@@ -75,7 +76,7 @@ export default function App() {
 
   const workspace = snapshot?.workspace;
   const selectedConnection = snapshot?.connections.find((connection) => connection.definition.id === selectedConnectionId) ?? null;
-  const activeCore = snapshot ? selectCoreProcess(snapshot.processes) : undefined;
+  const coreStatus = snapshot ? selectCoreStatus(snapshot) : "unknown";
 
   async function run(action: () => Promise<unknown>, message: string) {
     setBusy(true);
@@ -149,7 +150,7 @@ export default function App() {
   return (
     <div className="app-shell">
       <aside className="sidebar">
-        <div className="brand"><div className="brand-mark">H</div><div><strong>Hakoniwa</strong><span>Desktop Manager</span></div></div>
+        <div className="brand"><img className="brand-mark" src={appIcon} alt="" /><div><strong>Hakoniwa</strong><span>Desktop Manager</span></div></div>
         <nav>{tabs.map(([id, label]) => <button key={id} className={tab === id ? "nav-item active" : "nav-item"} onClick={() => setTab(id)}>{label}</button>)}</nav>
         <section className="environment"><span>実行環境</span><strong>{snapshot.platform} / {typeof snapshot.architecture === "string" ? snapshot.architecture : "other"}</strong><small>ローカル状態を2.5秒ごとに更新</small></section>
       </aside>
@@ -173,12 +174,12 @@ export default function App() {
         {snapshot.store_warnings.length > 0 && <div className="banner error"><div>{snapshot.store_warnings.map((warning, index) => <p key={index}>{warning}</p>)}</div><button onClick={() => void run(() => api.clearStoreWarnings(), "")}>閉じる</button></div>}
         {(notice || error) && <div className={error ? "banner error" : "banner"}><span>{error || notice}</span><button onClick={() => { setError(""); setNotice(""); }}>閉じる</button></div>}
         {tab === "dashboard" && <CheckPanel check={check && check.project_id === (snapshot.running_project_id ?? snapshot.active_project_id) ? check : null} error={checkError} onReview={() => setTab("checks")} />}
-        {tab === "dashboard" && <Dashboard snapshot={snapshot} activeCore={activeCore?.status ?? "unknown"} onStartCore={() => void run(api.startCore, "Coreコントローラーを起動しました。")} onStopCore={() => void run(api.stopCore, "Coreコントローラーを停止しました。")} onLifecycle={(command) => void run(async () => { const result = await api.runLifecycle(command); if (result.status === "failed") throw new Error(result.stderr || "hako-cmdが失敗しました。"); }, `hako-cmd ${command} を実行しました。`)} onAssetClick={(id) => { setSelectedAssetId(id); setTab("project"); }} onConnectionClick={(id) => { setSelectedConnectionId(id); setTab("topology"); }} />}
+        {tab === "dashboard" && <Dashboard snapshot={snapshot} activeCore={coreStatus} onStartCore={() => void run(api.startCore, "Coreコントローラーを起動しました。")} onStopCore={() => void run(api.stopCore, "Coreコントローラーを停止しました。")} onLifecycle={(command) => void run(async () => { const result = await api.runLifecycle(command); if (result.status === "failed") throw new Error(result.stderr || "hako-cmdが失敗しました。"); }, `hako-cmd ${command} を実行しました。`)} onAssetClick={(id) => { setSelectedAssetId(id); setTab("project"); }} onConnectionClick={(id) => { setSelectedConnectionId(id); setTab("topology"); }} />}
         {tab === "project" && <ProjectPage key={workspace.id} snapshot={snapshot} busy={busy} selectedId={selectedAssetId} onSelect={setSelectedAssetId} onRun={run} onOpenInLibrary={(assetId) => { setLibraryFocus(assetId); setTab("library"); }} />}
         {tab === "library" && <LibraryPage key={workspace.id} projectId={snapshot.active_project_id} members={snapshot.members} running={snapshot.running_project_id === snapshot.active_project_id} busy={busy} focusAssetId={libraryFocus} onRun={run} />}
         {tab === "checks" && <ChecksPage check={check && check.project_id === (snapshot.running_project_id ?? snapshot.active_project_id) ? check : null} error={checkError} disabled={busy || !!snapshot.running_project_id} onAccept={(projectId, revisions) => void run(() => api.acceptMemberChanges(projectId, revisions), "変更を承認しました。")} />}
         {tab === "topology" && <TopologyPage key={workspace.id} check={check && check.project_id === (snapshot.running_project_id ?? snapshot.active_project_id) ? check : null} snapshot={snapshot} selected={selectedConnection} onSelect={setSelectedConnectionId} onHeartbeat={(id) => void run(() => api.recordHeartbeat(id, "ユーザー操作による確認イベント"), "通信確認イベントを記録しました。")} />}
-        {tab === "core" && <CorePage key={`${workspace.id}:${JSON.stringify(workspace.core_controller ?? null)}`} workspace={workspace} catalog={catalog} activeCore={activeCore?.status ?? "unknown"} busy={busy} onSaveController={(controller) => void run(() => api.setCoreController(snapshot.active_project_id, workspace.core_controller ?? null, controller), "Core設定を保存しました。")} onInstall={(version) => void run(() => api.installCore(version), "Coreを検証して導入しました。")} onStart={() => void run(api.startCore, "Coreコントローラーを起動しました。")} onStop={() => void run(api.stopCore, "Coreコントローラーを停止しました。")} />}
+        {tab === "core" && <CorePage key={`${workspace.id}:${JSON.stringify(workspace.core_controller ?? null)}`} workspace={workspace} catalog={catalog} activeCore={coreStatus} busy={busy} onSaveController={(controller) => void run(() => api.setCoreController(snapshot.active_project_id, workspace.core_controller ?? null, controller), "Core設定を保存しました。")} onInstall={(version) => void run(() => api.installCore(version), "Coreを検証して導入しました。")} onStart={() => void run(api.startCore, "Coreコントローラーを起動しました。")} onStop={() => void run(api.stopCore, "Coreコントローラーを停止しました。")} />}
         {tab === "workspace" && <WorkspacePage key={`${workspace.id}:${workspace.name}`} workspace={workspace} busy={busy} preview={preview} onChoose={() => void chooseDirectory()} onImportV1={() => void importV1()} onApply={(mode) => preview && void run(async () => { await api.applyPreview(preview, mode); resetView(); }, mode === "new_project" ? "新しいプロジェクトとして取り込みました。" : "このプロジェクトにメンバーとして足しました。")} onRename={(name) => void run(() => api.renameProject(snapshot.active_project_id, workspace.name, name), "プロジェクト名を保存しました。")} />}
         {tab === "workspace" && <ProjectFilePanel key={workspace.id} projectId={snapshot.active_project_id} projectName={workspace.name} sourceDirectory={workspace.source_directory ?? null} busy={busy} running={!!snapshot.running_project_id} onRun={run} onImported={() => { resetView(); setTab("checks"); }} />}
       </main>
@@ -214,4 +215,4 @@ function WorkspacePage({ workspace, busy, preview, onChoose, onImportV1, onApply
 function Metric({ label, value, hint }: { label: string; value: string | number; hint: string }) { return <div className="metric"><span>{label}</span><strong>{value}</strong><small>{hint}</small></div>; }
 function StatusBadge({ value }: { value: string }) { return <span className="status-badge" data-state={value}>{labelFor(value)}</span>; }
 function EventTable({ events }: { events: WorkspaceSnapshot["recent_events"] }) { return <div className="events-table"><h3>通信タイムライン</h3>{events.length === 0 ? <Empty label="この経路のイベントはまだありません。" /> : events.slice(0, 50).map((event) => <div className="event" key={event.id}><span className="event-time">{fmt.format(new Date(event.observed_at))}</span><span className="event-type">{event.event_type}</span><span>{event.direction}</span><code>{event.pdu_name ?? "—"}</code><span>{event.byte_count ?? "—"}</span><span>{event.message}</span></div>)}</div>; }
-function labelFor(value: string) { return ({ running: "稼働中", starting: "起動中", stopping: "停止中", exited: "終了", failed: "失敗", connected: "通信中", idle: "待機", disconnected: "切断", unknown: "未確認" } as Record<string, string>)[value] ?? value; }
+function labelFor(value: string) { return ({ running: "稼働中", starting: "起動中", stopping: "停止中", stopped: "停止中", exited: "終了", failed: "失敗", connected: "通信中", idle: "待機", disconnected: "切断", unknown: "未確認" } as Record<string, string>)[value] ?? value; }

@@ -201,6 +201,15 @@ pub fn rename_project(store: &mut Store, project_id: &str, expected: &str, name:
     store.commit(store.draft(), project)
 }
 
+pub fn set_project_description(store: &mut Store, project_id: &str, expected: &str, description: &str) -> Result<(), String> {
+    let mut project = project_of(store, project_id)?;
+    if project.description != expected {
+        return Err("プロジェクトの概要が、表示した後に変わっています。画面を読み直してください。".to_owned());
+    }
+    project.description = description.trim().to_owned();
+    store.commit(store.draft(), project)
+}
+
 pub fn set_core_controller(store: &mut Store, project_id: &str, expected: Option<&CoreController>, controller: Option<CoreController>) -> Result<(), String> {
     let mut project = project_of(store, project_id)?;
     if serde_json::to_value(&project.core_controller).ok() != serde_json::to_value(expected).ok() {
@@ -400,6 +409,9 @@ mod tests {
         let name = store.projects[&id].name.clone();
         rename_project(&mut store, &id, &name, "Renamed").unwrap();
         assert!(rename_project(&mut store, &id, &name, "Again").is_err());
+        set_project_description(&mut store, &id, "", "  1 つの操縦入力で 2 機を動かす。\n").unwrap();
+        assert_eq!(store.projects[&id].description, "1 つの操縦入力で 2 機を動かす。");
+        assert!(set_project_description(&mut store, &id, "", "Again").is_err());
         let current = store.projects[&id].core_controller.clone();
         let next = CoreController { id: "controller-e2e".to_owned(), name: "C".to_owned(), command: crate::types::ProgramSpec { program: "x".to_owned(), args: Vec::new(), cwd: None, env: BTreeMap::new(), target: Default::default() }, readiness: Default::default() };
         set_core_controller(&mut store, &id, current.as_ref(), Some(next.clone())).unwrap();

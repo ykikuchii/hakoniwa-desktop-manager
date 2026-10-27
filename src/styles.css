@@ -8,7 +8,7 @@ code { color: #c6dbff; word-break: break-all; }
 .app-shell { min-height: 100vh; display: grid; grid-template-columns: 240px minmax(0, 1fr); background: radial-gradient(circle at 83% -15%, #183158 0, transparent 34%), #0b1220; }
 .sidebar { padding: 26px 16px 20px; border-right: 1px solid #213149; background: #0c1627cc; display: flex; flex-direction: column; gap: 28px; }
 .brand { display: flex; align-items: center; gap: 12px; padding: 0 8px; }
-.brand-mark { width: 34px; height: 34px; border-radius: 10px; display: grid; place-items: center; font-weight: 900; color: #092032; background: linear-gradient(135deg, #42d2ae, #5ea8ff); box-shadow: 0 0 28px #43d5b566; }
+.brand-mark { width: 34px; height: 34px; border-radius: 10px; display: block; box-shadow: 0 0 28px #43d5b566; }
 .brand strong { display: block; font-size: 17px; letter-spacing: .02em; }
 .brand span { display: block; margin-top: 1px; color: #8ea2bf; font-size: 10px; letter-spacing: .11em; text-transform: uppercase; }
 .sidebar nav { display: grid; gap: 5px; }

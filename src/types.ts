@@ -106,6 +106,8 @@ export interface Workspace {
   schema_version: number;
   id: string;
   name: string;
+  /** プロジェクトの概要（人が読む説明）。 */
+  description?: string;
   source_directory?: string | null;
   core_release?: InstalledCoreSelection | null;
   core_controller?: CoreController | null;
@@ -182,6 +184,8 @@ export interface WorkspaceSnapshot {
   active_project_id: string;
   /** 実行中のプロジェクト。実行中は切り替えも変更もできない。 */
   running_project_id?: string | null;
+  /** 実行中のプロジェクトで `hako-cmd start` が成功し、まだ止めていないか。 */
+  core_started?: boolean;
   store_warnings: string[];
   /** アクティブなプロジェクトのメンバーの設定。 */
   members: MemberSettings[];

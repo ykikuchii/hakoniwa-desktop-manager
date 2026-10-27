@@ -21,7 +21,7 @@ export function ProjectPage({ snapshot, busy, selectedId, onSelect, onRun, onOpe
 
   return <section className="split-page">
     <div className="panel asset-list-panel">
-      <div className="panel-heading"><div><p className="eyebrow">PROJECT MEMBERS</p><h2>メンバー</h2></div><button className="button primary small" disabled={busy || running} onClick={() => { setAdding(true); onSelect(null); }}>ライブラリから追加</button></div>
+      <div className="panel-heading"><div><p className="eyebrow">PROJECT MEMBERS</p><h2>メンバー</h2></div><div className="button-row"><button className="button subtle small" onClick={() => { setAdding(false); onSelect(null); }}>概要</button><button className="button primary small" disabled={busy || running} onClick={() => { setAdding(true); onSelect(null); }}>ライブラリから追加</button></div></div>
       <p className="muted">ライブラリのアセットを組み合わせます。起動・停止はメンバーごとにできます。</p>
       <div className="asset-cards">
         {snapshot.members.map((member) => {
@@ -39,9 +39,25 @@ export function ProjectPage({ snapshot, busy, selectedId, onSelect, onRun, onOpe
     <div className="panel editor-panel">
       {adding ? <AddMember key={projectId} projectId={projectId} members={snapshot.members} library={library} busy={busy} onRun={onRun} onDone={(id) => { setAdding(false); onSelect(id); }} />
         : selected ? <MemberEditor key={`${selected.id}:${JSON.stringify(selected)}`} snapshot={snapshot} member={selected} library={library} busy={busy} running={running} onRun={onRun} onOpenInLibrary={onOpenInLibrary} onRemoved={() => onSelect(null)} />
-        : <Empty label="左側からメンバーを選択してください。" />}
+        : <ProjectOverview key={`${projectId}:${snapshot.workspace.description ?? ""}`} snapshot={snapshot} busy={busy} running={running} onRun={onRun} />}
     </div>
   </section>;
+}
+
+/** プロジェクトの概要。何のためのプロジェクトか、どう動かすかを書いておく。起動には使わない。 */
+function ProjectOverview({ snapshot, busy, running, onRun }: { snapshot: WorkspaceSnapshot; busy: boolean; running: boolean; onRun: Run }) {
+  const saved = snapshot.workspace.description ?? "";
+  const [draft, setDraft] = useState(saved);
+  const projectId = snapshot.active_project_id;
+  return <>
+    <div className="panel-heading"><div><p className="eyebrow">PROJECT</p><h2>{snapshot.workspace.name}</h2></div></div>
+    <Field label="概要（何のプロジェクトか、どう動かすか）" wide>
+      <textarea rows={10} value={draft} placeholder="例: 1 つの操縦入力で、ジンバル試験装置のデジタルツインと自由飛行する機体を同時に動かす。" disabled={running} onChange={(event) => setDraft(event.target.value)} />
+    </Field>
+    {running && <p className="muted">実行中は変更できません。すべて停止してから変更してください。</p>}
+    <div className="form-actions"><button className="button primary" disabled={busy || running || draft.trim() === saved} onClick={() => void onRun(() => api.setProjectDescription(projectId, saved, draft), "プロジェクトの概要を保存しました。")}>概要を保存</button></div>
+    <p className="muted">左側からメンバーを選ぶと、メンバーごとの設定を編集できます。</p>
+  </>;
 }
 
 function MemberEditor({ snapshot, member, library, busy, running, onRun, onOpenInLibrary, onRemoved }: { snapshot: WorkspaceSnapshot; member: MemberSettings; library: LibraryEntry[]; busy: boolean; running: boolean; onRun: Run; onOpenInLibrary: (assetId: string) => void; onRemoved: () => void }) {
@@ -147,7 +163,7 @@ function AddMember({ projectId, members, library, busy, onRun, onDone }: { proje
     {error && <p className="error">{error}</p>}
     {current && shown && <div className="sub-editor">
       <h3>足した後の接続チェック</h3>
-      {related.length === 0 ? <p className="muted">このメンバーに関わる所見はありません。</p> : related.map((finding, index) => <p key={index} className={`finding ${finding.severity}`}><span>{({ error: "エラー", warning: "注意", info: "情報" } as Record<string, string>)[finding.severity]}</span>{finding.message}</p>)}
+      {related.length === 0 ? <p className="muted">このメンバーに関わる問題は見つかりませんでした。</p> : related.map((finding, index) => <p key={index} className={`finding ${finding.severity}`}><span>{({ error: "エラー", warning: "注意", info: "情報" } as Record<string, string>)[finding.severity]}</span>{finding.message}</p>)}
       {current.report.findings.some((finding) => finding.severity === "error") && <p className="muted">エラーがあると、足しても一括起動は止まります。</p>}
       <h3>起動の内容</h3>
       <ContractView contract={shown.contract} />

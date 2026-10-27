@@ -28,11 +28,24 @@ pub struct AppState {
     pub start_all_cancel: AtomicBool,
     /// 一括停止の実行中フラグ。停止中に始まった一括起動を拒否する。
     pub stop_all_running: AtomicBool,
+    /// `hako-cmd start` が成功し、まだ止めていないプロジェクト。Core コントローラーの
+    /// ないプロジェクトでは、Core の状態はこれでしか分からない。別のプロジェクトを表示したときに
+    /// 取り違えないよう、プロジェクトに結び付けて持つ。
+    pub core_started: Mutex<Option<CoreStarted>>,
     /// 単独起動の受付と、一括起動・一括停止の開始を直列化する。単独起動は確認から
     /// プロセスの登録までこれを持つので、その間に一括停止が通り過ぎることも、
     /// 一括起動が稼働中の確認を終えてしまうこともない。実行コンテキストの生成・解放と、
     /// プロジェクトの変更・切り替えの可否の判定も、これを持って行う。
     pub lifecycle_gate: Mutex<()>,
+}
+
+/// `hako-cmd start` が成功した記録。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoreStarted {
+    pub project_id: String,
+    /// このアプリが起動したプロセスの実行中に開始したか。そうなら、それらが全部終われば Core を
+    /// 動かしていたものも終わっている。外で動いている Core を開始した場合は、それが分からない。
+    pub with_managed_run: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -62,6 +75,7 @@ impl AppState {
             start_all_running: AtomicBool::new(false),
             start_all_cancel: AtomicBool::new(false),
             stop_all_running: AtomicBool::new(false),
+            core_started: Mutex::new(None),
             lifecycle_gate: Mutex::new(()),
         }
     }
@@ -93,6 +107,26 @@ impl AppState {
             return Ok(run.workspace.clone());
         }
         self.active_workspace()
+    }
+
+    /// `project_id` で `hako-cmd start` が成功し、まだ止めていないか。
+    pub fn core_started_for(&self, project_id: &str) -> bool {
+        self.core_started.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).as_ref().is_some_and(|record| record.project_id == project_id)
+    }
+
+    /// `project_id` で `hako-cmd start` が成功したと記録する。そのプロジェクトがこのアプリの
+    /// 起動したプロセスで実行中かどうかも一緒に残す。
+    pub fn record_core_started(&self, project_id: &str) {
+        let with_managed_run = self.running_project_id().as_deref() == Some(project_id);
+        *self.core_started.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(CoreStarted { project_id: project_id.to_owned(), with_managed_run });
+    }
+
+    /// `project_id` の Core を止めたと記録する。別のプロジェクトの記録は消さない。
+    pub fn clear_core_started(&self, project_id: &str) {
+        let mut started = self.core_started.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if started.as_ref().is_some_and(|record| record.project_id == project_id) {
+            *started = None;
+        }
     }
 
     pub fn running_project_id(&self) -> Option<String> {
@@ -132,7 +166,13 @@ impl AppState {
         let mut run = self.lock_run();
         let Some(context) = run.as_ref() else { return };
         if !has_live_processes(&self.processes, &context.workspace) {
+            let project_id = context.project_id.clone();
             *run = None;
+            // このプロジェクトの実行中に開始した Core なら、それを動かしていたプロセスも終わっている。
+            let mut started = self.core_started.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if started.as_ref().is_some_and(|record| record.with_managed_run && record.project_id == project_id) {
+                *started = None;
+            }
         }
     }
 
@@ -249,6 +289,20 @@ mod tests {
     }
 
     /// 実行中は、そのプロジェクトの変更と切り替えを拒否し、止まれば解放して許す。
+    /// Core を開始した記録はプロジェクトに結び付く。別のプロジェクトの停止では消えない。
+    #[test]
+    fn core_started_belongs_to_one_project() {
+        let (state, demo, other) = state("core-started");
+        assert!(!state.core_started_for(&demo));
+        state.record_core_started(&demo);
+        assert!(state.core_started_for(&demo));
+        assert!(!state.core_started_for(&other));
+        state.clear_core_started(&other);
+        assert!(state.core_started_for(&demo));
+        state.clear_core_started(&demo);
+        assert!(!state.core_started_for(&demo));
+    }
+
     #[test]
     fn running_blocks_edits_and_switching_until_idle() {
         let (state, demo, other) = state("block");

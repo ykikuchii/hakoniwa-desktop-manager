@@ -31,6 +31,7 @@ pub fn resolve(project: &Project, library: &Library) -> Result<Workspace, String
         schema_version: WORKSPACE_SCHEMA_VERSION,
         id: project.id.clone(),
         name: project.name.clone(),
+        description: project.description.clone(),
         source_directory: project.source_directory.clone(),
         core_release: project.core_release.clone(),
         core_controller: project.core_controller.clone(),
