@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import appIcon from "./assets/app-icon.png";
 import { open } from "@tauri-apps/plugin-dialog";
 import { api } from "./api";
 import type { CoreCatalog, ImportPreview, ProjectCheck, Workspace, WorkspaceSnapshot } from "./types";
@@ -149,7 +150,7 @@ export default function App() {
   return (
     <div className="app-shell">
       <aside className="sidebar">
-        <div className="brand"><div className="brand-mark">H</div><div><strong>Hakoniwa</strong><span>Desktop Manager</span></div></div>
+        <div className="brand"><img className="brand-mark" src={appIcon} alt="" /><div><strong>Hakoniwa</strong><span>Desktop Manager</span></div></div>
         <nav>{tabs.map(([id, label]) => <button key={id} className={tab === id ? "nav-item active" : "nav-item"} onClick={() => setTab(id)}>{label}</button>)}</nav>
         <section className="environment"><span>実行環境</span><strong>{snapshot.platform} / {typeof snapshot.architecture === "string" ? snapshot.architecture : "other"}</strong><small>ローカル状態を2.5秒ごとに更新</small></section>
       </aside>

@@ -147,7 +147,7 @@ function AddMember({ projectId, members, library, busy, onRun, onDone }: { proje
     {error && <p className="error">{error}</p>}
     {current && shown && <div className="sub-editor">
       <h3>足した後の接続チェック</h3>
-      {related.length === 0 ? <p className="muted">このメンバーに関わる所見はありません。</p> : related.map((finding, index) => <p key={index} className={`finding ${finding.severity}`}><span>{({ error: "エラー", warning: "注意", info: "情報" } as Record<string, string>)[finding.severity]}</span>{finding.message}</p>)}
+      {related.length === 0 ? <p className="muted">このメンバーに関わる問題は見つかりませんでした。</p> : related.map((finding, index) => <p key={index} className={`finding ${finding.severity}`}><span>{({ error: "エラー", warning: "注意", info: "情報" } as Record<string, string>)[finding.severity]}</span>{finding.message}</p>)}
       {current.report.findings.some((finding) => finding.severity === "error") && <p className="muted">エラーがあると、足しても一括起動は止まります。</p>}
       <h3>起動の内容</h3>
       <ContractView contract={shown.contract} />
